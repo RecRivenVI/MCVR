@@ -73,9 +73,9 @@ vec3 sampleSurfaceDirectionalLight(SampledSurface surface,
     }
     float shadowLength = max(1000.0 - shadowOriginDistance, 0.0001);
     if (!isFiniteVec3(shadowOrigin) || !isFiniteFloat(shadowLength)) { return vec3(0.0); }
-    uint shadowMask = WORLD_MASK | PLAYER_MASK;
+    uint shadowMask = WORLD_MASK | PLAYER_MASK | PRIORITY_MASK | PARTICLE_MASK;
     if (ADV_CLOUD_MODE != 2u) { shadowMask |= CLOUD_MASK; }
-    traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, shadowMask, 0, 0, 0, shadowOrigin, 0.0001, sampledLightDir,
+    traceRayEXT(topLevelAS, gl_RayFlagsCullBackFacingTrianglesEXT, shadowMask, 0, 0, 0, shadowOrigin, 0.0001, sampledLightDir,
                 shadowLength, 1);
 
     float progress = skyUBO.rainGradient;

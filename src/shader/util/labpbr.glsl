@@ -23,7 +23,10 @@ vec3 CalculateF0(vec3 n, vec3 k) {
     return r;
 }
 
-LabPBRMat convertLabPBRMaterial(vec4 texAlbedo, vec4 texSpecular, vec4 texNormal) {
+LabPBRMat convertLabPBRMaterial(vec4 texAlbedo,
+                                vec4 texSpecular,
+                                vec4 texNormal,
+                                bool allowAlphaTransmission) {
     LabPBRMat mat;
 
     mat.roughness = pow(1.0 - texSpecular.r, 2.0);
@@ -58,7 +61,7 @@ LabPBRMat convertLabPBRMaterial(vec4 texAlbedo, vec4 texSpecular, vec4 texNormal
         float sqrtF0 = sqrt(F0);
         mat.ior = (1.0 + sqrtF0) / max(1.0 - sqrtF0, EPS);
 
-        if (texAlbedo.a < 1.0 - EPS) { mat.transmission = 1.0; }
+        if (allowAlphaTransmission && texAlbedo.a < 1.0 - EPS) { mat.transmission = 1.0; }
     } else if (metalIdx <= 237) {
         vec3 n = vec3(1.0);
         vec3 k = vec3(0.0);

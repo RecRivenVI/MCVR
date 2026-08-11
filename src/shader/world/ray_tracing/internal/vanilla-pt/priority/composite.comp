@@ -1,0 +1,18 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 3, binding = 0, rgba16f) uniform image2D outputImage;
+layout(set = 5, binding = 38, rgba16f) uniform readonly image2D priorityGeometryImage;
+layout(set = 5, binding = 39, rgba16f) uniform readonly image2D priorityBackgroundImage;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(outputImage)))) { return; }
+    vec4 base = imageLoad(outputImage, pixel);
+    vec4 background = imageLoad(priorityBackgroundImage, pixel);
+    vec4 foreground = imageLoad(priorityGeometryImage, pixel);
+    vec3 composed = base.rgb * (1.0 - clamp(background.a, 0.0, 1.0)) + background.rgb;
+    composed = composed * (1.0 - clamp(foreground.a, 0.0, 1.0)) + foreground.rgb;
+    imageStore(outputImage, pixel, vec4(composed, 1.0));
+}

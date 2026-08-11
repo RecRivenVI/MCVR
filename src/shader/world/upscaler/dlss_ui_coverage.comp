@@ -1,0 +1,13 @@
+#version 460
+layout(local_size_x=16, local_size_y=16) in;
+layout(set=0,binding=0,rgba8) uniform readonly image2D backbuffer;
+layout(set=0,binding=2,r32f) uniform writeonly image2D uiCoverage;
+void main() {
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(p,imageSize(uiCoverage)))) return;
+    // The UI renderer reserves final-color alpha for accumulated GUI coverage.
+    // RGB remains the resolved final color required by Streamline recomposition.
+    // This preserves fractional text/edge/panel coverage instead of attempting
+    // to reconstruct alpha from a lossy final-vs-HUD-less color comparison.
+    imageStore(uiCoverage,p,vec4(clamp(imageLoad(backbuffer,p).a,0.0,1.0)));
+}

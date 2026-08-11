@@ -12,6 +12,7 @@
 class Framework;
 class Chunks;
 class Entities;
+class Instancing;
 
 class World : public SharedObject<World> {
   public:
@@ -29,6 +30,7 @@ class World : public SharedObject<World> {
         POSITION_TEXTURE_LIGHT_COLOR,
         POSITION_TEXTURE_COLOR_NORMAL,
         PBR_TRIANGLE,
+        PBR_COMPACT_V1,
         NUM_VERTEX_FORMATS,
     };
 
@@ -68,17 +70,22 @@ class World : public SharedObject<World> {
 
     std::shared_ptr<Chunks> chunks();
     std::shared_ptr<Entities> entities();
+    std::shared_ptr<Instancing> instancing();
 
     void setCameraPos(glm::dvec3 cameraPos);
     glm::dvec3 getCameraPos();
 
     void close();
+    // The client left its world. Waits for the GPU, then frees the scene (chunks, entity caches and the
+    // world pipeline's last-frame TLAS and history) instead of keeping it until the next world or shutdown.
+    void releaseScene();
 
   private:
     std::shared_ptr<Chunks> chunks_;
     std::shared_ptr<Entities> entities_;
+    std::shared_ptr<Instancing> instancing_;
 
     glm::dvec3 cameraPos_ = {0, 0, 0};
 
-    bool shouldRenderWorld_;
+    bool shouldRenderWorld_ = false;
 };

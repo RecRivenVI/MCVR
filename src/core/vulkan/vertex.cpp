@@ -1,17 +1,24 @@
 #include "core/vulkan/vertex.hpp"
 
 #include "common/shared.hpp"
+#include <cstring>
+#include <stdexcept>
 
 uint32_t vk::Vertex::packMaterialFlags(const VertexFormat::PBRVertex &vertex) {
+    if (vertex.useNorm == 2 && (vertex.useOverlay != 0 || vertex.useGlint != 0))
+        throw std::invalid_argument("Vertex BRDF normal cannot share cached glint or overlay channels");
     uint32_t packed = 0;
     packed |= vertex.useColorLayer > 0 ? useColorLayerBit : 0u;
     packed |= vertex.useTexture > 0 ? useTextureBit : 0u;
     packed |= vertex.useOverlay > 0 ? useOverlayBit : 0u;
     packed |= vertex.useGlint > 0 ? useGlintBit : 0u;
     packed |= vertex.useNorm > 0 ? useNormBit : 0u;
+    packed |= vertex.useNorm == 2 ? vertexShadingNormalBit : 0u;
     packed |= vertex.useLight > 0 ? useLightBit : 0u;
-    packed |= (vertex.alphaMode & 0xFu) << alphaModeShift;
+    packed |= vertex.useColorLayer > 1 ? colorLayerMixBit : 0u;
+    packed |= (vertex.alphaMode & 0x1Fu) << alphaModeShift;
     packed |= (vertex.coordinate & 0xFu) << coordinateShift;
+    packed |= (vertex.useGlint & 0x3u) << glintModeShift;
     return packed;
 }
 
@@ -34,8 +41,24 @@ vk::VertexFormat::MaterialVertex vk::Vertex::makeMaterialVertex(const VertexForm
         .albedoEmission = vertex.albedoEmission,
         .lightUV = vertex.lightUV,
         .packedData = packMaterialFlags(vertex),
-        .pad0 = 0,
+        .emissiveOverlayTextureID = 0,
     };
+}
+
+void vk::Vertex::writePackedVertices(std::span<const VertexFormat::PBRVertex> vertices,
+                                     uint32_t emissiveOverlay,
+                                     std::span<VertexFormat::PositionVertex> positions,
+                                     std::span<VertexFormat::MaterialVertex> materials) {
+    if (positions.size() != vertices.size() || materials.size() != vertices.size())
+        throw std::invalid_argument("Packed vertex destination size mismatch");
+    for (size_t i = 0; i < vertices.size(); ++i) {
+        const auto position = makePositionVertex(vertices[i]);
+        auto material = makeMaterialVertex(vertices[i]);
+        material.emissiveOverlayTextureID = emissiveOverlay;
+        // memcpy also establishes the trivial object's lifetime in raw mapped storage.
+        std::memcpy(positions.data() + i, &position, sizeof(position));
+        std::memcpy(materials.data() + i, &material, sizeof(material));
+    }
 }
 
 std::vector<vk::VertexFormat::PositionVertex>
@@ -44,6 +67,18 @@ vk::Vertex::buildPositionVertices(const std::vector<VertexFormat::PBRVertex> &ve
     packedVertices.reserve(vertices.size());
     for (const auto &vertex : vertices) { packedVertices.push_back(makePositionVertex(vertex)); }
     return packedVertices;
+}
+
+void vk::Vertex::appendPackedVertices(const std::vector<VertexFormat::PBRVertex> &vertices,
+                                     uint32_t emissiveOverlay,
+                                     std::vector<VertexFormat::PositionVertex> &positions,
+                                     std::vector<VertexFormat::MaterialVertex> &materials) {
+    for (const auto &vertex : vertices) {
+        positions.push_back(makePositionVertex(vertex));
+        auto material = makeMaterialVertex(vertex);
+        material.emissiveOverlayTextureID = emissiveOverlay;
+        materials.push_back(material);
+    }
 }
 
 std::vector<vk::VertexFormat::MaterialVertex>

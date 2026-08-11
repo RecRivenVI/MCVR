@@ -1,8 +1,7 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-#define NRD_GLSL 1
-#include "../../../extern/nrd/Shaders/Include/NRD.hlsli"
+#include "shader/world/nrd/nrd_glsl_compat.glsl"
 #include "common/shared.hpp"
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
@@ -34,7 +33,6 @@ layout(set = 2, binding = 1) uniform SkyUniform {
 
 const float kMinDiffuseAlbedo = 0.05;
 const float kMinSpecularAlbedo = 0.04;
-const vec3 kUnderwaterColor = vec3(0.0, 0.48, 0.65);
 
 vec3 remodulateDiffuse(vec3 radiance, vec3 albedo) {
     return radiance * max(albedo, vec3(kMinDiffuseAlbedo));
@@ -73,9 +71,6 @@ void main() {
         result = clearRadiance;
     } else {
         vec3 baseRadiance = diffRadiance + specRadiance + emissionRadiance;
-        if (useFogCompose && skyUBO.cameraSubmersionType == 1) {
-            baseRadiance *= kUnderwaterColor;
-        }
         result = baseRadiance * fogTransmittance + fogAdditive;
     }
     imageStore(denoisedRadianceImage, pixel, vec4(max(result, 0.0), 1.0));

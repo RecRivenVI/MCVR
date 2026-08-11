@@ -124,17 +124,24 @@ class BLASBuilder : public SharedObject<BLASBuilder> {
 
 class BLASBatchBuilder : public SharedObject<BLASBatchBuilder> {
   public:
+    // Shared places every BLAS of the batch in one storage buffer, which then lives until the
+    // last of them is destroyed; use it only when the whole batch is released together.
+    // Separate gives each BLAS its own storage, freed with that BLAS. Scratch is shared in both.
+    enum class Storage { shared, separate };
+
     std::shared_ptr<BLASBuilder> defineBLASBuilder();
     std::shared_ptr<BLASBatchBuilder> allocateBuffers(std::shared_ptr<PhysicalDevice> physicalDevice,
                                                       std::shared_ptr<Device> device,
-                                                      std::shared_ptr<VMA> vma);
+                                                      std::shared_ptr<VMA> vma,
+                                                      Storage storage = Storage::shared);
     std::vector<std::shared_ptr<BLAS>> build(std::shared_ptr<Device> device);
     void submit(std::shared_ptr<CommandBuffer> commandBuffer);
 
   private:
     std::vector<std::shared_ptr<BLASBuilder>> builders_;
 
-    std::shared_ptr<DeviceLocalBuffer> blasBuffer_;
+    // One entry per builder; with shared storage every entry is the same buffer.
+    std::vector<std::shared_ptr<DeviceLocalBuffer>> blasBuffers_;
     std::shared_ptr<DeviceLocalBuffer> scratchBuffer_;
 
     std::vector<VkDeviceSize> blasOffsets_;

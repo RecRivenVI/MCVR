@@ -1,15 +1,18 @@
 #include "core/vulkan/render_pass.hpp"
 
+#include "core/logging.hpp"
+#include "core/failure_state.hpp"
+
 #include "core/vulkan/device.hpp"
 
 #include <iostream>
 
-std::ostream &renderPassCout() {
-    return std::cout << "[RenderPass] ";
+auto renderPassCout() {
+    return mcvr::log::info("RenderPass");
 }
 
-std::ostream &renderPassCerr() {
-    return std::cerr << "[RenderPass] ";
+auto renderPassCerr() {
+    return mcvr::log::error("RenderPass");
 }
 
 vk::RenderPass::RenderPass(std::shared_ptr<Device> device, VkRenderPass renderpass)
@@ -186,9 +189,10 @@ std::shared_ptr<vk::RenderPass> vk::RenderPassBuilder::RenderPassBuilder::build(
     createInfo.pDependencies = subpassDependencyBuilder_.subpassDependencies.data();
 
     VkRenderPass renderPass;
-    if (vkCreateRenderPass(device->vkDevice(), &createInfo, nullptr, &renderPass) != VK_SUCCESS) {
+    if (const auto result = vkCreateRenderPass(device->vkDevice(), &createInfo, nullptr, &renderPass);
+        result != VK_SUCCESS) {
         renderPassCerr() << "failed to create render pass" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::raise(mcvr::failure::Kind::runtime, result, "vkCreateRenderPass");
     } else {
 #ifdef DEBUG
         renderPassCout() << "created render pass" << std::endl;

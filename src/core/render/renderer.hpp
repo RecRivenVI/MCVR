@@ -7,6 +7,7 @@
 #include <filesystem>
 
 class Textures;
+class Framebuffers;
 class Framework;
 class Buffers;
 class World;
@@ -16,12 +17,18 @@ struct Options {
     uint32_t inactivityFpsLimit = 1e6;
     bool vsync = true;
     uint32_t dlssMode = 1;
+    int dlssSrModel = 0;
+    int dlssRrModel = 4; // Preserve the accepted Ponder baseline globally.
+    int dlssFgModel = 0;
+    bool dlssFrameGeneration = false;
+    int reflexMode = 1;
     uint32_t upscalerType = 1;
     uint32_t upscalerQuality = 0;
     uint32_t denoiserMode = 1;
     uint32_t rayBounces = 4;
     uint32_t debugMode = 0;
     bool needRecreate = false;
+    bool presentationChanged = false;
 
     uint32_t chunkBuildingBatchSize = 2;
     uint32_t chunkBuildingTotalBatches = 4;
@@ -39,6 +46,7 @@ class Renderer : public Singleton<Renderer> {
 
     std::shared_ptr<Framework> framework();
     std::shared_ptr<Textures> textures();
+    std::shared_ptr<Framebuffers> framebuffers();
     std::shared_ptr<Buffers> buffers();
     std::shared_ptr<World> world();
 
@@ -49,6 +57,7 @@ class Renderer : public Singleton<Renderer> {
 
     std::shared_ptr<Framework> framework_;
     std::shared_ptr<Textures> textures_;
+    std::shared_ptr<Framebuffers> framebuffers_;
     std::shared_ptr<Buffers> buffers_;
     std::shared_ptr<World> world_;
 };

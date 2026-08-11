@@ -1,3 +1,4 @@
+#include "core/logging.hpp"
 #include "svgf_module.hpp"
 #include "core/render/buffers.hpp"
 #include "core/render/pipeline.hpp"
@@ -10,7 +11,7 @@ SvgfModule::SvgfModule() {}
 void SvgfModule::init(std::shared_ptr<Framework> framework, std::shared_ptr<WorldPipeline> worldPipeline) {
     WorldModule::init(framework, worldPipeline);
 
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     diffuseRadianceImages_.resize(size);
     specularRadianceImages_.resize(size);
@@ -78,7 +79,7 @@ bool SvgfModule::setOrCreateOutputImages(std::vector<std::shared_ptr<vk::DeviceL
 void SvgfModule::build() {
     auto framework = framework_.lock();
     auto worldPipeline = worldPipeline_.lock();
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     m_denoiser = std::make_shared<SvgfDenoiser>();
 
@@ -96,7 +97,7 @@ void SvgfModule::build() {
     bool ok = m_denoiser->init(framework->instance(), framework->physicalDevice(), framework->device(),
                                framework->vma(), width_, height_, size);
     if (!ok) {
-        std::cerr << "[SvgfModule] init failed." << std::endl;
+        mcvr::log::error("SvgfModule") << "[SvgfModule] init failed." << std::endl;
         m_denoiser.reset();
     }
 

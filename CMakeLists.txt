@@ -1,6 +1,25 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.25)
+
+option(MCVR_BUILD_TESTS "Build MCVR first-party contract tests" ON)
+option(MCVR_ENABLE_FFX_UPSCALER "Enable FidelityFX Upscaler support" ON)
+option(MCVR_ENABLE_NRD "Enable NRD denoiser support" ON)
+
+# FidelityFX forces CMAKE_GENERATOR_PLATFORM=x64 while configuring its Vulkan
+# backend. NRD's nested ShaderMake configure then forwards that Visual Studio
+# platform selection to Ninja, which rejects it. Keep the supported Windows
+# build path explicit and fail before dependency configuration becomes costly.
+if(CMAKE_HOST_WIN32
+        AND CMAKE_GENERATOR MATCHES "^Ninja"
+        AND MCVR_ENABLE_FFX_UPSCALER
+        AND MCVR_ENABLE_NRD)
+    message(FATAL_ERROR
+        "Windows builds with both FidelityFX and NRD require a Visual Studio generator. "
+        "Reconfigure in a fresh build directory with, for example, "
+        "-G \"Visual Studio 17 2022\" -A x64.")
+endif()
 
 project(minecraft-vulkan-renderer LANGUAGES C CXX)
+include(CTest)
 
 if(NOT DEFINED JAVA_PROJECT_ROOT_DIR OR "${JAVA_PROJECT_ROOT_DIR}" STREQUAL "")
     message(FATAL_ERROR "JAVA_PROJECT_ROOT_DIR is required. Pass -DJAVA_PROJECT_ROOT_DIR=/path/to/root/of/the/java/project/")
@@ -9,6 +28,17 @@ else()
     file(TO_CMAKE_PATH "${JAVA_PROJECT_ROOT_DIR}" JAVA_PROJECT_ROOT_DIR)
     message(STATUS "JAVA_PROJECT_ROOT_DIR: ${JAVA_PROJECT_ROOT_DIR}")
 endif()
+
+set(MCVR_JNI_INCLUDE_DIR "${JAVA_PROJECT_ROOT_DIR}/src/main/native/include")
+if(NOT IS_DIRECTORY "${MCVR_JNI_INCLUDE_DIR}")
+    message(FATAL_ERROR "Radiance JNI header directory does not exist: ${MCVR_JNI_INCLUDE_DIR}")
+endif()
+file(GLOB MCVR_JNI_HEADERS "${MCVR_JNI_INCLUDE_DIR}/*.h")
+if(NOT MCVR_JNI_HEADERS)
+    message(FATAL_ERROR "No generated Radiance JNI headers were found in ${MCVR_JNI_INCLUDE_DIR}")
+endif()
+list(LENGTH MCVR_JNI_HEADERS MCVR_JNI_HEADER_COUNT)
+message(STATUS "Radiance JNI contract: ${MCVR_JNI_HEADER_COUNT} headers")
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 23)
@@ -23,7 +53,7 @@ else()
     endif()
 endif()
 
-set(MCVR_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/src ${JAVA_PROJECT_ROOT_DIR}/src/main/native/include/)
+set(MCVR_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/src ${MCVR_JNI_INCLUDE_DIR})
 message(STATUS "Include dir: ${MCVR_INCLUDE_DIR}")
 
 set(MCVR_INSTALL_BIN_DIR ${PROJECT_SOURCE_DIR}/bin)
@@ -42,6 +72,9 @@ set(GLFW_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/extern/glfw/include)
 set(VOLK_BUILD_TESTS OFF CACHE BOOL "Disable tests")
 set(VOLK_BUILD_EXAMPLES OFF CACHE BOOL "Disable examples")
 add_subdirectory(extern/volk EXCLUDE_FROM_ALL)
+if(WIN32)
+    target_compile_definitions(volk PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+endif()
 set(VOLK_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/extern/volk)
 
 # VMA
@@ -63,9 +96,19 @@ set_target_properties(tinyexpr PROPERTIES POSITION_INDEPENDENT_CODE ON)
 set(TINYEXPR_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/extern/tinyexpr)
 
 # DLSS
-add_subdirectory(extern/DLSS EXCLUDE_FROM_ALL)
+set(MCVR_DLSS_ROOT "${PROJECT_SOURCE_DIR}/extern/DLSS")
+set(MCVR_DLSS_INCLUDE_DIR "${MCVR_DLSS_ROOT}/include")
+set(MCVR_DLSS_LIBRARY_DIR "${MCVR_DLSS_ROOT}/lib")
+if(NOT EXISTS "${MCVR_DLSS_INCLUDE_DIR}/nvsdk_ngx_vk.h")
+    message(FATAL_ERROR "The NVIDIA DLSS SDK submodule is incomplete: ${MCVR_DLSS_INCLUDE_DIR}")
+endif()
+
+add_library(ngx INTERFACE)
+target_include_directories(ngx INTERFACE "${MCVR_DLSS_INCLUDE_DIR}")
+include(cmake/Streamline.cmake)
 
 # JNI
+find_package(Java 21 EXACT REQUIRED COMPONENTS Development)
 find_package(JNI REQUIRED)
 message(STATUS "${JNI_INCLUDE_DIRS}")
 message(STATUS "${JNI_LIBRARIES}")
@@ -81,7 +124,6 @@ set(MCVR_BUILT_IN_SHADER_PACKS vanilla-pt advanced)
 message(STATUS "Built-in shader packs: ${MCVR_BUILT_IN_SHADER_PACKS}")
 
 # FidelityFX Upscaler (FSR3 Upscaler only)
-option(MCVR_ENABLE_FFX_UPSCALER "Enable FidelityFX Upscaler support" ON)
 if(MCVR_ENABLE_FFX_UPSCALER)
     message(STATUS "FidelityFX Upscaler Enabled")
 
@@ -112,7 +154,6 @@ else()
 endif()
 
 # NRD Denoiser
-option(MCVR_ENABLE_NRD "Enable NRD denoiser support" ON)
 if(MCVR_ENABLE_NRD)
     message(STATUS "NRD Denoiser Enabled")
 
@@ -151,8 +192,17 @@ endif()
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static libraries" FORCE)
 set(MZ_BUILD_TESTS OFF CACHE BOOL "Disable minizip tests" FORCE)
 set(MZ_BUILD_UNIT_TESTS OFF CACHE BOOL "Disable minizip unit tests" FORCE)
+set(MZ_SANITIZER OFF CACHE STRING "Disable minizip sanitizers" FORCE)
 set(MZ_FETCH_ZLIB ON CACHE BOOL "Fetch zlib automatically" FORCE)
 set(MZ_ZSTD OFF CACHE BOOL "Disable zstd in minizip-ng due to upstream target mismatch" FORCE)
+set(BZIP2_REPOSITORY "https://gitlab.com/bzip2/bzip2.git" CACHE STRING
+    "Pinned mirror used when minizip-ng fetches bzip2" FORCE)
+set(BZIP2_TAG "6a8690fc8d26c815e798c588f796eabe9d684cf0" CACHE STRING
+    "Pinned bzip2 1.0.8 commit used by minizip-ng" FORCE)
+# Stable releases, never moving master/stable branches.
+set(ZLIB_TAG "2.3.3" CACHE STRING "zlib-ng stable release" FORCE)
+set(LIBLZMA_TAG "v5.8.4" CACHE STRING "XZ stable release" FORCE)
+set(PPMD_TAG "26.03" CACHE STRING "7-Zip PPMd stable release" FORCE)
 add_subdirectory(extern/minizip-ng EXCLUDE_FROM_ALL)
 set_target_properties(minizip PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -160,3 +210,8 @@ set_target_properties(minizip PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_subdirectory(extern/json EXCLUDE_FROM_ALL)
 
 add_subdirectory(src)
+
+if(MCVR_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()

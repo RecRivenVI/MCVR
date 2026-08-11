@@ -10,7 +10,7 @@ void TemporalAccumulationModule::init(std::shared_ptr<Framework> framework,
                                       std::shared_ptr<WorldPipeline> worldPipeline) {
     WorldModule::init(framework, worldPipeline);
 
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     hdrNoisyImages_.resize(size);
     motionVectorImages_.resize(size);
@@ -71,9 +71,10 @@ bool TemporalAccumulationModule::setOrCreateOutputImages(std::vector<std::shared
 void TemporalAccumulationModule::setAttributes(int attributeCount, std::vector<std::string> &attributeKVs) {}
 
 void TemporalAccumulationModule::build() {
+    resetHistoryPending_.assign(worldPipeline_.lock()->viewCount(), 1);
     auto framework = framework_.lock();
     auto worldPipeline = worldPipeline_.lock();
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     initDescriptorTables();
     initImages();
@@ -97,11 +98,15 @@ void TemporalAccumulationModule::bindTexture(std::shared_ptr<vk::Sampler> sample
                                              std::shared_ptr<vk::DeviceLocalImage> image,
                                              int index) {}
 
+void TemporalAccumulationModule::onResourceReload() {
+    resetHistoryPending_.assign(worldPipeline_.lock()->viewCount(), 1);
+}
+
 void TemporalAccumulationModule::preClose() {}
 
 void TemporalAccumulationModule::initDescriptorTables() {
     auto framework = framework_.lock();
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     descriptorTables_.resize(size);
 
@@ -155,24 +160,29 @@ void TemporalAccumulationModule::initDescriptorTables() {
 
 void TemporalAccumulationModule::initImages() {
     auto framework = framework_.lock();
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
-    accumulatedRadianceImage_ = vk::DeviceLocalImage::create(
+    const auto viewCount = worldPipeline_.lock()->viewCount();
+    accumulatedRadianceImages_.resize(viewCount);
+    accumulatedNormalImages_.resize(viewCount);
+    for (uint32_t view = 0; view < viewCount; ++view) {
+    accumulatedRadianceImages_[view] = vk::DeviceLocalImage::create(
         framework->device(), framework->vma(), false, hdrNoisyImages_[0]->width(), hdrNoisyImages_[0]->height(), 1,
         hdrNoisyImages_[0]->vkFormat(),
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
 
-    accumulatedNormalImage_ = vk::DeviceLocalImage::create(
+    accumulatedNormalImages_[view] = vk::DeviceLocalImage::create(
         framework->device(), framework->vma(), false, hdrNoisyImages_[0]->width(), hdrNoisyImages_[0]->height(), 1,
         normalRoughnessImages_[0]->vkFormat(),
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
 
+    }
     for (int i = 0; i < size; i++) {
         descriptorTables_[i]->bindSamplerImageForShader(sampler_, hdrNoisyImages_[i], 0, 0);
-        descriptorTables_[i]->bindSamplerImageForShader(sampler_, accumulatedRadianceImage_, 0, 1);
+        descriptorTables_[i]->bindSamplerImageForShader(sampler_, accumulatedRadianceImages_[worldPipeline_.lock()->viewForSlot(i)], 0, 1);
         descriptorTables_[i]->bindSamplerImageForShader(sampler_, motionVectorImages_[i], 0, 2);
         descriptorTables_[i]->bindSamplerImageForShader(sampler_, normalRoughnessImages_[i], 0, 3);
-        descriptorTables_[i]->bindSamplerImageForShader(sampler_, accumulatedNormalImage_, 0, 4);
+        descriptorTables_[i]->bindSamplerImageForShader(sampler_, accumulatedNormalImages_[worldPipeline_.lock()->viewForSlot(i)], 0, 4);
 
         accumulatedNormalOutImages_[i] = vk::DeviceLocalImage::create(
             framework->device(), framework->vma(), false, hdrNoisyImages_[0]->width(), hdrNoisyImages_[0]->height(), 1,
@@ -228,7 +238,7 @@ void TemporalAccumulationModule::initRenderPass() {
 
 void TemporalAccumulationModule::initFrameBuffers() {
     auto framework = framework_.lock();
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     framebuffers_.resize(size);
 
@@ -244,6 +254,7 @@ void TemporalAccumulationModule::initFrameBuffers() {
 
 void TemporalAccumulationModule::initPipeline() {
     auto framework = framework_.lock();
+    auto worldPipeline = worldPipeline_.lock();
     std::filesystem::path shaderPath = Renderer::folderPath / "shaders";
     vertShader_ =
         vk::Shader::create(framework->device(), (shaderPath / "world/temporal_accumulation/tmp_acc_vert.spv").string());
@@ -262,15 +273,15 @@ void TemporalAccumulationModule::initPipeline() {
                             {
                                 .x = 0,
                                 .y = 0,
-                                .width = static_cast<float>(framework->swapchain()->vkExtent().width),
-                                .height = static_cast<float>(framework->swapchain()->vkExtent().height),
+                                .width = static_cast<float>(worldPipeline->renderExtent().width),
+                                .height = static_cast<float>(worldPipeline->renderExtent().height),
                                 .minDepth = 0.0,
                                 .maxDepth = 1.0,
                             },
                         .scissor =
                             {
                                 .offset = {.x = 0, .y = 0},
-                                .extent = framework->swapchain()->vkExtent(),
+                                .extent = worldPipeline->renderExtent(),
                             },
                     })
                     .defineDepthStencilState({
@@ -299,8 +310,8 @@ TemporalAccumulationModuleContext::TemporalAccumulationModuleContext(
       normalRoughnessImage(temporalAccumulationModule->normalRoughnessImages_[frameworkContext->frameIndex]),
       descriptorTable(temporalAccumulationModule->descriptorTables_[frameworkContext->frameIndex]),
       framebuffer(temporalAccumulationModule->framebuffers_[frameworkContext->frameIndex]),
-      accumulatedRadianceImage(temporalAccumulationModule->accumulatedRadianceImage_),
-      accumulatedNormalImage(temporalAccumulationModule->accumulatedNormalImage_),
+      accumulatedRadianceImage(temporalAccumulationModule->accumulatedRadianceImages_[temporalAccumulationModule->worldPipeline_.lock()->viewForSlot(frameworkContext->frameIndex)]),
+      accumulatedNormalImage(temporalAccumulationModule->accumulatedNormalImages_[temporalAccumulationModule->worldPipeline_.lock()->viewForSlot(frameworkContext->frameIndex)]),
       accumulatedNormalOutImage(temporalAccumulationModule->accumulatedNormalOutImages_[frameworkContext->frameIndex]),
       accumulatedRadianceOutImage(
           temporalAccumulationModule->accumulatedRadianceOutImages_[frameworkContext->frameIndex]) {}
@@ -376,8 +387,9 @@ void TemporalAccumulationModuleContext::render() {
               normalOutputSrcStage, normalOutputSrcAccess);
 
     TemporalAccumulationPushConstant pc{};
-    pc.alpha = module->alpha_;
+    pc.alpha = module->resetHistoryPending_[module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)] ? 1.0f : module->alpha_;
     pc.threshold = module->threshold_;
+    module->resetHistoryPending_[module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)] = false;
 
     vkCmdPushConstants(worldCommandBuffer->vkCommandBuffer(), descriptorTable->vkPipelineLayout(),
                        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(TemporalAccumulationPushConstant), &pc);

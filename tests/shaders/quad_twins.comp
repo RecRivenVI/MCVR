@@ -1,0 +1,16 @@
+#version 460
+#extension GL_EXT_ray_query : require
+layout(local_size_x=1) in;
+layout(set=0,binding=0) uniform accelerationStructureEXT scene;
+layout(set=0,binding=1,std430) buffer Results { uint values[]; } results;
+struct Probe { vec4 origin; vec4 direction; uvec4 control; };
+layout(set=0,binding=2,std430) readonly buffer Probes { Probe values[]; } probes;
+void main() {
+    uint i=gl_GlobalInvocationID.x;
+    Probe p=probes.values[i];
+    rayQueryEXT ray;
+    rayQueryInitializeEXT(ray,scene,gl_RayFlagsCullBackFacingTrianglesEXT,255,p.origin.xyz,
+                         0.0001,p.direction.xyz,2.0);
+    while(rayQueryProceedEXT(ray)) {}
+    results.values[i]=rayQueryGetIntersectionTypeEXT(ray,true)==gl_RayQueryCommittedIntersectionTriangleEXT?1u:0u;
+}

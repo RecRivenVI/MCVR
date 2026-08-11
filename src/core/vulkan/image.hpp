@@ -230,6 +230,7 @@ class DeviceLocalImage : public Image, public SharedObject<DeviceLocalImage> {
     uint32_t height() override;
     uint32_t depth() override;
     uint32_t layer() override;
+    uint32_t mipLevels() const;
     VkFormat &vkFormat() override;
     VkBuffer &vkStagingBuffer();
     VkImage &vkImage() override;
@@ -263,10 +264,11 @@ class DeviceLocalImage : public Image, public SharedObject<DeviceLocalImage> {
     void *mappedPtr_ = nullptr;
     VkBuffer stagingBuffer_ = VK_NULL_HANDLE;
     VmaAllocation stagingAllocation_ = VK_NULL_HANDLE;
-    VmaAllocationInfo stagingAllocationInfo_;
+    VmaAllocationInfo stagingAllocationInfo_{};
     VkImage image_ = VK_NULL_HANDLE;
     VmaAllocation allocation_ = VK_NULL_HANDLE;
-    VmaAllocationInfo allocationInfo_;
+    VmaAllocationInfo allocationInfo_{};
+    const char *allocTraceTag_ = nullptr;
 
     std::vector<VkImageView> imageViews_{1};
 };

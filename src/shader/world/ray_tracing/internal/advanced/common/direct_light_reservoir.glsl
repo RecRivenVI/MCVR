@@ -231,8 +231,13 @@ bool pointOnAreaLightTriangle(vec3 point, vec3 a, vec3 b, vec3 c) {
 
 bool areaLightMatchesReservoirSource(AreaLightReservoir reservoir, ChunkPackedLight light) {
     vec3 reservoirNormal = normalizeF(reservoir.normal, vec3(0.0, 1.0, 0.0));
-    vec3 lightNormal = normalizeF(light.normal.xyz, vec3(0.0, 1.0, 0.0));
-    if (dot(lightNormal, reservoirNormal) < ADV_AREA_LIGHT_RESERVOIR_SOURCE_NORMAL_THRESHOLD) { return false; }
+    uint sourceFaces = effectiveMaterialFaces(floatBitsToUint(light.normal.w));
+    if (sourceFaces == (materialCullFrontBit | materialCullBackBit)) return false;
+    vec3 lightNormal = emissionVisibleNormal(floatBitsToUint(light.normal.w),
+        normalizeF(light.normal.xyz, vec3(0.0, 1.0, 0.0)));
+    float alignment = dot(lightNormal, reservoirNormal);
+    if (sourceFaces == 0u) alignment = abs(alignment);
+    if (alignment < ADV_AREA_LIGHT_RESERVOIR_SOURCE_NORMAL_THRESHOLD) { return false; }
     vec3 emissionTolerance = ADV_AREA_LIGHT_RESERVOIR_SOURCE_EMISSION_RELATIVE_EPSILON *
                              max(max(abs(light.radiance.xyz), abs(reservoir.emission)), vec3(1.0));
     if (!all(lessThanEqual(abs(light.radiance.xyz - reservoir.emission), emissionTolerance))) { return false; }
@@ -273,6 +278,7 @@ void sampleAreaLightPoint(Light light,
         lightNormal = normalizeF(cross(p2 - p0, p3 - p0), vec3(0.0, 1.0, 0.0));
     }
     areaPdf = 1.0 / totalArea;
+    lightNormal = emissionVisibleNormal(floatBitsToUint(light.sampleProb.w), lightNormal);
 }
 
 bool tryGetAreaLightNeighborhoodIndex(vec3 scenePos, out uint centerChunkIndex) {
@@ -439,13 +445,18 @@ bool areaSampleLights(SampledSurface surface,
     light.p2 = vec4(chunkLight.p2.xyz, 0.0);
     light.p3 = vec4(chunkLight.p3.xyz, 0.0);
     light.emission = vec4(chunkLight.radiance.rgb, chunkLight.p0Area.w);
-    light.sampleProb = vec4(lightProbInChunk, lightProbInChunk * chunkProbInNeighborhood, chunkProbInNeighborhood, 0.0);
+    light.sampleProb = vec4(lightProbInChunk, lightProbInChunk * chunkProbInNeighborhood, chunkProbInNeighborhood, chunkLight.normal.w);
     if (light.sampleProb.y <= 1e-8 || light.emission.w <= 1e-8) { return false; }
 
     vec3 sampledPoint;
     vec3 lightNormal;
     float areaPdf;
     sampleAreaLightPoint(light, candidateSeed, sampledPoint, lightNormal, areaPdf);
+    uint sourceFaces = effectiveMaterialFaces(floatBitsToUint(chunkLight.normal.w));
+    if (sourceFaces == (materialCullBackBit | materialCullFrontBit)) return false;
+    if (sourceFaces == 0u && dot(lightNormal, surface.worldPos - areaLightWorldToScene(sampledPoint)) < 0.0) {
+        lightNormal = -lightNormal;
+    }
     if (areaPdf <= 1e-8) { return false; }
 
     float targetFunction = 0.0;

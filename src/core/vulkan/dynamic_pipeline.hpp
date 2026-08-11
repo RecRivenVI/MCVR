@@ -30,6 +30,8 @@ class DynamicGraphicsPipeline : public SharedObject<DynamicGraphicsPipeline> {
   std::shared_ptr<Device> device_;
 
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+    // Keeps the creation-time VkPipelineLayout alive for the whole pipeline lifetime.
+    std::shared_ptr<void> pipelineLayoutKeepAlive_;
 };
 
 class DynamicGraphicsPipelineBuilder {
@@ -61,6 +63,7 @@ class DynamicGraphicsPipelineBuilder {
     DynamicGraphicsPipelineBuilder &definePipelineLayout(std::shared_ptr<DescriptorTable> descriptorTable);
 
     DynamicGraphicsPipelineBuilder &defineInputAssemblyState(VkPrimitiveTopology topology);
+    DynamicGraphicsPipelineBuilder &definePatchControlPoints(uint32_t count);
 
     std::shared_ptr<vk::DynamicGraphicsPipeline> build(std::shared_ptr<Device> device);
 
@@ -127,6 +130,9 @@ class DynamicGraphicsPipelineBuilder {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .primitiveRestartEnable = VK_FALSE,
     };
+    VkPipelineTessellationStateCreateInfo tessellationStateCreateInfo_{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
+    };
 
     VkPipelineViewportStateCreateInfo viewportStateCreateInfo_{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
@@ -171,6 +177,7 @@ class DynamicGraphicsPipelineBuilder {
     ShaderStageBuilder shaderStageBuilder_;
 
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
+    std::shared_ptr<void> pipelineLayoutKeepAlive_;
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     uint32_t subpassIndex_ = 0;
 };
@@ -184,8 +191,10 @@ DynamicGraphicsPipelineBuilder &DynamicGraphicsPipelineBuilder::defineVertexInpu
 inline DynamicGraphicsPipelineBuilder &
 DynamicGraphicsPipelineBuilder::defineVertexInputState(const VertexLayoutInfo &vertexLayoutInfo) {
     vertexInputStateCreateInfo_.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertexInputStateCreateInfo_.vertexBindingDescriptionCount = 1;
-    vertexInputStateCreateInfo_.pVertexBindingDescriptions = &vertexLayoutInfo.bindingDescription;
+    vertexInputStateCreateInfo_.vertexBindingDescriptionCount =
+        static_cast<uint32_t>(vertexLayoutInfo.bindingDescriptions.size());
+    vertexInputStateCreateInfo_.pVertexBindingDescriptions =
+        vertexLayoutInfo.bindingDescriptions.data();
     vertexInputStateCreateInfo_.vertexAttributeDescriptionCount = vertexLayoutInfo.attributeDescriptions.size();
     vertexInputStateCreateInfo_.pVertexAttributeDescriptions = vertexLayoutInfo.attributeDescriptions.data();
 

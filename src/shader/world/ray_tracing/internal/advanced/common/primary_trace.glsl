@@ -26,6 +26,11 @@ void initMainRay(vec3 origin, vec3 direction, uint seed, float coneSpread, out M
     ray.seed = xxhash32(uvec3(gl_LaunchIDEXT.x, gl_LaunchIDEXT.y, seed));
     ray.radiance = vec3(0.0);
     ray.coneWidth = 0.0;
+    if (abs(worldUBO.cameraProjMat[3][3]) > 0.5) {
+        ray.coneWidth = max(1.0 / (abs(worldUBO.cameraProjMat[0][0]) * float(gl_LaunchSizeEXT.x)),
+                            1.0 / (abs(worldUBO.cameraProjMat[1][1]) * float(gl_LaunchSizeEXT.y)));
+        coneSpread = 0.0;
+    }
     ray.throughput = vec3(1.0);
     ray.coneSpread = coneSpread;
     ray.stateBits = 0u;
@@ -63,22 +68,19 @@ void resetMainRay(inout MainRay ray, int bounce) {
 
 void preparePrimary(int step, int isHand, out float len, out uint mask, out uint missId) {
     if (isHand == 0) {
+        uint cameraEntityMask = worldUBO.isFirstPerson > 0 ? 0u : PLAYER_MASK;
         missId = step == 0 ? ADV_WORLD_MISS_INDEX : ADV_WORLD_NO_VOLUMETRIC_MISS_INDEX;
         if (step == 0) {
             len = 1000.0;
-            if (worldUBO.isFirstPerson > 0) {
-                mask = WORLD_MASK | FISHING_BOBBER_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK | BOAT_WATER_MASK;
-            } else {
-                mask = WORLD_MASK | PLAYER_MASK | FISHING_BOBBER_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK |
-                       BOAT_WATER_MASK;
-            }
+            mask = WORLD_MASK | cameraEntityMask | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK |
+                   BOAT_WATER_MASK;
         } else if (step <= 1) {
             len = 1000.0;
-            mask = WORLD_MASK | PLAYER_MASK | FISHING_BOBBER_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK |
+            mask = WORLD_MASK | cameraEntityMask | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK |
                    BOAT_WATER_MASK;
         } else {
             len = 384.0;
-            mask = WORLD_MASK | PLAYER_MASK | FISHING_BOBBER_MASK | BOAT_WATER_MASK;
+            mask = WORLD_MASK | cameraEntityMask | PARTICLE_MASK | BOAT_WATER_MASK;
         }
     } else {
         if (step == 0) {
@@ -87,11 +89,11 @@ void preparePrimary(int step, int isHand, out float len, out uint mask, out uint
             missId = ADV_HAND_MISS_INDEX;
         } else if (step <= 1) {
             len = 384.0;
-            mask = WORLD_MASK | FISHING_BOBBER_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK | BOAT_WATER_MASK;
+            mask = WORLD_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK | BOAT_WATER_MASK;
             missId = step == 1 ? ADV_WORLD_MISS_INDEX : ADV_WORLD_NO_VOLUMETRIC_MISS_INDEX;
         } else {
             len = 384.0;
-            mask = WORLD_MASK | FISHING_BOBBER_MASK | BOAT_WATER_MASK;
+            mask = WORLD_MASK | PARTICLE_MASK | BOAT_WATER_MASK;
             missId = ADV_WORLD_NO_VOLUMETRIC_MISS_INDEX;
         }
     }
@@ -126,7 +128,9 @@ void tracePrimary(vec3 eyePos,
         vec3 tracedOrigin = rayState.origin;
         vec3 tracedDirection = rayState.direction;
         mainRay = rayState;
+        mainRay.stateBits = uiPrimaryTraceState(mainRay.stateBits, uint(step));
         traceRayEXT(topLevelAS, rayFlags, mask, 1, 1, missId, mainRay.origin, 0.0001, mainRay.direction, len, 0);
+        mainRay.stateBits &= ~rayUiPrimaryBit;
         rayState = mainRay;
 
         if (!surfaceDepthSampled) {

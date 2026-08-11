@@ -34,6 +34,7 @@ layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Ind
 indexBuffer;
 
 #include "util/vertex.glsl"
+#include "util/world_material_faces.glsl"
 
 layout(location = 0) rayPayloadInEXT MainRay mainRay;
 hitAttributeEXT vec2 attribs;
@@ -44,11 +45,21 @@ void main() {
         return;
     }
 
-    return;
     uint instanceID = gl_InstanceCustomIndexEXT;
     uint geometryID = gl_GeometryIndexEXT;
 
     uint geometryBufferIndex = getGeometryBufferIndex(instanceID, geometryID);
+    if (!acceptsWorldMaterialFace(instanceAppearances.values[geometryBufferIndex].materialFlags, gl_HitKindEXT == gl_HitKindFrontFacingTriangleEXT, geometryBufferIndex, gl_PrimitiveID, rayBounce(mainRay)==0u)) {
+        ignoreIntersectionEXT;
+        return;
+    }
+    return;
+    if (!acceptsUiOwner(instanceAppearances.values[geometryBufferIndex].materialFlags,
+            ubo.uiPrimaryOwner, mainRay.stateBits)) {
+        ignoreIntersectionEXT;
+        return;
+    }
+
 
     uint i0;
     uint i1;

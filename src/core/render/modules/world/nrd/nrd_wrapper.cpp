@@ -1,3 +1,4 @@
+#include "core/logging.hpp"
 /*
  * Copyright (c) 2024-2025, NVIDIA CORPORATION.  All rights reserved.
  *
@@ -227,8 +228,17 @@ void NrdWrapper::init(std::shared_ptr<Framework> framework, uint16_t width, uint
         vkSubmitInfo.pCommandBuffers = &oneTimeBuffer->vkCommandBuffer();
         vkSubmitInfo.signalSemaphoreCount = 0;
         vkSubmitInfo.pSignalSemaphores = nullptr;
-        vkQueueSubmit(framework->device()->mainVkQueue(), 1, &vkSubmitInfo, fence->vkFence());
-        vkWaitForFences(framework->device()->vkDevice(), 1, &fence->vkFence(), true, UINT64_MAX);
+        VkResult result =
+            vkQueueSubmit(framework->device()->mainVkQueue(), 1, &vkSubmitInfo, fence->vkFence());
+        if (result != VK_SUCCESS) {
+            framework->recordFailure(result, "vkQueueSubmit(NRD initialization)");
+            throw std::runtime_error("Failed to submit NRD initialization: VkResult=" + std::to_string(result));
+        }
+        result = vkWaitForFences(framework->device()->vkDevice(), 1, &fence->vkFence(), true, UINT64_MAX);
+        if (result != VK_SUCCESS) {
+            framework->recordFailure(result, "vkWaitForFences(NRD initialization)");
+            throw std::runtime_error("Failed to wait for NRD initialization: VkResult=" + std::to_string(result));
+        }
     }
 
     // Create the samplers
@@ -437,7 +447,7 @@ void NrdWrapper::createPipelines() {
 #pragma omp parallel for
     for (int p = 0; p < static_cast<int>(iDesc->pipelinesNum); ++p) {
 #ifdef DEBUG
-        std::cout << "Compiling NRD pipeline " << p << std::endl;
+        mcvr::log::info("NrdWrapper") << "Compiling NRD pipeline " << p << std::endl;
 #endif
 
         const nrd::PipelineDesc &pDesc = iDesc->pipelines[p];
@@ -484,7 +494,7 @@ void NrdWrapper::createPipelines() {
 
         nrdPipeline.numBindings = setLayoutInfo.bindingCount;
 #ifdef DEUBG
-        std::cout << "Pipeline uses " << nrdPipeline.numBindings << " bindings" << std::endl;
+        mcvr::log::info("NrdWrapper") << "Pipeline uses " << nrdPipeline.numBindings << " bindings" << std::endl;
 #endif
 
         // NRD using these two set indexes is a hardcoded assumption that NRD promised not to break
@@ -520,7 +530,7 @@ void NrdWrapper::createPipelines() {
                                                              .stage = stageCreateInfo,
                                                              .layout = nrdPipeline.pipelineLayout};
 
-        result = vkCreateComputePipelines(device->vkDevice(), VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr,
+        result = device->createComputePipelines(1, &pipelineCreateInfo, nullptr,
                                           &nrdPipeline.pipeline);
         vkDestroyShaderModule(device->vkDevice(), shaderModule, nullptr);
         if (result != VK_SUCCESS) { throw std::runtime_error("NRD: failed to create compute pipeline!"); }

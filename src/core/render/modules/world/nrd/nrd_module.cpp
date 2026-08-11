@@ -1,3 +1,4 @@
+#include "core/logging.hpp"
 #include "nrd_module.hpp"
 #include "core/render/buffers.hpp"
 #include "core/render/pipeline.hpp"
@@ -24,7 +25,6 @@ void NrdModule::updateReblurSettings() {
     settings.hitDistanceParameters.A = std::max(settings.hitDistanceParameters.A, 0.0f);
     settings.hitDistanceParameters.B = std::max(settings.hitDistanceParameters.B, 0.0f);
     settings.hitDistanceParameters.C = std::max(settings.hitDistanceParameters.C, 1.0f);
-    settings.hitDistanceParameters.D = std::min(settings.hitDistanceParameters.D, 0.0f);
 
     settings.antilagSettings.luminanceSigmaScale = std::clamp(settings.antilagSettings.luminanceSigmaScale, 1.0f, 5.0f);
     settings.antilagSettings.luminanceSensitivity =
@@ -71,13 +71,13 @@ void NrdModule::updateReblurSettings() {
 NrdModule::NrdModule() : reblurSettings_(makeDefaultReblurSettings()) {}
 
 NrdModule::~NrdModule() {
-    wrapper_ = nullptr;
+    histories_.clear();
 }
 
 void NrdModule::init(std::shared_ptr<Framework> framework, std::shared_ptr<WorldPipeline> worldPipeline) {
     WorldModule::init(framework, worldPipeline);
 
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     diffuseIndirectRadianceImages_.resize(size);
     specularIndirectRadianceImages_.resize(size);
@@ -113,7 +113,7 @@ bool NrdModule::setOrCreateInputImages(std::vector<std::shared_ptr<vk::DeviceLoc
     for (uint32_t i = 0; i < images.size(); i++) {
         if (images[i] == nullptr) {
             if (width_ == 0 || height_ == 0) {
-                std::cerr << "[NrdModule] Error: Cannot create input image " << i << " because dimensions are unknown."
+                mcvr::log::error("NrdModule") << "[NrdModule] Error: Cannot create input image " << i << " because dimensions are unknown."
                           << std::endl;
                 return false;
             }
@@ -156,14 +156,14 @@ bool NrdModule::setOrCreateOutputImages(std::vector<std::shared_ptr<vk::DeviceLo
 void NrdModule::build() {
     auto framework = framework_.lock();
     auto worldPipeline = worldPipeline_.lock();
-    uint32_t size = framework->swapchain()->imageCount();
-
-    wrapper_ = NrdWrapper::create(framework, width_, height_);
+    uint32_t size = framework->recordingContextCount();
 
     updateReblurSettings();
-    wrapper_->setREBLURSettings(reblurSettings_);
-    lastRefractionHistoryFrameIndex_ = -1;
-    nrdFrameIndex_ = 0;
+    histories_.resize(worldPipeline->viewCount());
+    for (auto &history : histories_) {
+        history.wrapper_ = NrdWrapper::create(framework, width_, height_);
+        history.wrapper_->setREBLURSettings(reblurSettings_);
+    }
 
     initDescriptorTables();
     initImages();
@@ -220,8 +220,6 @@ void NrdModule::setAttributes(int attributeCount, std::vector<std::string> &attr
             reblurSettings_.hitDistanceParameters.B = parseFloat(value, reblurSettings_.hitDistanceParameters.B);
         } else if (key == "render_pipeline.module.nrd.attribute.hit_distance_parameters_c") {
             reblurSettings_.hitDistanceParameters.C = parseFloat(value, reblurSettings_.hitDistanceParameters.C);
-        } else if (key == "render_pipeline.module.nrd.attribute.hit_distance_parameters_d") {
-            reblurSettings_.hitDistanceParameters.D = parseFloat(value, reblurSettings_.hitDistanceParameters.D);
         } else if (key == "render_pipeline.module.nrd.attribute.antilag_luminance_sigma_scale") {
             reblurSettings_.antilagSettings.luminanceSigmaScale =
                 parseFloat(value, reblurSettings_.antilagSettings.luminanceSigmaScale);
@@ -306,13 +304,20 @@ void NrdModule::bindTexture(std::shared_ptr<vk::Sampler> sampler,
                             std::shared_ptr<vk::DeviceLocalImage> image,
                             int index) {}
 
+void NrdModule::onResourceReload() {
+    for (auto &history : histories_) {
+        history.nrdFrameIndex_ = 0;
+        history.lastRefractionHistoryFrameIndex_ = -1;
+    }
+}
+
 void NrdModule::preClose() {
-    wrapper_ = nullptr;
+    histories_.clear();
 }
 
 void NrdModule::initDescriptorTables() {
     auto framework = framework_.lock();
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     composeDescriptorTables_.resize(size);
     prepareDescriptorTables_.resize(size);
@@ -418,7 +423,7 @@ void NrdModule::initDescriptorTables() {
 
 void NrdModule::initImages() {
     auto framework = framework_.lock();
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     nrdDiffuseRadianceImages_.resize(size);
     nrdSpecularRadianceImages_.resize(size);
@@ -486,7 +491,6 @@ void NrdModule::initImages() {
                                          VK_FORMAT_R16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
         prepareDescriptorTables_[i]->bindImage(nrdLinearDepthImages_[i], VK_IMAGE_LAYOUT_GENERAL, 1, 4);
         userTexturePools_[i]->at((size_t)nrd::ResourceType::IN_VIEWZ) = nrdLinearDepthImages_[i];
-        userTexturePools_[i]->at((size_t)nrd::ResourceType::IN_BASECOLOR_METALNESS) = diffuseAlbedoMetallicImages_[i];
 
         composeDescriptorTables_[i]->bindImage(diffuseAlbedoMetallicImages_[i], VK_IMAGE_LAYOUT_GENERAL, 0, 0);
         composeDescriptorTables_[i]->bindImage(specularAlbedoImages_[i], VK_IMAGE_LAYOUT_GENERAL, 0, 1);
@@ -554,8 +558,12 @@ void NrdModule::initImages() {
     }
 
     commandBuffer->end();
-    commandBuffer->submitMainQueueIndividual(framework->device());
-    vkQueueWaitIdle(framework->device()->mainVkQueue());
+    VkResult result = commandBuffer->submitMainQueueIndividual(framework->device());
+    if (result != VK_SUCCESS) {
+        framework->recordFailure(result, "vkQueueSubmit(NRD history clear)");
+        return;
+    }
+    if (framework->waitRenderQueueIdle() != VK_SUCCESS) { return; }
 }
 
 void NrdModule::initPipeline() {
@@ -611,7 +619,7 @@ NrdModuleContext::NrdModuleContext(std::shared_ptr<FrameworkContext> frameworkCo
 
 void NrdModuleContext::render() {
     auto module = nrdModule.lock();
-    if (!module || !module->wrapper_) return;
+    if (!module || !module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).wrapper_) return;
 
     auto context = frameworkContext.lock();
     auto framework = context->framework.lock();
@@ -685,9 +693,9 @@ void NrdModuleContext::render() {
         commonSettings.cameraJitter[1] = worldUBO->cameraJitter.y;
         commonSettings.cameraJitterPrev[0] = lastWorldUBO->cameraJitter.x;
         commonSettings.cameraJitterPrev[1] = lastWorldUBO->cameraJitter.y;
-        commonSettings.frameIndex = module->nrdFrameIndex_;
+        commonSettings.frameIndex = module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).nrdFrameIndex_;
         commonSettings.accumulationMode =
-            module->nrdFrameIndex_ == 0 ? nrd::AccumulationMode::CLEAR_AND_RESTART : nrd::AccumulationMode::CONTINUE;
+            module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).nrdFrameIndex_ == 0 ? nrd::AccumulationMode::CLEAR_AND_RESTART : nrd::AccumulationMode::CONTINUE;
 
         commonSettings.motionVectorScale[0] = 1.0f / module->width_;
         commonSettings.motionVectorScale[1] = 1.0f / module->height_;
@@ -697,13 +705,12 @@ void NrdModuleContext::render() {
         commonSettings.disocclusionThresholdAlternate = 0.15f;
         commonSettings.isMotionVectorInWorldSpace = false;
 
-        commonSettings.isBaseColorMetalnessAvailable = true;
         commonSettings.isDisocclusionThresholdMixAvailable = false;
         commonSettings.enableValidation = false;
 
-        module->wrapper_->setCommonSettings(commonSettings);
-        module->wrapper_->setUserPoolTexture(userTexturePool);
-        module->nrdFrameIndex_++;
+        module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).wrapper_->setCommonSettings(commonSettings);
+        module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).wrapper_->setUserPoolTexture(userTexturePool);
+        module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).nrdFrameIndex_++;
     }
 
     // prepare
@@ -749,19 +756,20 @@ void NrdModuleContext::render() {
         worldCommandBuffer->barriersBufferImage({}, imageBarriers);
 
         nrd::Identifier denoiser = nrd::Identifier(nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR);
-        module->wrapper_->denoise(&denoiser, 1, worldCommandBuffer->vkCommandBuffer());
+        module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).wrapper_->denoise(&denoiser, 1, worldCommandBuffer->vkCommandBuffer());
     }
 
     // composition
     {
-        const uint32_t historyImageCount = static_cast<uint32_t>(module->refractionHistoryRadianceImages_.size());
+        const uint32_t historyImageCount = module->worldPipeline_.lock()->framesPerView();
+        const uint32_t viewBase = (context->frameIndex / historyImageCount) * historyImageCount;
         const uint32_t currentFrameIndex = context->frameIndex;
-        uint32_t prevFrameIndex = (currentFrameIndex + historyImageCount - 1) % historyImageCount;
-        if (module->lastRefractionHistoryFrameIndex_ >= 0) {
-            prevFrameIndex = static_cast<uint32_t>(module->lastRefractionHistoryFrameIndex_);
+        uint32_t prevFrameIndex = viewBase + (currentFrameIndex + historyImageCount - 1) % historyImageCount;
+        if (module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).lastRefractionHistoryFrameIndex_ >= 0) {
+            prevFrameIndex = static_cast<uint32_t>(module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).lastRefractionHistoryFrameIndex_);
         }
         if (prevFrameIndex == currentFrameIndex && historyImageCount > 1) {
-            prevFrameIndex = (currentFrameIndex + 1) % historyImageCount;
+            prevFrameIndex = viewBase + (currentFrameIndex + 1) % historyImageCount;
         }
 
         auto refractionHistoryRadianceImagePrev = module->refractionHistoryRadianceImages_[prevFrameIndex];
@@ -801,6 +809,6 @@ void NrdModuleContext::render() {
         vkCmdDispatch(worldCommandBuffer->vkCommandBuffer(), (module->width_ + 15) / 16, (module->height_ + 15) / 16,
                       1);
 
-        module->lastRefractionHistoryFrameIndex_ = static_cast<int32_t>(currentFrameIndex);
+        module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).lastRefractionHistoryFrameIndex_ = static_cast<int32_t>(currentFrameIndex);
     }
 }

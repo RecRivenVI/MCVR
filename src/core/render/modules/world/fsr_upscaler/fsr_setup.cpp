@@ -1,3 +1,4 @@
+#include "core/logging.hpp"
 // This file is part of the FidelityFX SDK.
 //
 // Copyright (C) 2024 Advanced Micro Devices, Inc.
@@ -74,17 +75,20 @@ PFN_vkVoidFunction customVkGetDeviceProcAddr(VkDevice device, const char *pName)
 }
 
 void messageCallback(uint32_t type, const wchar_t *message) {
-    if (type == FFX_API_MESSAGE_TYPE_ERROR) {
-        std::cerr << "[FSR] ERROR: ";
-    } else if (type == FFX_API_MESSAGE_TYPE_WARNING) {
-        std::cerr << "[FSR] WARNING: ";
-    } else {
-        std::cerr << "[FSR] UNKNOWN: ";
+    try {
+        char buffer[1024]{};
+        if (message != nullptr) wcstombs(buffer, message, sizeof(buffer) - 1);
+        buffer[sizeof(buffer) - 1] = '\0';
+        if (type == FFX_API_MESSAGE_TYPE_ERROR) {
+            mcvr::log::error("FsrSetup") << buffer << std::endl;
+        } else if (type == FFX_API_MESSAGE_TYPE_WARNING) {
+            mcvr::log::warn("FsrSetup") << buffer << std::endl;
+        } else {
+            mcvr::log::debug("FsrSetup") << buffer << std::endl;
+        }
+    } catch (...) {
+        // Never let a C++ exception cross the FidelityFX callback boundary.
     }
-    char buffer[1024];
-    wcstombs(buffer, message, sizeof(buffer) - 1);
-    buffer[sizeof(buffer) - 1] = '\0';
-    std::cerr << buffer << std::endl;
 }
 
 #endif

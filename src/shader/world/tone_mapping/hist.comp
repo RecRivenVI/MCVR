@@ -70,15 +70,22 @@ void main() {
     if (sampleForHistogram) {
         vec3 hdr = texelFetch(uHdr, p, 0).rgb;
 
-        float lum = dot(hdr, LUMA);
-        float logLum = log2(max(lum, pc.epsilon));
+        // Invalid producer output is not a luminance sample and must not index the histogram.
+        if (any(isnan(hdr)) || any(isinf(hdr))) {
+            sampleForHistogram = false;
+        }
 
-        float denom = (pc.log2Max - pc.log2Min);
-        float t = (denom != 0.0) ? (logLum - pc.log2Min) / denom : 0.0;
-        t = clamp(t, 0.0, 1.0);
+        if (sampleForHistogram) {
+            float lum = dot(max(hdr, vec3(0.0)), LUMA);
+            float logLum = log2(max(lum, pc.epsilon));
 
-        uint bin = uint(t * float(NUM_BINS - 1));
-        atomicAdd(sHist[bin], 1u);
+            float denom = (pc.log2Max - pc.log2Min);
+            float t = (denom != 0.0) ? (logLum - pc.log2Min) / denom : 0.0;
+            t = clamp(t, 0.0, 1.0);
+
+            uint bin = uint(t * float(NUM_BINS - 1));
+            atomicAdd(sHist[bin], 1u);
+        }
     }
 
     barrier();

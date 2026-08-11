@@ -62,6 +62,7 @@ layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Ind
 indexBuffer;
 
 #include "util/vertex.glsl"
+#include "util/geometry_backface_debug.glsl"
 
 layout(location = 0) rayPayloadInEXT MainRay mainRay;
 layout(location = 1) rayPayloadEXT ShadowRay shadowRay;
@@ -74,6 +75,7 @@ void main() {
     uint geometryID = gl_GeometryIndexEXT;
 
     uint geometryBufferIndex = getGeometryBufferIndex(instanceID, geometryID);
+    if (geometryBackfaceDebug(mainRay, instanceAppearances.values[geometryBufferIndex].materialFlags)) return;
 
     uint i0;
     uint i1;
@@ -145,8 +147,8 @@ void main() {
     shadowRay.throughput = vec3(1.0);
     shadowRay.insideBoat = 0u;
     shadowRay.pad0 = 0u;
-    traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT,
-                WORLD_MASK, // masks
+    traceRayEXT(topLevelAS, gl_RayFlagsCullBackFacingTrianglesEXT,
+                WORLD_MASK | PRIORITY_MASK, // masks
                 0,          // sbtRecordOffset
                 0,          // sbtRecordStride
                 0,          // missIndex

@@ -7,14 +7,24 @@ endif(WIN32)
 
 file(GLOB_RECURSE GLSL_SHADERS CONFIGURE_DEPENDS "*.vert" "*.frag" "*.rgen" "*.rmiss" "*.rchit" "*.rahit" "*.comp")
 list(FILTER GLSL_SHADERS EXCLUDE REGEX "world/ray_tracing/internal") # exclude world shaders
-file(GLOB_RECURSE GLSL_DEPENDS CONFIGURE_DEPENDS "../common/*.hpp" "../common/*.glsl" "util/*.glsl")
+file(GLOB_RECURSE GLSL_DEPENDS CONFIGURE_DEPENDS
+    "../common/*.hpp"
+    "../common/*.glsl"
+    "util/*.glsl"
+    "world/nrd/*.glsl"
+    "overlay/post/*.glsl")
 
 set(SPIRV_OUTPUT_PATH "${CMAKE_CURRENT_BINARY_DIR}/shaders")
 file(MAKE_DIRECTORY ${SPIRV_OUTPUT_PATH})
 
 set(SPIRV_OUTPUT_FILES "")
 
-set(SHADER_FLAGS "$<$<CONFIG:Debug>:-g>" "$<$<CONFIG:Debug>:-Od>")
+set(SHADER_FLAGS
+    "$<$<CONFIG:Debug>:-g>"
+    "$<$<CONFIG:Debug>:-Od>"
+    "-DNRD_NORMAL_ENCODING=${NRD_NORMAL_ENCODING}"
+    "-DNRD_ROUGHNESS_ENCODING=${NRD_ROUGHNESS_ENCODING}"
+)
 
 foreach(GLSL_SHADER ${GLSL_SHADERS})
     file(RELATIVE_PATH REL_PATH "${CMAKE_CURRENT_SOURCE_DIR}" "${GLSL_SHADER}")
@@ -36,6 +46,32 @@ foreach(GLSL_SHADER ${GLSL_SHADERS})
     )
 
     list(APPEND SPIRV_OUTPUT_FILES "${SPIRV_FILE}")
+endforeach()
+
+# Framebuffer clears use one output per draw-buffer slot, including GL_NONE slots.
+foreach(CLEAR_ATTACHMENT_COUNT RANGE 2 32)
+    set(CLEAR_SPIRV "${SPIRV_OUTPUT_PATH}/overlay/clear_${CLEAR_ATTACHMENT_COUNT}_frag.spv")
+    add_custom_command(
+        OUTPUT "${CLEAR_SPIRV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${SPIRV_OUTPUT_PATH}/overlay"
+        COMMAND ${GLSLVALIDATOR} ${SHADER_FLAGS} -V "${CMAKE_CURRENT_SOURCE_DIR}/overlay/clear.frag"
+            "-DCLEAR_ATTACHMENTS=${CLEAR_ATTACHMENT_COUNT}" -o "${CLEAR_SPIRV}" --target-env vulkan1.4
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/overlay/clear.frag"
+        VERBATIM COMMAND_EXPAND_LISTS
+    )
+    list(APPEND SPIRV_OUTPUT_FILES "${CLEAR_SPIRV}")
+endforeach()
+
+# CONFIGURE_DEPENDS updates the generated commands when shader sources change,
+# but CMake does not automatically delete outputs whose source was removed.
+# Keep the install tree source-faithful so obsolete post-render shaders cannot
+# survive in a clean staging directory or the packaged Radiance JAR.
+file(GLOB_RECURSE EXISTING_SPIRV_OUTPUTS "${SPIRV_OUTPUT_PATH}/*.spv")
+foreach(EXISTING_SPIRV_OUTPUT ${EXISTING_SPIRV_OUTPUTS})
+    list(FIND SPIRV_OUTPUT_FILES "${EXISTING_SPIRV_OUTPUT}" EXPECTED_SPIRV_INDEX)
+    if(EXPECTED_SPIRV_INDEX EQUAL -1)
+        file(REMOVE "${EXISTING_SPIRV_OUTPUT}")
+    endif()
 endforeach()
 
 add_custom_target(shaders ALL
@@ -88,6 +124,8 @@ install(CODE "
         file(COPY \"${RT_COMMON_SRC_DIR}/\" DESTINATION \"\${RT_PACK_STAGING_DIR}/common\")
         file(COPY \"${RT_SHARC_SRC_DIR}/\" DESTINATION \"\${RT_PACK_STAGING_DIR}/extern/sharc/include\")
         file(REMOVE \"\${RT_PACK_OUTPUT}\")
+
+        file(COPY \"${RT_INTERNAL_ROOT_DIR}/vanilla-pt/priority/\" DESTINATION \"\${RT_PACK_STAGING_DIR}/priority\")
 
         execute_process(
             COMMAND \"${CMAKE_COMMAND}\" -E tar \"cf\" \"\${RT_PACK_OUTPUT}\" --format=zip .

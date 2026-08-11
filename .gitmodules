@@ -18,10 +18,10 @@
 	url = https://github.com/nothings/stb.git
 [submodule "extern/DLSS"]
 	path = extern/DLSS
-	url = https://github.com/Ljiong201108/DLSS.git
+	url = https://github.com/NVIDIA/DLSS.git
 [submodule "extern/nrd"]
 	path = extern/nrd
-	url = https://github.com/NVIDIAGameWorks/RayTracingDenoiser.git
+	url = https://github.com/NVIDIA-RTX/NRD.git
 [submodule "extern/FidelityFX-SDK"]
 	path = extern/FidelityFX-SDK
 	url = https://github.com/Interstellarss/FidelityFX-SDK.git

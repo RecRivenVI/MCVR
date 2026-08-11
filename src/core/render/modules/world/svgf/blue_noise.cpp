@@ -1,5 +1,7 @@
 #include "blue_noise.hpp"
 
+#include "core/logging.hpp"
+
 #include <iostream>
 
 // Include the FFX blue noise data
@@ -8,8 +10,8 @@
 //   - scramblingTile[128*128*8]
 #include "../../../extern/FidelityFX-SDK/sdk/src/components/sssr/samplerBlueNoiseErrorDistribution_128x128_OptimizedFor_2d2d2d2d_1spp.cpp"
 
-std::ostream &blueNoiseCout() {
-    return std::cout << "[BlueNoise] ";
+auto blueNoiseCout() {
+    return mcvr::log::info("BlueNoise");
 }
 
 BlueNoise::BlueNoise(std::shared_ptr<vk::Device> device, std::shared_ptr<vk::VMA> vma) {

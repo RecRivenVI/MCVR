@@ -7,7 +7,9 @@
 
 #include "util/ray_cone.glsl"
 #include "util/ray.glsl"
+#include "util/alpha_mode.glsl"
 #include "util/color_space.glsl"
+#include "util/surface_overlay.glsl"
 #include "common/shared.hpp"
 
 layout(set = 0, binding = 0) uniform sampler2D textures[];
@@ -36,6 +38,10 @@ layout(set = 1, binding = 7) readonly buffer TextureMappingBuffer {
     TextureMapping mapping;
 };
 
+layout(set = 2, binding = 0) uniform WorldUniform {
+    WorldUBO worldUBO;
+};
+
 layout(set = 1, binding = 6) readonly buffer LastPositionBufferAddr {
     uint64_t addrs[];
 }
@@ -47,6 +53,7 @@ layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Ind
 indexBuffer;
 
 #include "util/vertex.glsl"
+#include "util/geometry_backface_debug.glsl"
 
 layout(location = 0) rayPayloadInEXT MainRay mainRay;
 hitAttributeEXT vec2 attribs;
@@ -62,7 +69,12 @@ bool loadPreviousScenePos(uint geometryBufferIndex, uint primitiveID, vec3 baryC
     uint i1 = lastIndexBuffer.indices[indexBaseID + 1u];
     uint i2 = lastIndexBuffer.indices[indexBaseID + 2u];
 
+    uint current0,current1,current2;
+    loadTriangleIndices(geometryBufferIndex,primitiveID,current0,current1,current2);
+    if(current0!=i0 || current1!=i1 || current2!=i2) return false;
+    PositionBuffer currentPositionBuffer=PositionBuffer(positionBufferAddrs.addrs[geometryBufferIndex]);
     PositionBuffer lastPositionBuffer = PositionBuffer(lastPositionAddr);
+    if(((currentPositionBuffer.vertices[current0].pad0 ^ lastPositionBuffer.vertices[i0].pad0)&2u)!=0u) return false;
     vec3 p0 = lastPositionBuffer.vertices[i0].pos;
     vec3 p1 = lastPositionBuffer.vertices[i1].pos;
     vec3 p2 = lastPositionBuffer.vertices[i2].pos;
@@ -77,6 +89,7 @@ void main() {
     uint instanceID = gl_InstanceCustomIndexEXT;
     uint geometryID = gl_GeometryIndexEXT;
     uint geometryBufferIndex = getGeometryBufferIndex(instanceID, geometryID);
+    if (geometryBackfaceDebug(mainRay, instanceAppearances.values[geometryBufferIndex].materialFlags)) return;
 
     uint i0, i1, i2;
     PositionVertex p0, p1, p2;
@@ -88,6 +101,12 @@ void main() {
     vec4 colorLayer = hasColorLayer(m0.packedData) ?
                           (bary.x * m0.colorLayer + bary.y * m1.colorLayer + bary.z * m2.colorLayer) :
                           vec4(1.0);
+    vec3 flywheelLocalPosition = bary.x * p0.pos + bary.y * p1.pos + bary.z * p2.pos;
+    vec3 flywheelLocalNormal = normalize(bary.x * m0.norm + bary.y * m1.norm + bary.z * m2.norm);
+    ivec2 flywheelLightUv = ivec2(round(bary.x * vec2(m0.lightUV)
+        + bary.y * vec2(m1.lightUV) + bary.z * vec2(m2.lightUV)));
+    applyFlywheelFragmentLighting(geometryBufferIndex, flywheelLocalPosition,
+        flywheelLocalNormal, colorLayer, flywheelLightUv);
 
     vec4 albedo = vec4(1.0);
     float pbrEmission = 0.0;
@@ -103,24 +122,54 @@ void main() {
         }
     }
 
-    vec4 shaded = albedo * colorLayer;
-    float alpha = clamp(shaded.a, 0.0, 1.0);
+    float radianceLayeredAlpha = hasColorLayerMix(m0.packedData) ? albedo.a : albedo.a * colorLayer.a;
+    bool useOverlay = hasOverlay(m0.packedData);
+    vec4 overlayColor = vec4(0.0, 0.0, 0.0, 1.0);
+    if (useOverlay) {
+        overlayColor = sampleTexture(textures[nonuniformEXT(worldUBO.overlayTextureID)],
+            m0.overlayUV, 0, false);
+    }
+    vec3 tint = applySurfaceMaterialColor(albedo.rgb, colorLayer,
+        hasColorLayerMix(m0.packedData), useOverlay, overlayColor);
+    vec4 shaded = vec4(tint, radianceLayeredAlpha);
+    uint alphaMode = getAlphaMode(m0.packedData);
+    float alpha = resolveSurfaceAlpha(shaded.a, alphaMode);
     vec3 shadedRgb = clamp(shaded.rgb, vec3(0.0), vec3(1.0));
-    vec3 transmittance = vec3(clamp(albedo.a, 0.0, 1.0));
+    float albedoEmission =
+        bary.x * m0.albedoEmission + bary.y * m1.albedoEmission + bary.z * m2.albedoEmission;
 
     float factor = rayBounce(mainRay) == 0u ? VPT_DIRECT_LIGHT_STRENGTH : VPT_INDIRECT_LIGHT_STRENGTH;
     mainRay.radiance += factor * shadedRgb * alpha * pbrEmission * mainRay.throughput;
-    mainRay.throughput *= transmittance;
+    mainRay.radiance += shadedRgb * alpha * albedoEmission * mainRay.throughput;
+    if (alphaMode == ALPHA_MODE_ADDITIVE) {
+        mainRay.radiance += shadedRgb * mainRay.throughput;
+    } else if (alphaMode == ALPHA_MODE_FLYWHEEL_LIGHTNING) {
+        mainRay.radiance += shadedRgb * alpha * mainRay.throughput;
+    } else if (alphaMode == ALPHA_MODE_FLYWHEEL_GLINT) {
+        mainRay.radiance += shadedRgb * shadedRgb * mainRay.throughput;
+    } else if (alphaMode == ALPHA_MODE_FLYWHEEL_CRUMBLING) {
+        mainRay.throughput *= 2.0 * shadedRgb;
+    } else if (alphaMode == ALPHA_MODE_FLYWHEEL_TRANSLUCENT) {
+        mainRay.radiance += shadedRgb * alpha * mainRay.throughput;
+        mainRay.throughput *= vec3(1.0 - alpha);
+    } else if (alphaMode == ALPHA_MODE_ORDERED_OPAQUE) {
+        // Unlit overlay stroke: write the overlay colour and stop so nothing bleeds through,
+        // matching the vanilla opaque outline pass.
+        mainRay.radiance += shadedRgb * mainRay.throughput;
+        mainRay.throughput = vec3(0.0);
+    } else {
+        mainRay.throughput *= vec3(1.0 - alpha);
+    }
 
     vec3 worldPos = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
     vec3 geoNormalObj = normalize(cross(p1.pos - p0.pos, p2.pos - p0.pos));
-    mat3 normalMatrix = transpose(mat3(gl_WorldToObject3x4EXT));
+    mat3 normalMatrix = mat3(gl_WorldToObject3x4EXT);
     vec3 normal = normalize(normalMatrix * geoNormalObj);
     if (dot(normal, -mainRay.direction) < 0.0) { normal = -normal; }
     float defaultF0 = 0.02;
     float sqrtF0 = sqrt(defaultF0);
     float ior = (1.0 + sqrtF0) / max(1.0 - sqrtF0, 1e-6);
-    float payloadTransmission = alpha < 0.999999 ? 1.0 : 0.0;
+    float payloadTransmission = alpha < 0.999999 || isAdditiveAlphaMode(alphaMode) ? 1.0 : 0.0;
 
     mainRay.normal = normal;
     rayStoreMaterial(mainRay, vec4(shadedRgb, alpha), vec3(defaultF0), 1.0, 0.0, payloadTransmission, ior, 0.0);

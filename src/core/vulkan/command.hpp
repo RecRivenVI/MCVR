@@ -116,9 +116,9 @@ class CommandBuffer : public SharedObject<CommandBuffer> {
     std::shared_ptr<CommandBuffer> end();
     std::shared_ptr<CommandBuffer> reset(VkCommandBufferResetFlags flags = 0);
 
-    void submitMainQueueIndividual(std::shared_ptr<Device> device);
-    void submitMainQueueIndividual(std::shared_ptr<Device> device, std::shared_ptr<Fence> fence);
-    void submitMainQueue(std::shared_ptr<Device> device, SubmitInfo submitInfo);
+    VkResult submitMainQueueIndividual(std::shared_ptr<Device> device);
+    VkResult submitMainQueueIndividual(std::shared_ptr<Device> device, std::shared_ptr<Fence> fence);
+    VkResult submitMainQueue(std::shared_ptr<Device> device, SubmitInfo submitInfo);
 
   private:
     std::shared_ptr<Device> device_;

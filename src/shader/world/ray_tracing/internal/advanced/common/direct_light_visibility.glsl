@@ -79,7 +79,8 @@ vec3 traceAreaLightReservoirTransmission(SampledSurface surface,
 
     float shadowLength = max(distanceToLight - shadowOriginDistance - ADV_AREA_LIGHT_VISIBILITY_DISTANCE_SHRINK, 0.0001);
     if (!isFiniteVec3(shadowOrigin) || !isFiniteFloat(shadowLength)) { return vec3(0.0); }
-    traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, WORLD_MASK | PLAYER_MASK | CLOUD_MASK, 0, 0, 0, shadowOrigin, 0.0001,
+    traceRayEXT(topLevelAS, gl_RayFlagsCullBackFacingTrianglesEXT,
+                WORLD_MASK | PLAYER_MASK | PRIORITY_MASK | PARTICLE_MASK | CLOUD_MASK, 0, 0, 0, shadowOrigin, 0.0001,
                 sampledLightDir, shadowLength, 1);
     return shadowRay.radiance;
 }

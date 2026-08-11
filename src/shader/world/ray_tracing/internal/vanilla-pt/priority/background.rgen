@@ -1,0 +1,70 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/shared.hpp"
+#include "util/camera_ray.glsl"
+#include "util/priority_payload.glsl"
+#include "util/util.glsl"
+
+layout(set = 1, binding = 0) uniform accelerationStructureEXT topLevelAS;
+layout(set = 2, binding = 0) uniform WorldUniform { WorldUBO worldUBO; };
+layout(set = 2, binding = 1) uniform LastWorldUniform { WorldUBO lastWorldUBO; };
+layout(set = 3, binding = 1, rgba8) uniform image2D diffuseAlbedoImage;
+layout(set = 3, binding = 2, rgba8) uniform image2D specularAlbedoImage;
+layout(set = 3, binding = 3, rgba16f) uniform image2D normalRoughnessImage;
+layout(set = 3, binding = 4, rg16f) uniform image2D motionVectorImage;
+layout(set = 3, binding = 5, r16f) uniform image2D linearDepthImage;
+layout(set = 3, binding = 6, r16f) uniform image2D specularHitDepthImage;
+layout(set = 3, binding = 7, r16f) uniform image2D firstHitDepthImage;
+layout(set = 5, binding = 39, rgba16f) uniform image2D priorityBackgroundImage;
+
+layout(location = 0) rayPayloadEXT PriorityRayPayload priorityRay;
+
+void main() {
+    ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+    ivec2 resolution = imageSize(priorityBackgroundImage);
+    if (any(greaterThanEqual(pixel, resolution))) { return; }
+
+    vec2 pixelCenter = vec2(pixel) + 0.5 + worldUBO.cameraJitter;
+    vec3 origin;
+    vec3 direction;
+    buildWorldCameraRay(worldUBO, pixelCenter, vec2(resolution), origin, direction);
+    uint priorityMask = PRIORITY_MASK;
+    if (worldUBO.isFirstPerson == 0) { priorityMask |= PLAYER_MASK; }
+
+    vec4 accumulated = vec4(0.0);
+    vec3 firstHitPosition = vec3(0.0);
+    bool hasFirstHit = false;
+    const int maxPriorityLayers = 32;
+    for (int layer = 0; layer < maxPriorityLayers && accumulated.a < 0.999; ++layer) {
+        priorityRay.color = vec4(0.0);
+        priorityRay.hitT = INF_DISTANCE;
+        traceRayEXT(topLevelAS, gl_RayFlagsCullBackFacingTrianglesEXT, priorityMask, 1, 1, 0,
+                    origin, 0.000001, direction, 1000.0, 0);
+        if (priorityRay.hitT == INF_DISTANCE || priorityRay.color.a <= 0.0) { break; }
+
+        vec3 hitPosition = origin + direction * priorityRay.hitT;
+        if (!hasFirstHit) { firstHitPosition = hitPosition; hasFirstHit = true; }
+        float remaining = 1.0 - accumulated.a;
+        float alpha = clamp(priorityRay.color.a, 0.0, 1.0);
+        accumulated.rgb += priorityRay.color.rgb * alpha * remaining;
+        accumulated.a += alpha * remaining;
+        origin += direction * (priorityRay.hitT + 0.00001);
+    }
+    imageStore(priorityBackgroundImage, pixel, accumulated);
+    if (hasFirstHit && accumulated.a > 0.0) {
+        float viewDepth = -(worldUBO.cameraEffectedViewMat * vec4(firstHitPosition, 1.0)).z;
+        vec3 cameraDelta = vec3(worldUBO.cameraPos.xyz - lastWorldUBO.cameraPos.xyz);
+        mat4 previous = lastWorldUBO.cameraProjMat * lastWorldUBO.cameraEffectedViewMat;
+        vec2 motion = computeCameraMotionVector(previous, pixelCenter,
+                                                vec4(firstHitPosition + cameraDelta, 1.0));
+        imageStore(diffuseAlbedoImage, pixel, vec4(0.0));
+        imageStore(specularAlbedoImage, pixel, vec4(0.0));
+        imageStore(normalRoughnessImage, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+        imageStore(motionVectorImage, pixel, vec4(motion, 0.0, 0.0));
+        imageStore(linearDepthImage, pixel, vec4(viewDepth));
+        imageStore(specularHitDepthImage, pixel, vec4(INF_DISTANCE));
+        imageStore(firstHitDepthImage, pixel, vec4(viewDepth));
+    }
+}

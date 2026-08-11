@@ -22,6 +22,14 @@ layout(location = 0) out vec4 fragColor;
 layout(location = 1) out vec4 fragNormal;
 
 void main() {
+    vec3 colorCurrent = texture(texCurrent, texCoord).rgb;
+    vec3 normalCurrent = texture(texNormalCurrent, texCoord).xyz;
+    if (pushConstants.alpha >= 1.0) {
+        // Newly allocated histories have no defined pixels. Do not sample either one.
+        fragColor = vec4(colorCurrent, 1.0);
+        fragNormal = vec4(dot(normalCurrent, normalCurrent) > 1e-8 ? normalize(normalCurrent) : vec3(0.0), 1.0);
+        return;
+    }
     ivec2 size = textureSize(texCurrent, 0);
     vec2 resolution = vec2(size);
     vec2 texelSize = 1.0 / resolution;
@@ -30,8 +38,6 @@ void main() {
     vec2 velocityUV = velocityPixels / resolution;
     vec2 historyUV = texCoord + velocityUV;
 
-    vec3 colorCurrent = texture(texCurrent, texCoord).rgb;
-    vec3 normalCurrent = texture(texNormalCurrent, texCoord).xyz;
 
     vec3 minColor = vec3(10000.0);
     vec3 maxColor = vec3(-10000.0);

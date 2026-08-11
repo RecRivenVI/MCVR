@@ -1,0 +1,7 @@
+*.comp text eol=lf
+*.frag text eol=lf
+*.glsl text eol=lf
+*.rahit text eol=lf
+*.rchit text eol=lf
+*.rgen text eol=lf
+*.rmiss text eol=lf

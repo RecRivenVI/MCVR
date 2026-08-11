@@ -1,19 +1,22 @@
 #include "core/vulkan/dynamic_pipeline.hpp"
 
+#include "core/logging.hpp"
+
 #include "core/vulkan/descriptor.hpp"
 #include "core/vulkan/device.hpp"
 #include "core/vulkan/render_pass.hpp"
 #include "core/vulkan/shader.hpp"
 
 #include <iostream>
+#include <stdexcept>
 #include <vector>
 
-std::ostream &dynamicGraphicsPipelineCout() {
-    return std::cout << "[GraphicsPipeline] ";
+auto dynamicGraphicsPipelineCout() {
+    return mcvr::log::info("GraphicsPipeline");
 }
 
-std::ostream &dynamicGraphicsPipelineCerr() {
-    return std::cerr << "[GraphicsPipeline] ";
+auto dynamicGraphicsPipelineCerr() {
+    return mcvr::log::error("GraphicsPipeline");
 }
 
 vk::DynamicGraphicsPipeline::DynamicGraphicsPipeline(std::shared_ptr<Device> device, VkPipeline pipeline)
@@ -95,12 +98,20 @@ vk::DynamicGraphicsPipelineBuilder::ShaderStageBuilder &vk::DynamicGraphicsPipel
 vk::DynamicGraphicsPipelineBuilder &
 vk::DynamicGraphicsPipelineBuilder::definePipelineLayout(std::shared_ptr<DescriptorTable> descriptorTable) {
     pipelineLayout_ = descriptorTable->vkPipelineLayout();
+    pipelineLayoutKeepAlive_ = descriptorTable->pipelineLayoutKeepAlive();
     return *this;
 }
 
 vk::DynamicGraphicsPipelineBuilder &
 vk::DynamicGraphicsPipelineBuilder::defineInputAssemblyState(VkPrimitiveTopology topology) {
     inputAssemblyStateCreateInfo_.topology = topology;
+    return *this;
+}
+
+vk::DynamicGraphicsPipelineBuilder &vk::DynamicGraphicsPipelineBuilder::definePatchControlPoints(uint32_t count) {
+    if (count == 0) throw std::invalid_argument("Tessellation patch cannot be empty");
+    tessellationStateCreateInfo_.patchControlPoints = count;
+    inputAssemblyStateCreateInfo_.topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
     return *this;
 }
 
@@ -129,6 +140,11 @@ std::shared_ptr<vk::DynamicGraphicsPipeline> vk::DynamicGraphicsPipelineBuilder:
     pipelineCreateInfo.pStages = shaderStageBuilder_.shaderStageCreateInfos.data();
     pipelineCreateInfo.pVertexInputState = &vertexInputStateCreateInfo_;
     pipelineCreateInfo.pInputAssemblyState = &inputAssemblyStateCreateInfo_;
+    if (inputAssemblyStateCreateInfo_.topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) {
+        if (!device->hasTessellation() || tessellationStateCreateInfo_.patchControlPoints == 0)
+            throw std::runtime_error("Tessellation requires an enabled device feature and patch size");
+        pipelineCreateInfo.pTessellationState = &tessellationStateCreateInfo_;
+    }
     pipelineCreateInfo.pViewportState = &viewportStateCreateInfo_;
     pipelineCreateInfo.pRasterizationState = &rasterizationStateCreateInfo_;
     pipelineCreateInfo.pMultisampleState = &multisampleStateCreateInfo_;
@@ -141,16 +157,18 @@ std::shared_ptr<vk::DynamicGraphicsPipeline> vk::DynamicGraphicsPipelineBuilder:
     pipelineCreateInfo.basePipelineHandle = VK_NULL_HANDLE;
     pipelineCreateInfo.basePipelineIndex = -1;
 
-    VkPipeline pipeline;
-    if (vkCreateGraphicsPipelines(device->vkDevice(), VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &pipeline) !=
-        VK_SUCCESS) {
-        dynamicGraphicsPipelineCerr() << "failed to create graphics pipeline" << std::endl;
-        exit(EXIT_FAILURE);
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const VkResult result = device->createGraphicsPipelines(1, &pipelineCreateInfo, nullptr, &pipeline);
+    if (result != VK_SUCCESS) {
+        if (pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device->vkDevice(), pipeline, nullptr);
+        throw std::runtime_error("Failed to create dynamic graphics pipeline: VkResult=" + std::to_string(result));
     } else {
 #ifdef DEBUG
         dynamicGraphicsPipelineCout() << "created dynamic graphics pipeline" << std::endl;
 #endif
     }
 
-    return std::make_shared<DynamicGraphicsPipeline>(device, pipeline);
+    auto resultPipeline = std::make_shared<DynamicGraphicsPipeline>(device, pipeline);
+    resultPipeline->pipelineLayoutKeepAlive_ = pipelineLayoutKeepAlive_;
+    return resultPipeline;
 }

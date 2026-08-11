@@ -19,9 +19,10 @@ struct ToneMappingModuleContext;
 struct ToneMappingModuleExposureData {
     float exposure;
     float avgLogLum;
-    float padding0;
-    float padding1;
+    uint32_t historyValid;
+    uint32_t padding;
 };
+static_assert(sizeof(ToneMappingModuleExposureData) == 16);
 
 enum ToneMappingMethod : int32_t {
     TONE_MAPPING_METHOD_PBR_NEUTRAL = 0,
@@ -92,6 +93,8 @@ class ToneMappingModule : public WorldModule, public SharedObject<ToneMappingMod
     bindTexture(std::shared_ptr<vk::Sampler> sampler, std::shared_ptr<vk::DeviceLocalImage> image, int index) override;
 
     void preClose() override;
+    std::shared_ptr<WorldModuleRebuildState> captureRebuildState() const override;
+    void restoreRebuildState(const std::shared_ptr<WorldModuleRebuildState> &state) override;
 
   private:
     static constexpr uint32_t histSize = 256;
@@ -111,7 +114,17 @@ class ToneMappingModule : public WorldModule, public SharedObject<ToneMappingMod
     std::vector<std::shared_ptr<vk::DescriptorTable>> descriptorTables_;
 
     std::vector<std::shared_ptr<vk::DeviceLocalBuffer>> histBuffers_;
-    std::shared_ptr<vk::DeviceLocalBuffer> exposureData_;
+    struct ViewExposure {
+        std::shared_ptr<vk::DeviceLocalBuffer> data;
+        bool initialized = false;
+        bool firstFrame = true;
+    };
+    std::vector<ViewExposure> exposures_{1};
+    struct ExposureRebuildState : WorldModuleRebuildState {
+        std::shared_ptr<vk::DeviceLocalBuffer> buffer;
+        VkDevice device = VK_NULL_HANDLE;
+        bool initialized = false;
+    };
 
     std::shared_ptr<vk::Shader> histShader_;
     std::shared_ptr<vk::ComputePipeline> histPipeline_;

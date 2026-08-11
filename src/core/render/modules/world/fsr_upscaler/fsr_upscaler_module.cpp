@@ -1,3 +1,4 @@
+#include "core/logging.hpp"
 #include "fsr_upscaler_module.hpp"
 
 #include "core/render/buffers.hpp"
@@ -5,6 +6,7 @@
 #include "core/render/pipeline.hpp"
 #include "core/render/render_framework.hpp"
 #include "core/render/renderer.hpp"
+#include "core/diagnostics/ponder_capture.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -52,7 +54,7 @@ bool FSRUpscalerModule::parseQualityModeValue(const std::string &value, QualityM
 void FSRUpscalerModule::init(std::shared_ptr<Framework> framework, std::shared_ptr<WorldPipeline> worldPipeline) {
     WorldModule::init(framework, worldPipeline);
 
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
     deviceDepthImages_.resize(size);
     fsrMotionVectorImages_.resize(size);
     inputImages_.resize(size);
@@ -68,7 +70,7 @@ bool FSRUpscalerModule::setOrCreateInputImages(std::vector<std::shared_ptr<vk::D
     if (!fw) return false;
 
     if (displayWidth_ == 0 || displayHeight_ == 0) {
-        VkExtent2D extent = fw->swapchain()->vkExtent();
+        VkExtent2D extent = worldPipeline_.lock()->renderExtent();
         displayWidth_ = extent.width;
         displayHeight_ = extent.height;
     }
@@ -117,7 +119,7 @@ bool FSRUpscalerModule::setOrCreateOutputImages(std::vector<std::shared_ptr<vk::
             }
         }
         if (displayWidth_ == 0 || displayHeight_ == 0) {
-            VkExtent2D extent = fw->swapchain()->vkExtent();
+            VkExtent2D extent = worldPipeline_.lock()->renderExtent();
             displayWidth_ = extent.width;
             displayHeight_ = extent.height;
         }
@@ -141,9 +143,8 @@ bool FSRUpscalerModule::setOrCreateOutputImages(std::vector<std::shared_ptr<vk::
 void FSRUpscalerModule::build() {
     auto fw = framework_.lock();
     auto wp = worldPipeline_.lock();
-    uint32_t size = fw->swapchain()->imageCount();
+    uint32_t size = fw->recordingContextCount();
 
-    fsr3_ = std::make_shared<mcvr::FSR3Upscaler>();
 
     mcvr::UpscalerConfig config{};
     config.device = fw->device()->vkDevice();
@@ -164,13 +165,18 @@ void FSRUpscalerModule::build() {
     config.enableSharpening = true;
     config.sharpness = sharpness_;
 
+    histories_.resize(wp->viewCount());
+    for (auto &history : histories_) {
+        history.fsr3_ = std::make_shared<mcvr::FSR3Upscaler>();
     if (!fsr3Enabled_) {
-        initialized_ = false;
-    } else if (!fsr3_->initialize(config)) {
-        std::cerr << "FSRUpscalerModule: Failed to initialize FSR3" << std::endl;
-        initialized_ = false;
+        history.initialized_ = false;
+    } else if (!history.fsr3_->initialize(config)) {
+        mcvr::log::error("FsrUpscalerModule") << "FSRUpscalerModule: Failed to initialize FSR3" << std::endl;
+        history.initialized_ = false;
     } else {
-        initialized_ = true;
+        history.initialized_ = true;
+    }
+
     }
 
     initDescriptorTables();
@@ -201,7 +207,7 @@ void FSRUpscalerModule::build() {
 
 void FSRUpscalerModule::initDescriptorTables() {
     auto fw = framework_.lock();
-    uint32_t size = fw->swapchain()->imageCount();
+    uint32_t size = fw->recordingContextCount();
     depthDescriptorTables_.resize(size);
 
     for (uint32_t i = 0; i < size; i++) {
@@ -263,7 +269,7 @@ void FSRUpscalerModule::initDescriptorTables() {
 
 void FSRUpscalerModule::initImages() {
     auto fw = framework_.lock();
-    uint32_t size = fw->swapchain()->imageCount();
+    uint32_t size = fw->recordingContextCount();
 
     for (uint32_t i = 0; i < size; i++) {
         deviceDepthImages_[i] =
@@ -346,13 +352,19 @@ void FSRUpscalerModule::bindTexture(std::shared_ptr<vk::Sampler> sampler,
                                  std::shared_ptr<vk::DeviceLocalImage> image,
                                  int index) {}
 
+void FSRUpscalerModule::onResourceReload() {
+    for (auto &history : histories_) history.firstFrame_ = true;
+}
+
 void FSRUpscalerModule::preClose() {
+    for (auto &history : histories_) {
     if (auto fw = framework_.lock()) { fw->waitRenderQueueIdle(); }
-    if (fsr3_) {
-        fsr3_->destroy();
-        fsr3_.reset();
+    if (history.fsr3_) {
+        history.fsr3_->destroy();
+        history.fsr3_.reset();
     }
-    initialized_ = false;
+    history.initialized_ = false;
+    }
 }
 
 void FSRUpscalerModule::getRenderResolution(uint32_t displayWidth,
@@ -382,19 +394,19 @@ FSRUpscalerModuleContext::FSRUpscalerModuleContext(std::shared_ptr<FrameworkCont
 
 bool FSRUpscalerModuleContext::checkCameraReset(const glm::vec3 &cameraPos, const glm::vec3 &cameraDir) {
     auto module = upscalerModule_.lock();
-    if (module->firstFrame_) {
-        module->firstFrame_ = false;
-        module->lastCameraPos_ = cameraPos;
-        module->lastCameraDir_ = cameraDir;
+    if (module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).firstFrame_) {
+        module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).firstFrame_ = false;
+        module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).lastCameraPos_ = cameraPos;
+        module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).lastCameraDir_ = cameraDir;
         return true;
     }
 
-    float positionDelta = glm::length(cameraPos - module->lastCameraPos_);
-    float directionDot = glm::dot(glm::normalize(cameraDir), glm::normalize(module->lastCameraDir_));
+    float positionDelta = glm::length(cameraPos - module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).lastCameraPos_);
+    float directionDot = glm::dot(glm::normalize(cameraDir), glm::normalize(module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).lastCameraDir_));
     bool shouldReset = (positionDelta > 1.0f) || (directionDot < 0.866f);
 
-    module->lastCameraPos_ = cameraPos;
-    module->lastCameraDir_ = cameraDir;
+    module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).lastCameraPos_ = cameraPos;
+    module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).lastCameraDir_ = cameraDir;
     return shouldReset;
 }
 
@@ -632,7 +644,7 @@ void FSRUpscalerModuleContext::render() {
         return;
     }
 
-    if (!module->initialized_ || !module->fsr3_) return;
+    if (!module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).initialized_ || !module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).fsr3_) return;
 
     auto buffers = Renderer::instance().buffers();
     auto worldUBO = static_cast<vk::Data::WorldUBO *>(buffers->worldUniformBuffer()->mappedPtr());
@@ -816,8 +828,24 @@ void FSRUpscalerModuleContext::render() {
     input.enableSharpening = true;
     input.sharpness = module->sharpness_;
 
-    module->fsr3_->dispatch(input);
+    auto framework = fwContext->framework.lock();
+    auto capture = mcvr::diagnostics::PonderCapture::begin(framework, Renderer::instance().buffers(),
+        "FSR: input-color is upstream processed color (NRD output in NRD-FSR), not raw PT");
+    if (capture) {
+        capture->copy(framework, worldCommandBuffer, "input-color", inputColorImage);
+        capture->copy(framework, worldCommandBuffer, "depth", inputDepthImage);
+        capture->copy(framework, worldCommandBuffer, "motion", inputMotionVectorImage);
+        capture->copy(framework, worldCommandBuffer, "normal-roughness", inputNormalRoughnessImage);
+        capture->copy(framework, worldCommandBuffer, "first-hit-depth", inputFirstHitDepthImage);
+        capture->copy(framework, worldCommandBuffer, "fsr-device-depth", deviceDepthImage);
+        capture->copy(framework, worldCommandBuffer, "fsr-motion", fsrMotionVectorImage);
+    }
+    module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).fsr3_->dispatch(input);
     outputImage->imageLayout() = VK_IMAGE_LAYOUT_GENERAL;
+    if (capture) {
+        capture->copy(framework, worldCommandBuffer, "output-color", outputImage);
+        capture->seal(worldCommandBuffer, NVSDK_NGX_Result_Success, false);
+    }
 
     dispatchUpscaledFirstHitDepth();
     dispatchUpscaledMotion();

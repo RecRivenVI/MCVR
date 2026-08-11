@@ -1,3 +1,5 @@
+#include "core/logging.hpp"
+#include "core/failure_state.hpp"
 #include "core/vulkan/framework.hpp"
 
 #include <iostream>
@@ -27,7 +29,7 @@ vk::Framework::Context::Context(Framework &framework,
 
 vk::Framework::Context::~Context() {
 #ifdef DEBUG
-    std::cout << "[Context] context deconstructed" << std::endl;
+    mcvr::log::info("Framework") << "[Context] context deconstructed" << std::endl;
 #endif
 }
 
@@ -85,7 +87,7 @@ vk::Framework::Framework(uint32_t width, uint32_t height)
 
 vk::Framework::~Framework() {
 #ifdef DEBUG
-    std::cout << "[Framework] framework deconstructed" << std::endl;
+    mcvr::log::info("Framework") << "[Framework] framework deconstructed" << std::endl;
 #endif
 }
 
@@ -93,10 +95,11 @@ std::shared_ptr<vk::Framework::Context> vk::Framework::acquireContext() {
     std::shared_ptr<Semaphore> imageAcquiredSemaphore = acquireSemaphore();
 
     uint32_t imageIndex;
-    if (vkAcquireNextImageKHR(device_->vkDevice(), swapchain_->vkSwapchain(), UINT64_MAX,
-                              imageAcquiredSemaphore->vkSemaphore(), VK_NULL_HANDLE, &imageIndex) != VK_SUCCESS) {
-        std::cerr << "Cannot acquire images from swapchain" << std::endl;
-        exit(EXIT_FAILURE);
+    if (const auto result = vkAcquireNextImageKHR(device_->vkDevice(), swapchain_->vkSwapchain(), UINT64_MAX,
+            imageAcquiredSemaphore->vkSemaphore(), VK_NULL_HANDLE, &imageIndex); result != VK_SUCCESS) {
+        mcvr::log::error("Framework") << "Cannot acquire images from swapchain" << std::endl;
+        mcvr::failure::raise(mcvr::failure::Kind::runtime, result,
+                             "vkAcquireNextImageKHR(legacy framework)");
     }
 
     std::shared_ptr<Fence> fence = contexts_[imageIndex]->commandFinishedFence;
@@ -136,8 +139,9 @@ void vk::Framework::present(std::shared_ptr<Context> context) {
 
     // TODO: recreate swapchain
     if (res != VK_SUCCESS) {
-        std::cerr << "failed to submit present command buffer" << std::endl;
-        exit(1);
+        mcvr::log::error("Framework") << "failed to submit present command buffer" << std::endl;
+        mcvr::failure::raise(mcvr::failure::Kind::runtime, res,
+                             "vkQueuePresentKHR(legacy framework)");
     }
 }
 
@@ -192,10 +196,10 @@ std::vector<std::shared_ptr<vk::Framework::Context>> &vk::Framework::contexts() 
 std::shared_ptr<vk::Semaphore> vk::Framework::acquireSemaphore() {
     std::shared_ptr<Semaphore> semaphore;
     if (recycledImageAcquiredSemaphores_.empty()) {
-        // std::cout << "no recycledSemaphores left, alloc new one: " << std::hex << semaphore << std::endl;
+        // mcvr::log::info("Framework") << "no recycledSemaphores left, alloc new one: " << std::hex << semaphore << std::endl;
         semaphore = Semaphore::create(device_);
     } else {
-        // std::cout << "recycledSemaphores left, use existing one: " << std::hex << semaphore << std::endl;
+        // mcvr::log::info("Framework") << "recycledSemaphores left, use existing one: " << std::hex << semaphore << std::endl;
         semaphore = recycledImageAcquiredSemaphores_.front();
         recycledImageAcquiredSemaphores_.pop();
     }

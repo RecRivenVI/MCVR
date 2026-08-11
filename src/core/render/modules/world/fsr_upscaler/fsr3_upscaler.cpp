@@ -1,5 +1,9 @@
+#include "core/logging.hpp"
+#include "core/failure_state.hpp"
 #include "fsr3_upscaler.hpp"
 #include "core/render/modules/world/fsr_upscaler/fsr_setup.hpp"
+#include "core/render/render_framework.hpp"
+#include "core/render/renderer.hpp"
 #include <algorithm>
 #include <cstring>
 #include <iostream>
@@ -69,30 +73,28 @@ bool FSR3Upscaler::isAvailable() const {
 
 bool FSR3Upscaler::initialize(const UpscalerConfig &config) {
 #ifdef DEBUG
-    std::cout << "FSR3Upscaler::initialize called" << std::endl;
+    mcvr::log::debug("Fsr3Upscaler") << "Initialize requested" << std::endl;
 #endif
 
 #ifndef MCVR_ENABLE_FFX_UPSCALER
     (void)config;
-    std::cerr << "FSR3Upscaler::initialize: FSR3 support not compiled in" << std::endl;
+    mcvr::log::error("Fsr3Upscaler") << "FSR3Upscaler::initialize: FSR3 support not compiled in" << std::endl;
     return false;
 #else
     if (m_initialized) {
 #    ifdef DEBUG
-        std::cerr << "[DEBUG] FSR3: Destroying old context" << std::endl;
-        std::flush(std::cerr);
+        mcvr::log::debug("Fsr3Upscaler") << "Destroying the previous context" << std::endl;
 #    endif
         destroy();
     }
 
 #    ifdef DEBUG
-    std::cerr << "[DEBUG] FSR3: Assigning handles" << std::endl;
+    mcvr::log::debug("Fsr3Upscaler") << "Assigning Vulkan handles" << std::endl;
 #    endif
     m_device = config.device;
     m_physicalDevice = config.physicalDevice;
 #    ifdef DEBUG
-    std::cerr << "[DEBUG] FSR3: Device = " << (void *)m_device << std::endl;
-    std::flush(std::cerr);
+    mcvr::log::debug("Fsr3Upscaler") << "Device=" << (void *)m_device << std::endl;
 #    endif
 
     m_commandPool = config.commandPool;
@@ -106,7 +108,7 @@ bool FSR3Upscaler::initialize(const UpscalerConfig &config) {
     m_displayHeight = config.maxDisplayHeight;
 
 #    ifdef DEBUG
-    std::cout << "[FSR3] init config: render=" << m_renderWidth << "x" << m_renderHeight
+    mcvr::log::debug("Fsr3Upscaler") << "Init config: render=" << m_renderWidth << "x" << m_renderHeight
               << " display=" << m_displayWidth << "x" << m_displayHeight
               << " quality=" << static_cast<int>(config.qualityMode) << " hdr=" << config.hdr
               << " depthInverted=" << config.depthInverted << " depthInfinite=" << config.depthInfinite
@@ -115,11 +117,10 @@ bool FSR3Upscaler::initialize(const UpscalerConfig &config) {
 #    endif
 
 #    ifdef DEBUG
-    std::cerr << "[DEBUG] FSR3: Calling createContext()" << std::endl;
-    std::flush(std::cerr);
+    mcvr::log::debug("Fsr3Upscaler") << "Creating FFX context" << std::endl;
 #    endif
     if (!createContext()) {
-        std::cerr << "FSR3Upscaler::initialize: Failed to create FFX context" << std::endl;
+        mcvr::log::error("Fsr3Upscaler") << "Failed to create FFX context" << std::endl;
         return false;
     }
 
@@ -133,10 +134,8 @@ bool FSR3Upscaler::initialize(const UpscalerConfig &config) {
     m_initialized = true;
 
 #    ifdef DEBUG
-    std::cerr << "=== FSR3 INITIALIZED ===" << std::endl;
-    std::cerr << "Render: " << m_renderWidth << "x" << m_renderHeight << " -> Display: " << m_displayWidth << "x"
+    mcvr::log::debug("Fsr3Upscaler") << "Initialized: render=" << m_renderWidth << "x" << m_renderHeight << ", display=" << m_displayWidth << "x"
               << m_displayHeight << std::endl;
-    std::cerr << "Context: " << (m_fsrContext != nullptr ? "OK" : "FAILED") << std::endl;
 #    endif
 
     m_debugLogged = false;
@@ -150,8 +149,7 @@ bool FSR3Upscaler::createContext() {
     return false;
 #else
 #    ifdef DEBUG
-    std::cerr << "[DEBUG] FSR3: Entering createContext" << std::endl;
-    std::flush(std::cerr);
+    mcvr::log::debug("Fsr3Upscaler") << "Entering FFX context creation" << std::endl;
 #    endif
 
     // Query available providers for debug visibility, but let FFX choose the best one.
@@ -181,18 +179,18 @@ bool FSR3Upscaler::createContext() {
             ffxQuery(nullptr, &versionQuery.header);
 
 #    ifdef DEBUG
-            std::cout << "FSR3: Found " << versionCount << " available FSR version(s):" << std::endl;
+            mcvr::log::info("Fsr3Upscaler") << "FSR3: Found " << versionCount << " available FSR version(s):" << std::endl;
             for (uint64_t i = 0; i < versionCount; ++i) {
-                std::cout << "  Version[" << i << "] = 0x" << std::hex << fsrVersionIds[i] << std::dec;
+                mcvr::log::info("Fsr3Upscaler") << "  Version[" << i << "] = 0x" << std::hex << fsrVersionIds[i] << std::dec;
                 if (i < fsrVersionNames.size() && fsrVersionNames[i] != nullptr) {
-                    std::cout << " (" << fsrVersionNames[i] << ")";
+                    mcvr::log::info("Fsr3Upscaler") << " (" << fsrVersionNames[i] << ")";
                 }
-                std::cout << std::endl;
+                mcvr::log::info("Fsr3Upscaler") << std::endl;
             }
 #    endif
 
         } else {
-            std::cerr << "FSR3: No alternative versions available" << std::endl;
+            mcvr::log::error("Fsr3Upscaler") << "FSR3: No alternative versions available" << std::endl;
         }
     }
 
@@ -208,7 +206,7 @@ bool FSR3Upscaler::createContext() {
     };
 
 #    ifdef DEBUG
-    std::cout << "FSR3: Checking required extensions..." << std::endl;
+    mcvr::log::info("Fsr3Upscaler") << "FSR3: Checking required extensions..." << std::endl;
 #    endif
 
     const char *requiredExtensions[] = {VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
@@ -219,10 +217,10 @@ bool FSR3Upscaler::createContext() {
     for (const char *ext : requiredExtensions) {
         bool available = hasExtension(ext);
 #    ifdef DEBUG
-        std::cerr << "  " << ext << ": " << (available ? "OK" : "MISSING") << std::endl;
+        mcvr::log::error("Fsr3Upscaler") << "  " << ext << ": " << (available ? "OK" : "MISSING") << std::endl;
 #    endif
         if (!available && strcmp(ext, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME) == 0) {
-            std::cerr << "FSR3: Missing required extension: " << ext << std::endl;
+            mcvr::log::error("Fsr3Upscaler") << "FSR3: Missing required extension: " << ext << std::endl;
         }
     }
 
@@ -235,7 +233,7 @@ bool FSR3Upscaler::createContext() {
     PFN_vkGetDeviceProcAddr deviceProcAddr =
         reinterpret_cast<PFN_vkGetDeviceProcAddr>(mcvr::fsr::customVkGetDeviceProcAddr);
     if (deviceProcAddr == nullptr) {
-        std::cerr << "FSR3 ERROR: customVkGetDeviceProcAddr is NULL!" << std::endl;
+        mcvr::log::error("Fsr3Upscaler") << "FSR3 ERROR: customVkGetDeviceProcAddr is NULL!" << std::endl;
         return false;
     }
 
@@ -245,20 +243,20 @@ bool FSR3Upscaler::createContext() {
     PFN_vkCreateSampler testCreateSampler = (PFN_vkCreateSampler)deviceProcAddr(m_device, "vkCreateSampler");
 
 #    ifdef DEBUG
-    std::cerr << "FSR3: Function pointer check:" << std::endl;
-    std::cerr << "  vkCreateComputePipelines: " << (void *)testCreateComputePipelines << std::endl;
-    std::cerr << "  vkCmdDispatch: " << (void *)testCmdDispatch << std::endl;
-    std::cerr << "  vkCreateSampler: " << (void *)testCreateSampler << std::endl;
+    mcvr::log::error("Fsr3Upscaler") << "FSR3: Function pointer check:" << std::endl;
+    mcvr::log::error("Fsr3Upscaler") << "  vkCreateComputePipelines: " << (void *)testCreateComputePipelines << std::endl;
+    mcvr::log::error("Fsr3Upscaler") << "  vkCmdDispatch: " << (void *)testCmdDispatch << std::endl;
+    mcvr::log::error("Fsr3Upscaler") << "  vkCreateSampler: " << (void *)testCreateSampler << std::endl;
 #    endif
 
     if (testCreateComputePipelines == nullptr || testCmdDispatch == nullptr) {
-        std::cerr << "FSR3 ERROR: Failed to get required Vulkan function pointers" << std::endl;
+        mcvr::log::error("Fsr3Upscaler") << "FSR3 ERROR: Failed to get required Vulkan function pointers" << std::endl;
         return false;
     }
 
     backendDesc.vkDeviceProcAddr = deviceProcAddr;
 #    ifdef DEBUG
-    std::cerr << "FSR3: vkDeviceProcAddr = " << reinterpret_cast<void *>(deviceProcAddr) << std::endl;
+    mcvr::log::error("Fsr3Upscaler") << "FSR3: vkDeviceProcAddr = " << reinterpret_cast<void *>(deviceProcAddr) << std::endl;
 #    endif
 
     ffx::CreateContextDescUpscale createFsr{};
@@ -283,24 +281,24 @@ bool FSR3Upscaler::createContext() {
         ffx::InitHelper<ffxQueryGetProviderVersion> providerQuery{};
         if (ffx::Query(reinterpret_cast<ffx::Context &>(m_fsrContext), providerQuery) == ffx::ReturnCode::Ok &&
             providerQuery.versionName != nullptr) {
-            std::cout << "FSR3: Active provider = " << providerQuery.versionName << " (0x" << std::hex
+            mcvr::log::info("Fsr3Upscaler") << "FSR3: Active provider = " << providerQuery.versionName << " (0x" << std::hex
                       << providerQuery.versionId << std::dec << ")" << std::endl;
         }
 #    ifdef DEBUG
-        std::cout << "FSR3: CreateContext succeeded!" << std::endl;
+        mcvr::log::info("Fsr3Upscaler") << "FSR3: CreateContext succeeded!" << std::endl;
 #    endif
         m_contextCreated = true;
         return true;
     }
 
-    std::cerr << "FSR3: CreateContext failed with error: " << toFFXReturnCodeString(retCode) << " ("
+    mcvr::log::error("Fsr3Upscaler") << "FSR3: CreateContext failed with error: " << toFFXReturnCodeString(retCode) << " ("
               << static_cast<uint32_t>(retCode) << ")" << std::endl;
 
-    std::cerr << "FSR3: Device=" << m_device << std::endl;
-    std::cerr << "FSR3: PhysicalDevice=" << m_physicalDevice << std::endl;
+    mcvr::log::error("Fsr3Upscaler") << "FSR3: Device=" << m_device << std::endl;
+    mcvr::log::error("Fsr3Upscaler") << "FSR3: PhysicalDevice=" << m_physicalDevice << std::endl;
 
     if (retCode == ffx::ReturnCode::ErrorRuntimeError) {
-        std::cerr << "FSR3: Runtime error - check Vulkan validation layers for details" << std::endl;
+        mcvr::log::error("Fsr3Upscaler") << "FSR3: Runtime error - check Vulkan validation layers for details" << std::endl;
     }
 
     m_fsrContext = nullptr;
@@ -316,15 +314,27 @@ void FSR3Upscaler::destroyContext() {
         return;
     }
 
-    if (m_device != VK_NULL_HANDLE) { vkDeviceWaitIdle(m_device); }
+    auto framework = Renderer::try_instance() == nullptr ? nullptr : Renderer::instance().framework();
+    const bool deviceLost = framework == nullptr ? mcvr::failure::isDeviceLost() : framework->isDeviceLost();
+    if (m_device != VK_NULL_HANDLE && !deviceLost) {
+        const VkResult idleResult = vkDeviceWaitIdle(m_device);
+        if (idleResult != VK_SUCCESS && framework != nullptr) {
+            framework->recordFailure(idleResult, "vkDeviceWaitIdle(FSR3 destroy)");
+        }
+    }
 
     ffx::ReturnCode result = ffx::DestroyContext(reinterpret_cast<ffx::Context &>(m_fsrContext));
     if (result != ffx::ReturnCode::Ok) {
-        if (m_device != VK_NULL_HANDLE) { vkDeviceWaitIdle(m_device); }
+        if (m_device != VK_NULL_HANDLE && !deviceLost) {
+            const VkResult idleResult = vkDeviceWaitIdle(m_device);
+            if (idleResult != VK_SUCCESS && framework != nullptr) {
+                framework->recordFailure(idleResult, "vkDeviceWaitIdle(FSR3 destroy retry)");
+            }
+        }
         result = ffx::DestroyContext(reinterpret_cast<ffx::Context &>(m_fsrContext));
     }
     if (result != ffx::ReturnCode::Ok) {
-        std::cerr << "FSR3: DestroyContext failed with error: " << toFFXReturnCodeString(result) << " ("
+        mcvr::log::error("Fsr3Upscaler") << "FSR3: DestroyContext failed with error: " << toFFXReturnCodeString(result) << " ("
                   << static_cast<uint32_t>(result) << ")" << std::endl;
     }
 
@@ -349,7 +359,7 @@ void FSR3Upscaler::dispatch(const UpscalerInput &input) {
         m_lastDisplayHeight = input.displayHeight;
 
 #    ifdef DEBUG
-        std::cout << "[FSR3] dispatch: render=" << input.renderWidth << "x" << input.renderHeight
+        mcvr::log::info("Fsr3Upscaler") << "[FSR3] dispatch: render=" << input.renderWidth << "x" << input.renderHeight
                   << " display=" << input.displayWidth << "x" << input.displayHeight
                   << " colorFmt=" << static_cast<int>(input.colorFormat)
                   << " depthFmt=" << static_cast<int>(input.depthFormat)
@@ -457,14 +467,14 @@ void FSR3Upscaler::dispatch(const UpscalerInput &input) {
     static int dispatchCount = 0;
     ffx::ReturnCode retCode = ffx::Dispatch(reinterpret_cast<ffx::Context &>(m_fsrContext), dispatchUpscale);
     if (retCode != ffx::ReturnCode::Ok) {
-        std::cerr << "FSR3 DISPATCH FAILED: " << toFFXReturnCodeString(retCode) << " ("
+        mcvr::log::error("Fsr3Upscaler") << "FSR3 DISPATCH FAILED: " << toFFXReturnCodeString(retCode) << " ("
                   << static_cast<uint32_t>(retCode) << ")" << std::endl;
         return;
     }
     // else {
     //     dispatchCount++;
     //     if (dispatchCount == 1 || dispatchCount % 300 == 0) {
-    //         std::cerr << "FSR3 dispatch OK (count: " << dispatchCount << ")" << std::endl;
+    //         mcvr::log::error("Fsr3Upscaler") << "FSR3 dispatch OK (count: " << dispatchCount << ")" << std::endl;
     //     }
     // }
 

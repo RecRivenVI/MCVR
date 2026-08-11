@@ -1,6 +1,11 @@
 #ifndef ADV_LIGHT_GLSL
 #define ADV_LIGHT_GLSL
 
+#include "util/material_faces.glsl"
+vec3 emissionVisibleNormal(uint flags, vec3 geometricNormal) {
+    return effectiveMaterialFaces(flags) == materialCullFrontBit ? -geometricNormal : geometricNormal;
+}
+
 #include "common/shared.hpp"
 #include "common/chunk_lookup.glsl"
 #include "common/constants.glsl"

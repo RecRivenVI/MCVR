@@ -1,5 +1,8 @@
 #include "core/vulkan/shader.hpp"
 
+#include "core/logging.hpp"
+#include "core/diagnostics/device_loss_trace.hpp"
+
 #include "core/vulkan/device.hpp"
 
 #include <algorithm>
@@ -10,18 +13,50 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-std::ostream &shaderCout() {
-    return std::cout << "[Shader] ";
+auto shaderCout() {
+    return mcvr::log::info("Shader");
 }
 
-std::ostream &shaderCerr() {
-    return std::cerr << "[Shader] ";
+auto shaderCerr() {
+    return mcvr::log::error("Shader");
+}
+
+namespace {
+// Creation-time only, default-off with the existing local loss tracker. Names
+// allow GPU-AV to select our shaders without instrumenting private SDK shaders.
+void captureShader(vk::Device &device, VkShaderModule module, const std::string &source,
+                   const void *code, size_t bytes) noexcept {
+    if (!mcvr::diagnostics::device_loss::enabled()) return;
+    try {
+        const auto name = "MCVR:" + source;
+        device.nameObject(VK_OBJECT_TYPE_SHADER_MODULE, reinterpret_cast<uint64_t>(module), name.c_str());
+        static std::mutex lock;
+        static size_t count = 0, totalBytes = 0;
+        std::lock_guard guard(lock);
+        if (count >= 512 || bytes > 64 * 1024 * 1024 - totalBytes) return;
+        static const auto directory = std::filesystem::path("radiance-gpu-shaders") /
+            std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        std::filesystem::create_directories(directory);
+        const auto filename = std::to_string(count++) + ".spv";
+        totalBytes += bytes;
+        std::ofstream binary(directory / filename, std::ios::binary);
+        binary.write(static_cast<const char *>(code), static_cast<std::streamsize>(bytes));
+        std::ofstream index(directory / "index.txt", std::ios::app);
+        index << module << ' ' << filename << ' ' << bytes << ' ' << std::quoted(source) << '\n';
+    } catch (...) {
+        // A diagnostic failure cannot invalidate a successfully created shader.
+        mcvr::diagnostics::device_loss::note("shader-diagnostic-failed");
+    }
+}
 }
 
 std::string injectSourceAfterVersion(std::string sourceText, const std::string &injectedSource) {
@@ -53,6 +88,8 @@ std::string injectSourceAfterVersion(std::string sourceText, const std::string &
 shaderc_shader_kind vk::shaderKindFromStage(VkShaderStageFlagBits stage) {
     switch (stage) {
         case VK_SHADER_STAGE_VERTEX_BIT: return shaderc_glsl_vertex_shader;
+        case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT: return shaderc_glsl_tess_control_shader;
+        case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: return shaderc_glsl_tess_evaluation_shader;
         case VK_SHADER_STAGE_FRAGMENT_BIT: return shaderc_glsl_fragment_shader;
         case VK_SHADER_STAGE_COMPUTE_BIT: return shaderc_glsl_compute_shader;
         case VK_SHADER_STAGE_RAYGEN_BIT_KHR: return shaderc_glsl_raygen_shader;
@@ -61,7 +98,7 @@ shaderc_shader_kind vk::shaderKindFromStage(VkShaderStageFlagBits stage) {
         case VK_SHADER_STAGE_ANY_HIT_BIT_KHR: return shaderc_glsl_anyhit_shader;
         case VK_SHADER_STAGE_INTERSECTION_BIT_KHR: return shaderc_glsl_intersection_shader;
         case VK_SHADER_STAGE_CALLABLE_BIT_KHR: return shaderc_glsl_callable_shader;
-        default: shaderCerr() << "unsupported shader stage " << stage << std::endl; exit(EXIT_FAILURE);
+        default: throw std::runtime_error("Unsupported shader stage: " + std::to_string(stage));
     }
 }
 
@@ -142,8 +179,7 @@ void vk::ShaderIncluder::ReleaseInclude(shaderc_include_result *data) {
 vk::Shader::Shader(std::shared_ptr<Device> device, std::string path) : device_(device), path_(path) {
     std::ifstream file(path, std::ios::ate | std::ios::binary);
     if (!file.is_open()) {
-        shaderCerr() << "Cannot open file: " << path << std::endl;
-        exit(EXIT_FAILURE);
+        throw std::runtime_error("Cannot open shader file: " + path);
     }
     std::vector<char> fileBytes(file.tellg());
     file.seekg(0, std::ios::beg);
@@ -156,9 +192,9 @@ vk::Shader::Shader(std::shared_ptr<Device> device, std::string path) : device_(d
     createInfo.pCode = (uint32_t *)fileBytes.data();
 
     if (vkCreateShaderModule(device_->vkDevice(), &createInfo, nullptr, &module_) != VK_SUCCESS) {
-        shaderCerr() << "failed to create shader module for " << path << std::endl;
-        exit(EXIT_FAILURE);
+        throw std::runtime_error("Failed to create shader module: " + path);
     }
+    captureShader(*device_, module_, path, fileBytes.data(), fileBytes.size());
 
 #ifdef DEBUG
     shaderCout() << "created shader module for " << path << std::endl;
@@ -431,8 +467,7 @@ vk::Shader::compileGlslToSpv(std::string sourcePath,
 
     std::ifstream sourceFile(sourcePath, std::ios::binary);
     if (!sourceFile.is_open()) {
-        shaderCerr() << "Cannot open source file: " << sourcePath << std::endl;
-        exit(EXIT_FAILURE);
+        throw std::runtime_error("Cannot open shader source: " + sourcePath);
     }
     std::string sourceText{std::istreambuf_iterator<char>(sourceFile), std::istreambuf_iterator<char>()};
     sourceText = injectSourceAfterVersion(std::move(sourceText), injectedSource);
@@ -455,9 +490,7 @@ vk::Shader::compileGlslToSpv(std::string sourcePath,
     shaderc::SpvCompilationResult result =
         compiler.CompileGlslToSpv(sourceText, shaderKindFromStage(stage), sourcePath.c_str(), options);
     if (result.GetCompilationStatus() != shaderc_compilation_status_success) {
-        shaderCerr() << "failed to compile shader source " << sourcePath << "\n"
-                     << result.GetErrorMessage() << std::endl;
-        exit(EXIT_FAILURE);
+        throw std::runtime_error("Failed to compile shader source " + sourcePath + "\n" + result.GetErrorMessage());
     }
 
     std::vector<uint32_t> spirv(result.cbegin(), result.cend());
@@ -487,9 +520,9 @@ void vk::Shader::createModule(const std::vector<uint32_t> &spirv, const std::str
     createInfo.pCode = spirv.data();
 
     if (vkCreateShaderModule(device_->vkDevice(), &createInfo, nullptr, &module_) != VK_SUCCESS) {
-        shaderCerr() << "failed to create shader module for " << sourcePath << std::endl;
-        exit(EXIT_FAILURE);
+        throw std::runtime_error("Failed to create shader module: " + sourcePath);
     }
+    captureShader(*device_, module_, sourcePath, spirv.data(), spirv.size() * sizeof(uint32_t));
 
 #ifdef DEBUG
     shaderCout() << "created runtime shader module for " << sourcePath << std::endl;

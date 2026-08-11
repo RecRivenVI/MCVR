@@ -1,4 +1,7 @@
 #define VMA_IMPLEMENTATION
+
+#include "core/logging.hpp"
+#include "core/failure_state.hpp"
 #include "core/vulkan/vma.hpp"
 
 #include "core/vulkan/device.hpp"
@@ -7,12 +10,12 @@
 
 #include <iostream>
 
-std::ostream &vmaTableCout() {
-    return std::cout << "[VMA] ";
+auto vmaTableCout() {
+    return mcvr::log::info("VMA");
 }
 
-std::ostream &vmaTableCerr() {
-    return std::cerr << "[VMA] ";
+auto vmaTableCerr() {
+    return mcvr::log::error("VMA");
 }
 
 vk::VMA::VMA(std::shared_ptr<Instance> instance,
@@ -25,9 +28,11 @@ vk::VMA::VMA(std::shared_ptr<Instance> instance,
     allocatorCreateInfo.vulkanApiVersion = VK_API_VERSION_1_4;
     allocatorCreateInfo.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
 
-    if (vmaImportVulkanFunctionsFromVolk(&allocatorCreateInfo, &vulkanFunctions_)) {
+    if (const auto result = vmaImportVulkanFunctionsFromVolk(&allocatorCreateInfo, &vulkanFunctions_);
+        result != VK_SUCCESS) {
         vmaTableCerr() << "failed to create vulkan function from volk" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::raise(mcvr::failure::Kind::initialization, result,
+                             "vmaImportVulkanFunctionsFromVolk");
     } else {
 #ifdef DEBUG
         vmaTableCout() << "created vulkan function from volk" << std::endl;
@@ -35,9 +40,9 @@ vk::VMA::VMA(std::shared_ptr<Instance> instance,
     }
     allocatorCreateInfo.pVulkanFunctions = &vulkanFunctions_;
 
-    if (vmaCreateAllocator(&allocatorCreateInfo, &allocator_)) {
+    if (const auto result = vmaCreateAllocator(&allocatorCreateInfo, &allocator_); result != VK_SUCCESS) {
         vmaTableCerr() << "failed to create VMA" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::raise(mcvr::failure::Kind::initialization, result, "vmaCreateAllocator");
     } else {
 #ifdef DEBUG
         vmaTableCout() << "created VMA" << std::endl;
@@ -49,7 +54,7 @@ vk::VMA::~VMA() {
 #ifdef DEBUG
     vmaTableCout() << "VMA deconstructed" << std::endl;
 #endif
-    vmaDestroyAllocator(allocator_);
+    if (allocator_ != VK_NULL_HANDLE) { vmaDestroyAllocator(allocator_); }
 }
 
 VmaAllocator &vk::VMA::allocator() {

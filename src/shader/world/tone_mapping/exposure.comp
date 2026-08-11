@@ -9,8 +9,8 @@ gHist;
 layout(set = 0, binding = 2) buffer ExposureBuffer {
     float exposure;
     float avgLogLum;
-    float padding0;
-    float padding1;
+    uint historyValid;
+    uint padding;
 }
 expData;
 
@@ -48,11 +48,13 @@ void main() {
     for (uint i = 0u; i < NUM_BINS; ++i) total += gHist.bins[i];
 
     float prev = expData.exposure;
-    if (isnan(prev) || isinf(prev) || prev <= 0.0) { prev = clamp(pc.manualExposure, pc.minExposure, pc.maxExposure); }
+    bool hasHistory = expData.historyValid == 1u && !isnan(prev) && !isinf(prev) && prev > 0.0;
+    prev = clamp(hasHistory ? prev : pc.manualExposure, pc.minExposure, pc.maxExposure);
 
     if (total == 0u) {
         expData.avgLogLum = pc.log2Min;
         expData.exposure = clamp(prev, pc.minExposure, pc.maxExposure);
+        expData.historyValid = hasHistory ? 1u : 0u;
         return;
     }
 
@@ -95,8 +97,9 @@ void main() {
     float targetExposure = pc.middleGrey / max(avgLum, 1e-6);
     float speed = (targetExposure > prev) ? pc.speedUp : pc.speedDown;
     float k = 1.0 - exp(-pc.dt * speed);
-    float adapted = mix(prev, targetExposure, clamp(k, 0.0, 1.0));
+    float adapted = hasHistory ? mix(prev, targetExposure, clamp(k, 0.0, 1.0)) : targetExposure;
 
     expData.avgLogLum = avgLogLum;
     expData.exposure = clamp(adapted, pc.minExposure, pc.maxExposure);
+    expData.historyValid = 1u;
 }

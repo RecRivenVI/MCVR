@@ -41,6 +41,8 @@ class NrdModule : public WorldModule, public SharedObject<NrdModule> {
     void
     bindTexture(std::shared_ptr<vk::Sampler> sampler, std::shared_ptr<vk::DeviceLocalImage> image, int index) override;
 
+    void onResourceReload() override;
+
     void preClose() override;
 
   private:
@@ -91,14 +93,20 @@ class NrdModule : public WorldModule, public SharedObject<NrdModule> {
     std::array<std::shared_ptr<vk::Sampler>, 2> composeSamplers_;
     std::vector<std::shared_ptr<vk::DeviceLocalImage>> refractionHistoryRadianceImages_;
     std::vector<std::shared_ptr<vk::DeviceLocalImage>> refractionHistoryDepthImages_;
-    int32_t lastRefractionHistoryFrameIndex_ = -1;
-    uint32_t nrdFrameIndex_ = 0;
+
+
 
     // output
     std::vector<std::shared_ptr<vk::DeviceLocalImage>> denoisedRadianceImages_;
 
+    struct ViewHistory {
+        std::shared_ptr<NrdWrapper> wrapper_;
+        int32_t lastRefractionHistoryFrameIndex_ = -1;
+        uint32_t nrdFrameIndex_ = 0;
+    };
+    std::vector<ViewHistory> histories_;
     uint32_t width_, height_;
-    std::shared_ptr<NrdWrapper> wrapper_;
+
 
     std::vector<std::shared_ptr<std::array<std::shared_ptr<vk::DeviceLocalImage>, size_t(nrd::ResourceType::MAX_NUM)>>>
         userTexturePools_;

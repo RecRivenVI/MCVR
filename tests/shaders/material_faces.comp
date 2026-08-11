@@ -1,0 +1,72 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_GOOGLE_include_directive : require
+#include "util/material_faces.glsl"
+#include "util/ui_primary_visibility.glsl"
+layout(local_size_x=1) in;
+layout(set=0,binding=0) uniform accelerationStructureEXT scene;
+layout(set=0,binding=1,std430) buffer Results { uint result[]; };
+layout(set=0,binding=2,std430) readonly buffer Cases { uvec4 cases[]; };
+bool acceptCandidate(uint face,bool front,uint mode) {
+    return acceptsWorldTriangleFace(face,front,(face & (1u<<19u))!=0u?1u:0u,(mode&0x80000000u)!=0u);
+}
+void main() {
+    uint i=gl_GlobalInvocationID.x, c=i/4, g=(i/2)%2, side=i%2;
+    float mirror=cases[c].z==0?1:-1;
+    vec3 origin=vec3(mirror*((cases[c].w&0x40000000u)!=0u?0.0:float(g)*3.0),float(c)*4.0,side==0?2:-2);
+    rayQueryEXT ray;
+    rayQueryInitializeEXT(ray,scene,gl_RayFlagsCullBackFacingTrianglesEXT,1,origin,0.001,vec3(0,0,side==0?-1:1),4);
+    uint acceptedInterfaces=0u;
+    while(rayQueryProceedEXT(ray)) {
+        uint geom=rayQueryGetIntersectionGeometryIndexEXT(ray,false);
+        uint face=cases[c][geom];
+        if ((cases[c].w&0x80000000u)==0u && cases[c].w!=0) {
+            uint effective = effectiveMaterialFaces(face);
+            if (effective == materialCullFrontBit) face |= materialHardwareFrontFlipBit;
+        }
+        if(acceptCandidate(face,rayQueryGetIntersectionFrontFaceEXT(ray,false),cases[c].w)) {++acceptedInterfaces;rayQueryConfirmIntersectionEXT(ray);}
+    }
+    result[i]=rayQueryGetIntersectionTypeEXT(ray,true)==gl_RayQueryCommittedIntersectionTriangleEXT?1:0;
+    if((cases[c].w&0x40000000u)!=0u && result[i]!=0u)
+        result[i]|=(1024u<<rayQueryGetIntersectionGeometryIndexEXT(ray,true))|(acceptedInterfaces<<12u);
+    rayQueryInitializeEXT(ray,scene,gl_RayFlagsCullBackFacingTrianglesEXT,1,origin,0.001,vec3(0,0,side==0?-1:1),4);
+    while(rayQueryProceedEXT(ray)) {
+        uint geom=rayQueryGetIntersectionGeometryIndexEXT(ray,false);
+        uint face=cases[c][geom];
+        if ((cases[c].w&0x80000000u)==0u && cases[c].w!=0 && effectiveMaterialFaces(face)==materialCullFrontBit)
+            face |= materialHardwareFrontFlipBit;
+        if(acceptCandidate(face,rayQueryGetIntersectionFrontFaceEXT(ray,false),cases[c].w))
+            rayQueryConfirmIntersectionEXT(ray);
+    }
+    if(rayQueryGetIntersectionTypeEXT(ray,true)==gl_RayQueryCommittedIntersectionTriangleEXT) result[i]|=64u;
+    rayQueryInitializeEXT(ray,scene,gl_RayFlagsCullBackFacingTrianglesEXT,1,origin,0.001,vec3(0,0,side==0?-1:1),4);
+    while(rayQueryProceedEXT(ray)) {
+        uint face=cases[c][rayQueryGetIntersectionGeometryIndexEXT(ray,false)];
+        if ((cases[c].w&0x80000000u)==0u && cases[c].w!=0 && effectiveMaterialFaces(face)==materialCullFrontBit)
+            face |= materialHardwareFrontFlipBit;
+        if(acceptCandidate(face,rayQueryGetIntersectionFrontFaceEXT(ray,false),cases[c].w)) rayQueryConfirmIntersectionEXT(ray);
+    }
+    if(rayQueryGetIntersectionTypeEXT(ray,true)==gl_RayQueryCommittedIntersectionTriangleEXT) result[i]|=128u;
+    // An opaque accepted face selects foreground only. A rejected face exposes
+    // the blue background; it is never a red+blue identity/material mixture.
+    uint layerMask=1u | (side==0?2u:4u);
+    rayQueryInitializeEXT(ray,scene,gl_RayFlagsCullBackFacingTrianglesEXT,layerMask,origin,0.001,vec3(0,0,side==0?-1:1),4);
+    while(rayQueryProceedEXT(ray)) {
+        if(rayQueryGetIntersectionInstanceCustomIndexEXT(ray,false)!=0u) {
+            rayQueryConfirmIntersectionEXT(ray);
+            continue;
+        }
+        uint face=cases[c][rayQueryGetIntersectionGeometryIndexEXT(ray,false)];
+        if((cases[c].w&0x80000000u)==0u && cases[c].w!=0 && effectiveMaterialFaces(face)==materialCullFrontBit) face|=materialHardwareFrontFlipBit;
+        if(acceptCandidate(face,rayQueryGetIntersectionFrontFaceEXT(ray,false),cases[c].w)) rayQueryConfirmIntersectionEXT(ray);
+    }
+    if(rayQueryGetIntersectionTypeEXT(ray,true)==gl_RayQueryCommittedIntersectionTriangleEXT)
+        result[i]|=rayQueryGetIntersectionInstanceCustomIndexEXT(ray,true)==0u?256u:512u;
+    uint primary=uiPrimaryTraceState(7u,0u);
+    uint reflected=uiPrimaryTraceState(primary,1u);
+    result[i] |= (acceptsUiOwner(1u<<24u,1u,primary)?2u:0u)
+        | (acceptsUiOwner(2u<<24u,1u,primary)?4u:0u)
+        | (acceptsUiOwner(2u<<24u,1u,reflected)?8u:0u)
+        | (acceptsUiOwner(0u,1u,primary)?16u:0u)
+        | (acceptsUiOwner(2u<<24u,0u,primary)?32u:0u);
+}

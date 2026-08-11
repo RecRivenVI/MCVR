@@ -1,0 +1,68 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "util/vertex_shading_normal.glsl"
+#include "util/vertex_shading_cache.glsl"
+#include "util/alpha_mode.glsl"
+#include "util/surface_overlay.glsl"
+
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) buffer Results { vec4 rows[]; } result;
+
+vec3 mappedNormal(vec3 base) {
+    vec3 reference = abs(base.x) < 0.9 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+    vec3 tangent = normalize(reference - base * dot(reference, base));
+    vec3 bitangent = normalize(cross(base, tangent));
+    return normalize(tangent * 0.4 + bitangent * -0.25 + base * 0.88);
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    mat3 objectToWorld = mat3(1.0);
+    if (id == 2u) objectToWorld = mat3(vec3(-1.0, 0.0, 0.0),
+                                      vec3(0.0, 1.0, 0.0), vec3(0.0, 0.0, 1.0));
+    if (id == 3u) objectToWorld = mat3(vec3(2.0, 0.0, 0.0),
+                                      vec3(0.0, 0.5, 0.0), vec3(0.0, 0.0, 1.5));
+    vec3 p0 = vec3(0.0), p1 = vec3(1.0, 0.0, 0.0), p2 = vec3(0.0, 1.0, 0.0);
+    vec3 geometric = normalize(cross(objectToWorld * (p1 - p0), objectToWorld * (p2 - p0)));
+    mat3 normalMatrix = transpose(inverse(objectToWorld));
+    vec3 source = normalize(vec3(0.3, 0.4, 0.8660254));
+    if (id == 1u || id == 2u) source = -source;
+    if (id == 4u) source = vec3(0.0);
+    if (id == 5u) source = vec3(uintBitsToFloat(0x7FC00000u), 0.0, 1.0);
+    if (id == 7u) source = vec3(1e30, 1e30, 1e30); // finite lanes, overflowing length squared
+    if (id == 8u) source = vec3(1.0, 0.0, 1.000001e-5); // just above hemisphere cutoff
+    if (id == 9u) source = vec3(1.0, 0.0, 0.999999e-5); // just below cutoff
+    uint packedData = (id == 6u ? 0u : VERTEX_SHADING_NORMAL_BIT)
+        | (9u << 8u) | (1u << 6u); // mixed cutout/stress fields must not affect normal policy
+    bool tagged = hasVertexShadingNormal(packedData);
+    vec3 direct = vertexBrdfNormal(packedData,
+                                   source, source, source, vec3(0.2, 0.3, 0.5),
+                                   normalMatrix, geometric);
+    vec4 originalAux = vec4(167.0, 123.0, 456.0, -17.0);
+    vec4 cache6 = encodeVertexShadingAux(tagged, originalAux, direct);
+    float overlayY = encodeVertexShadingOverlayY(tagged, -19.0, direct);
+    vec4 cache7 = vec4(overlayY, 0.0, 0.0, 1.0);
+    vec3 decoded = decodeVertexShadingBase(tagged, cache6, cache7, geometric);
+    uint first = id * 8u;
+    result.rows[first + 0u] = vec4(geometric, 1.0);
+    result.rows[first + 1u] = vec4(direct, 1.0);
+    result.rows[first + 2u] = vec4(decoded, 1.0);
+    result.rows[first + 3u] = vec4(mappedNormal(direct), 1.0);
+    result.rows[first + 4u] = vec4(mappedNormal(decoded), 1.0);
+    result.rows[first + 5u] = cache6;
+    result.rows[first + 6u] = cache7;
+    float textureAlpha = id == 0u ? 0.099 : (id == 1u ? 0.1 : 0.101);
+    vec4 colorLayer = vec4(1.0);
+    vec4 overlayColor = vec4(1.0, 0.0, 0.0, 178.0 / 255.0);
+    bool colorLayerMix = id <= 2u || id == 8u;
+    bool useOverlay = id == 3u || id == 4u || id == 6u || id == 9u;
+    if (colorLayerMix) colorLayer = vec4(235.0, 50.0, 48.0,
+        id == 0u ? 0.0 : (id == 1u ? 38.0 : (id == 2u ? 76.0 : 255.0))) / 255.0;
+    if (id == 4u || id == 5u) colorLayer = vec4(0.5, 0.8, 1.0, 1.0);
+    if (id == 6u || id == 9u) overlayColor = vec4(1.0, 1.0, 1.0,
+        id == 6u ? 63.0 / 255.0 : 153.0 / 255.0);
+    vec3 tinted = applySurfaceMaterialColor(vec3(0.8, 0.6, 0.4),
+        colorLayer, colorLayerMix, useOverlay, overlayColor);
+    result.rows[first + 7u] = vec4(tinted,
+        resolveSurfaceAlpha(textureAlpha, ALPHA_MODE_CUTOUT_LOW));
+}

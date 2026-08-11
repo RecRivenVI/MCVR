@@ -1,0 +1,138 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+
+// Independent Ponder preview path tracer. CPU-built BVH, no main-world globals.
+layout(local_size_x=8, local_size_y=8) in;
+struct Vertex {
+    vec3 pos; uint useNorm;
+    vec3 norm; uint useColor;
+    vec4 color;
+    uint useTexture; uint useOverlay; vec2 uv;
+    ivec2 overlay; uint useGlint; uint textureId;
+    vec2 glintUv; uint glintTexture; uint useLight;
+    ivec2 lightUv; uint coordinate; float emission;
+    vec3 postBase; uint alphaMode;
+};
+struct Triangle { Vertex a; Vertex b; Vertex c; };
+struct Node { vec4 lower; vec4 upper; uvec4 info; };
+layout(std430, set=0, binding=0) readonly buffer Triangles { Triangle triangles[]; };
+layout(std430, set=0, binding=1) readonly buffer Nodes { Node nodes[]; };
+layout(rgba8, set=0, binding=2) uniform writeonly image2D outputImage;
+layout(set=0, binding=3) uniform sampler2D textures[512];
+layout(push_constant) uniform Params { mat4 inverseProjection; uvec4 dimensions; } params;
+
+uint rng;
+float randomFloat() {
+    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+    return float(rng >> 8) / 16777216.0;
+}
+bool boxHit(Node node, vec3 origin, vec3 direction, float limit) {
+    vec3 safeDir = mix(direction, vec3(1e-20), lessThan(abs(direction), vec3(1e-20)));
+    vec3 a = (node.lower.xyz-origin)/safeDir, b=(node.upper.xyz-origin)/safeDir;
+    vec3 lo=min(a,b), hi=max(a,b);
+    return max(max(lo.x,lo.y),max(lo.z,0.0)) <= min(min(hi.x,hi.y),min(hi.z,limit));
+}
+bool triangleHit(Triangle t, vec3 origin, vec3 direction, inout float distance, out vec2 bary) {
+    vec3 e1=t.b.pos-t.a.pos, e2=t.c.pos-t.a.pos;
+    vec3 p=cross(direction,e2);
+    float det=dot(e1,p);
+    if (abs(det)<1e-9) return false;
+    vec3 delta=origin-t.a.pos;
+    float u=dot(delta,p)/det;
+    if(u<0.0 || u>1.0) return false;
+    vec3 q=cross(delta,e1);
+    float v=dot(direction,q)/det;
+    if(v<0.0 || u+v>1.0) return false;
+    float d=dot(e2,q)/det;
+    if(d<0.0001 || d>=distance) return false;
+    distance=d; bary=vec2(u,v); return true;
+}
+bool nearest(vec3 origin, vec3 direction, out uint triangle, out vec2 bary, out float distance) {
+    uint stack[64]; int size=1; stack[0]=0;
+    distance=1e30; bool hit=false;
+    while(size>0) {
+        Node node=nodes[stack[--size]];
+        if(!boxHit(node,origin,direction,distance)) continue;
+        if(node.info.y==0u) { stack[size++]=node.info.x; stack[size++]=node.info.z; }
+        else for(uint i=0u;i<node.info.y;i++) {
+            uint index=node.info.x+i; vec2 b;
+            if(triangleHit(triangles[index],origin,direction,distance,b)) { hit=true; triangle=index; bary=b; }
+        }
+    }
+    return hit;
+}
+vec3 cosineDirection(vec3 normal) {
+    float angle=6.2831853*randomFloat(), r=sqrt(randomFloat());
+    vec3 tangent=normalize(cross(abs(normal.y)<0.99 ? vec3(0,1,0) : vec3(1,0,0),normal));
+    return tangent*(r*cos(angle))+cross(normal,tangent)*(r*sin(angle))+normal*sqrt(1-r*r);
+}
+vec4 path(vec3 origin, vec3 direction) {
+    vec3 radiance=vec3(0), throughput=vec3(1); bool covered=false;
+    int bounce=0;
+    for(int step=0;step<48 && bounce<4;step++) {
+        uint index; vec2 bary; float distance;
+        if(!nearest(origin,direction,index,bary,distance)) {
+            if(covered) radiance+=throughput*mix(vec3(0.25),vec3(1.1,1.2,1.4),0.5+0.5*direction.y);
+            break;
+        }
+        Triangle t=triangles[index];
+        vec3 weights=vec3(1-bary.x-bary.y,bary);
+        vec4 tint=t.a.color*weights.x+t.b.color*weights.y+t.c.color*weights.z;
+        vec4 color=vec4(1);
+        if(t.a.useTexture!=0u) {
+            vec2 uv=t.a.uv*weights.x+t.b.uv*weights.y+t.c.uv*weights.z;
+            color*=textureLod(textures[nonuniformEXT(t.a.textureId)],uv,0);
+        }
+        if(t.a.useColor==1u) color*=tint;
+        else if(t.a.useColor==2u) color.rgb=mix(color.rgb,tint.rgb,tint.a);
+        uint mode=t.a.alphaMode;
+        bool skip=(mode==1u && color.a<0.5) || (mode==9u && color.a<0.1)
+            || (mode==10u && randomFloat()>color.a);
+        vec3 point=origin+direction*distance;
+        if(skip) { origin=point+direction*0.001; continue; }
+        covered=true;
+        vec3 normal=normalize(cross(t.b.pos-t.a.pos,t.c.pos-t.a.pos));
+        bool entering=dot(normal,direction)<0.0;
+        if(!entering) normal=-normal;
+        vec3 albedo=pow(max(color.rgb,vec3(0)),vec3(2.2));
+        float emission=t.a.emission*weights.x+t.b.emission*weights.y+t.c.emission*weights.z;
+        radiance+=throughput*albedo*emission;
+        if(mode==2u) {
+            // Plain dielectric preview, with Fresnel reflection and transmission.
+            float fresnel=0.04+0.96*pow(1-max(dot(-direction,normal),0),5);
+            vec3 transmitted=refract(direction,normal,entering ? 1.0/1.5 : 1.5);
+            if(dot(transmitted,transmitted)<1e-8 || randomFloat()<fresnel) direction=reflect(direction,normal);
+            else { direction=normalize(transmitted); throughput*=mix(vec3(1),albedo,color.a); }
+        } else {
+            throughput*=albedo;
+            direction=cosineDirection(normal);
+        }
+        origin=point+direction*0.001;
+        bounce++;
+        if(bounce>2) {
+            float probability=clamp(max(throughput.r,max(throughput.g,throughput.b)),0.1,0.95);
+            if(randomFloat()>probability) break;
+            throughput/=probability;
+        }
+    }
+    return vec4(radiance,covered ? 1.0 : 0.0);
+}
+void main() {
+    ivec2 pixel=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(pixel,ivec2(params.dimensions.xy)))) return;
+    rng=(uint(pixel.x)+uint(pixel.y)*params.dimensions.x+1u)*747796405u+(params.dimensions.z+1u)*2891336453u;
+    vec4 result=vec4(0);
+    for(int sampleIndex=0;sampleIndex<8;sampleIndex++) {
+        vec2 uv=(vec2(pixel)+vec2(randomFloat(),randomFloat()))/vec2(params.dimensions.xy);
+        vec2 ndc=vec2(uv.x*2-1,1-uv.y*2);
+        vec4 nearPoint=params.inverseProjection*vec4(ndc,-1,1);
+        vec4 farPoint=params.inverseProjection*vec4(ndc,1,1);
+        vec3 origin=nearPoint.xyz/nearPoint.w;
+        result+=path(origin,normalize(farPoint.xyz/farPoint.w-origin));
+    }
+    result/=8.0;
+    // Convert accumulated premultiplied radiance to straight alpha for the UI compositor.
+    vec3 linear=result.a>0 ? result.rgb/result.a : vec3(0);
+    vec3 mapped=linear/(vec3(1)+linear);
+    imageStore(outputImage,pixel,vec4(pow(mapped,vec3(1.0/2.2)),result.a));
+}

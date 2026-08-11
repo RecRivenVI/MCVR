@@ -1,8 +1,7 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-#define NRD_GLSL 1
-#include "../../../extern/nrd/Shaders/Include/NRD.hlsli"
+#include "shader/world/nrd/nrd_glsl_compat.glsl"
 #include "common/shared.hpp"
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
@@ -86,7 +85,7 @@ void main() {
     float diffHitDist = max(imageLoad(diffuseHitDepthImage, pixel).r, 0.001);
     vec3 diffAlbedo = max(imageLoad(diffuseAlbedoMetallicImage, pixel).rgb, vec3(0.05));
     vec3 demodDiffuse = safeDiv(diffRadiance, diffAlbedo);
-    float normDiffHitDist = REBLUR_FrontEnd_GetNormHitDist(diffHitDist, linearDepth, gDiffHitDistParams, 1.0);
+    float normDiffHitDist = REBLUR_FrontEnd_GetNormHitDist(diffHitDist, linearDepth, gDiffHitDistParams.xyz, 1.0);
     imageStore(nrdDiffuseRadianceImage, pixel,
                REBLUR_FrontEnd_PackRadianceAndNormHitDist(demodDiffuse, normDiffHitDist, true));
 
@@ -94,7 +93,7 @@ void main() {
     specHitDist = NRD_FrontEnd_TrimHitDistance(specHitDist, 1e-3);
     vec3 specAlbedo = max(imageLoad(specularAlbedoImage, pixel).rgb, vec3(0.04));
     vec3 demodSpecular = safeDiv(specRadiance, specAlbedo);
-    float normSpecHitDist = REBLUR_FrontEnd_GetNormHitDist(specHitDist, linearDepth, gSpecHitDistParams, roughness);
+    float normSpecHitDist = REBLUR_FrontEnd_GetNormHitDist(specHitDist, linearDepth, gSpecHitDistParams.xyz, roughness);
     imageStore(nrdSpecularRadianceImage, pixel,
                REBLUR_FrontEnd_PackRadianceAndNormHitDist(demodSpecular, normSpecHitDist, true));
 }

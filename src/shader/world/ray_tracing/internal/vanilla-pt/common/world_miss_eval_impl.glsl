@@ -101,6 +101,88 @@ vec4 evalMoonBillboard(vec3 rayDir) {
     return sampleAtlasLod0(textures[nonuniformEXT(skyUBO.moonTextureID)], uv, tileCount, tile);
 }
 
+// The vanilla End sky is a six-face cube made by drawing the same 16x16
+// end_sky texture on each face with UVs 0..16.  Keep the face rotations from
+// LevelRenderer#renderEndSky instead of treating it as the normal atmosphere.
+vec3 evalEndSky(vec3 rayDir) {
+    rayDir = normalize(rayDir);
+    float ax = abs(rayDir.x);
+    float ay = abs(rayDir.y);
+    float az = abs(rayDir.z);
+    vec2 faceUv;
+
+    if (ay >= ax && ay >= az) {
+        float d = max(ay, 1e-5);
+        faceUv = rayDir.y > 0.0
+            ? vec2(rayDir.x / d, -rayDir.z / d)
+            : vec2(rayDir.x / d, rayDir.z / d);
+    } else if (az >= ax) {
+        float d = max(az, 1e-5);
+        faceUv = rayDir.z > 0.0
+            ? vec2(rayDir.x / d, rayDir.y / d)
+            : vec2(rayDir.x / d, -rayDir.y / d);
+    } else {
+        float d = max(ax, 1e-5);
+        faceUv = rayDir.x > 0.0
+            ? vec2(rayDir.y / d, rayDir.z / d)
+            : vec2(-rayDir.y / d, rayDir.z / d);
+    }
+
+    vec2 uv = fract((faceUv * 0.5 + 0.5) * 16.0);
+    vec3 textureColor = texture(textures[nonuniformEXT(worldUBO.endSkyTextureID)], uv).rgb;
+    // renderEndSky sets the vertex color to ARGB 0xff282828.
+    return textureColor * (40.0 / 255.0);
+}
+
+vec3 applySunriseGradient(vec3 rayDir, vec3 background) {
+    float alpha = clamp(skyUBO.horizonColor.a, 0.0, 1.0);
+    if (alpha <= 1e-5) return background;
+
+    vec3 sunHorizon = vec3(skyUBO.sunDirection.x, 0.0, skyUBO.sunDirection.z);
+    float sunHorizonLength = length(sunHorizon);
+    vec3 rayHorizon = vec3(rayDir.x, 0.0, rayDir.z);
+    float rayHorizonLength = length(rayHorizon);
+    if (sunHorizonLength <= 1e-5 || rayHorizonLength <= 1e-5) return background;
+
+    float azimuth = dot(rayHorizon / rayHorizonLength, sunHorizon / sunHorizonLength);
+    // The vanilla triangle fan is centered on the sunrise/sunset azimuth and
+    // fades toward both the vertical and the edge of its 120-block disc.
+    float azimuthWeight = smoothstep(0.10, 0.92, azimuth);
+    float verticalWeight = 1.0 - smoothstep(0.0, 0.65, abs(rayDir.y));
+    float blend = clamp(alpha * azimuthWeight * verticalWeight, 0.0, 1.0);
+    return mix(background, skyUBO.horizonColor.rgb, blend);
+}
+
+uint starHash(uvec2 value) {
+    uint h = value.x * 0x8da6b343u ^ value.y * 0xd8163841u ^ 0xcb1ab31fu;
+    h ^= h >> 16u;
+    h *= 0x7feb352du;
+    h ^= h >> 15u;
+    h *= 0x846ca68bu;
+    return h ^ (h >> 16u);
+}
+
+vec3 evalPathTracedStars(vec3 rayDir) {
+    const uvec2 gridSize = uvec2(512u, 256u);
+    vec2 sphericalUv = vec2(atan(rayDir.z, rayDir.x) * INV_TWO_PI + 0.5,
+                            asin(clamp(rayDir.y, -1.0, 1.0)) * INV_PI + 0.5);
+    uvec2 cell = uvec2(floor(fract(sphericalUv) * vec2(gridSize)));
+    uint h = starHash(cell);
+    // Approximately 3000 stable stars over the full environment sphere.
+    if ((h % 44u) != 0u) { return vec3(0.0); }
+
+    vec2 jitter = vec2(float((h >> 8u) & 0xffffu), float((h >> 16u) & 0xffffu)) / 65535.0;
+    vec2 centerUv = (vec2(cell) + 0.15 + jitter * 0.70) / vec2(gridSize);
+    float longitude = (centerUv.x - 0.5) * TWO_PI;
+    float latitude = (centerUv.y - 0.5) * PI;
+    vec3 centerDir = vec3(cos(latitude) * cos(longitude), sin(latitude),
+                          cos(latitude) * sin(longitude));
+    float angularDistance = acos(clamp(dot(normalize(rayDir), centerDir), -1.0, 1.0));
+    float radius = mix(0.00065, 0.00125, float(h & 0xffu) / 255.0);
+    float coverage = 1.0 - smoothstep(radius * 0.35, radius, angularDistance);
+    return vec3(coverage * 1.8);
+}
+
 void main() {
     mainRay.directLightRadiance.x = 1.0;
 
@@ -110,21 +192,29 @@ void main() {
         return;
     }
 
-    switch (worldUBO.skyType) {
-        case 0:
-        case 2:
-            raySetStop(mainRay, true);
-            mainRay.hitT = INF_DISTANCE;
-            return;
-        case 1:
-        default: break;
+    if (worldUBO.skyType == 0) {
+        raySetStop(mainRay, true);
+        mainRay.hitT = INF_DISTANCE;
+        return;
     }
 
     vec3 rayDir = normalize(gl_WorldRayDirectionEXT);
-    vec3 sunDir = celestialSunDirection();
-    float progress = skyUBO.rainGradient;
-    vec3 rainyRadiance = mix(vec3(0.0), vec3(0.1), smoothstep(-0.3, 0.3, sunDir.y));
-    vec3 backgroundRadiance = mix(texture(skyFull, rayDir).rgb, rainyRadiance, progress);
+    if (skyUBO.isSkyDark > 0 && worldUBO.skyType == 1 && rayDir.y <= 0.0) {
+        raySetStop(mainRay, true);
+        mainRay.hitT = INF_DISTANCE;
+        return;
+    }
+    vec3 backgroundRadiance;
+    float progress = clamp(skyUBO.rainGradient, 0.0, 1.0);
+
+    if (worldUBO.skyType == 2) {
+        backgroundRadiance = evalEndSky(rayDir);
+    } else {
+        vec3 sunDir = celestialSunDirection();
+        vec3 rainyRadiance = mix(vec3(0.0), vec3(0.1), smoothstep(-0.3, 0.3, sunDir.y));
+        backgroundRadiance = mix(texture(skyFull, rayDir).rgb, rainyRadiance, progress);
+        backgroundRadiance = applySunriseGradient(rayDir, backgroundRadiance);
+    }
 
     if (worldUBO.skyType == 1) {
         float cameraHeight = worldUBO.cameraViewMatInv[3].y;
@@ -155,10 +245,12 @@ void main() {
                 backgroundRadiance += mix(moonRadiance, vec3(0.0), progress);
             }
         }
+
+        backgroundRadiance += evalPathTracedStars(rayDir) * clamp(skyUBO.starBrightness, 0.0, 1.0);
     }
 
 #if VPT_ALLOW_VOLUMETRIC_CLOUD_MISS
-    if (VPT_CLOUD_MODE == 2u) {
+    if (worldUBO.skyType == 1 && VPT_CLOUD_MODE == 2u) {
         VolumetricCloudResult cloudResult =
             rayUseIndirectVolumetricCloud(mainRay) ?
                 applyVolumetricCloudBudgeted(gl_WorldRayOriginEXT, rayDir, backgroundRadiance,

@@ -1,0 +1,3155 @@
+# MCVR development ledger
+
+## 2026-09-22: native error-boundary follow-up repair
+
+Status: source-fixed; automated verification passed; paired client runtime acceptance pending.
+Evidence: static root-cause inventory, injected native contracts, RelWithDebInfo `core.dll` build,
+and complete CTest on baseline `dadb7ecb9fcc3b333d48bb0f76b906c979e63ae3`.
+Corrects: the earlier native failure-boundary source-closure entry, which missed the four cases
+below.
+
+The confirmed and repaired cases are:
+
+- `parallelFor` now treats worker creation as part of the exception-safe operation. A launcher
+  failure latches cancellation, joins every worker already started while their referenced state is
+  alive, then rethrows the original creation error. The production helper is exercised with an
+  injected third-launch failure, normal work, and a throwing task; it does not exhaust system
+  threads to create the failure.
+- `failure::State` publishes the first kind/result in one allocation-free atomic operation before
+  locking, copying strings, or logging. Detail storage and logging are best effort and publish a
+  separate diagnostic-failure bit. An injected throwing detail recorder proves that the fatal bit
+  and original `VkResult` survive and later normal work is still rejected.
+- first-cause diagnostics and device-loss cleanup are separate contracts. A later
+  `VK_ERROR_DEVICE_LOST` no longer overwrites an ordinary first cause, but monotonically reaches
+  device, framework, renderer, queue-idle, FSR teardown, and asynchronous Streamline cleanup
+  decisions. Concurrent records, ordinary-fatal-then-loss, global async-loss/local ordinary state,
+  and a concurrent idempotent close gate are covered without submitting real GPU work or changing
+  TDR.
+- JNI string conversion now copies the exact UTF-16 or modified-UTF-8 length into owned storage
+  before a Win32/POSIX module lookup. Pending Java exceptions stop ordinary work; borrowed chars
+  and local references are released during unwinding. The same helper replaced all direct
+  `GetStringChars`/`GetStringUTFChars` uses in first-party `src/core/middleware` and
+  `src/core/loading`. The contract covers non-NUL-terminated Unicode data, null, acquisition
+  failure, and an exception becoming pending after acquisition. Loaded module handles remain
+  borrowed and are not freed.
+
+The MCVR product changeset relative to the fixed baseline, excluding documentation and including
+the three untracked product headers, has SHA-256
+`D50CFA7F44668D7A948EA630084F507435B332E768E58BB98F0386C2140695E2`. The
+RelWithDebInfo native artifact has SHA-256
+`95EB80A6F0C99A9B377CD66FC187A76AACD58C1B11D698095FA8BAFB60FCEAD5`. The
+targeted contract passed, the complete CTest suite passed 30/30 including four Vulkan GPU tests,
+and the paired Radiance JUnit suite was rerun successfully. An earlier CTest invocation after only
+building the targeted binary reported thirteen tests as `Not Run`; after `ALL_BUILD` produced the
+missing executables, the full suite passed. That first invocation is a build-order observation,
+not a product-test failure.
+
+The actual `GetModuleHandleW` lookup was compiled through the full native target but not driven by
+a mocked JVM. No Minecraft client, injected post-world fatal, real or controlled GPU device loss,
+integrated-server save/stop, or visual flow ran. Third-party SDK internal teardown and driver
+behavior remain outside static proof. No artifact was installed, packaged, or published.
+
+## 2026-09-22: single-port-commit history policy correction
+
+Status: adopted as repository-maintenance policy; no product or acceptance claim.
+Evidence: explicit user decision and local Git-history verification.
+Supersedes: the new paired remediation-commit recommendation in the pre-commit state audit below.
+
+The maintained branch keeps upstream history followed by exactly one signed `Initial port` commit.
+Later Radiance/MCVR changes are amended into that commit while preserving its original author and
+committer names, emails, timestamps with time zones, message, and upstream parent. This intentionally
+replaces the amended commit object and signature; the old SHA and signature bytes are not an
+identity requirement. Cross-repository records use a one-way MCVR reference from Radiance and do
+not trigger reciprocal SHA backfills or repeated amendments.
+
+Backups are temporary rollback tools rather than permanent history. Before a destructive local or
+remote rewrite, retain the smallest verified bundle needed to restore the affected refs. Remove
+superseded project-maintenance backup refs after the rewrite is verified and their recoverability
+has been exported. A backup needed to recover a future force-push remains until the remote state is
+verified. Do not prune reflogs, force garbage collection, or delete backups of uncertain origin.
+
+## 2026-09-22: paired pre-commit state audit
+
+Status: documented; no staging, commit, amend, push, cleanup, product edit, or new validation was
+performed by this checkpoint.
+Evidence: Git worktree/index/ignored-file inventory, remote/ref comparison, GitHub signature
+verification, native-install hash comparison, pinned dependency inspection, and license inventory.
+
+MCVR `develop` and `origin/develop` both point to the valid SSH-signed `Initial port` commit
+`b0173ab855d4f693a0a62216ec07197b184490b5`. The unstaged worktree has 68 tracked changed paths and
+ten untracked candidate paths: six product/header/shader files and four tests. The index is empty.
+All ten untracked files are part of the implemented contracts and must be included in any later
+candidate; `bin`, `build-radiance-1.21.1-neoforge`, loose objects and other generated/install
+outputs are excluded.
+
+The paired Radiance audit is the normalized status authority for the thirteen findings, the extra
+P1-03 and physical-client findings, runtime blind spots, and the corrected Ponder
+`eWarnOutOfVRAM` diagnosis. MCVR's native source closure and automatic tests do not establish live
+post-world fatal handling, real device-loss behavior, integrated-server save/stop, broad gameplay,
+or visual acceptance. P2-02 and the generic UI PT design remain explicitly open; P2-07's composite
+reuse does not resolve full-window multi-pipeline memory pressure.
+
+The ignored native and SDK binaries are install outputs, not source-commit content. Core and XeSS
+outputs match the files installed into Radiance, while DLSS/Streamline DLLs come from the pinned
+DLSS submodule and SHA-256-pinned Streamline 2.14.1 archive. MCVR's `LICENSE.md` states the primary
+GPL-3.0 and file-level exceptions. A public binary release still requires the paired distribution
+license checklist described in Radiance; local build reproducibility is not redistribution
+authorization.
+
+The preferred history is a new paired remediation commit so the signed `Initial port` commit and
+external-review comparison remain stable. If an amend is later explicitly selected, preserve exact
+author/committer metadata and message, create newly SSH-signed commit objects, retain verified
+backup refs/bundles, push with an expected-old-value lease, and keep the old and new snapshot IDs
+side by side in the audit.
+
+## 2026-09-22: native failure boundary source closure
+
+Status: implemented; build-verified; automated-verified; paired runtime acceptance pending.
+Evidence: complete first-party native source and JNI inventory, Release build, CTest, build-host
+Vulkan GPU tests, paired distribution verification, and artifact hashes.
+
+All 61 remaining direct process exits were removed after classification. Initialization failures
+throw through a non-sticky initialization boundary, while runtime, invariant, and device-lost
+failures publish one synchronized immutable first-failure record. Normal JNI calls reject work
+after fatal; `lastFailureDescriptionNative`, loading cleanup, renderer close, and close-before-init
+are explicitly allowed. All 182 JNI exports under `src/core/middleware` and `src/core/loading` are
+guarded. Repeated close and close-before-initialization are safe.
+
+The audit extended beyond JNI. `parallelFor` captures the first worker exception, stops admitting
+new work, joins all workers, and rethrows on the caller. Vulkan validation, Streamline logging and
+FidelityFX message callbacks contain exceptions at their C ABI. The DLSS-G asynchronous callback
+publishes `VK_ERROR_DEVICE_LOST` globally. Swapchain recreation preserves an existing typed fatal
+result. Renderer, framework, device, and early-loading cleanup skip idle waits once device loss is
+known. Cleanup uses an allocation-free atomic device-loss result rather than copying the locked
+diagnostic snapshot from a destructor. Two-step `Framework` creation retains constructed members during partial initialization,
+and a failed singleton constructor can be retried.
+
+The failure-state contract injects initialization, runtime, concurrent-first-failure, post-fatal,
+and worker-thread failures; source contracts reject process exits and unguarded JNI exports. The
+Release build completed and the paired Radiance build installed the result. The final product-source
+snapshot, excluding docs and including untracked product files, is
+`4CE216AF5378A526243437EE3C9FD062A7807F7307A0DD60EFCBEE138F6F3137`. Build and installed
+`core.dll` share SHA-256 `5AA4C808C2C766270491FF93389D4ECE39350385CEE204B319A8BD8959860FB3`.
+
+The first full CTest run after adding cancellation included a scheduler-sensitive assertion about
+how many already-running callbacks completed. That assertion was not part of the error-propagation
+contract and was removed; the final full result is 30/30 passing, including four Vulkan GPU tests.
+The paired packaged dedicated-server check reached `Done (3.300s)` without publishing Radiance's
+nested GAME mod or extracting the native payload. Its Gradle wrapper was interrupted after
+readiness because it did not forward `stop`; this is discovery/startup evidence, not graceful
+shutdown evidence. No live injected Minecraft failure or actual device loss has been run. Driver
+behavior, third-party SDK internal cleanup, Java error presentation, and integrated-server
+save/stop remain runtime blind spots. P2-02 and generic UI PT were untouched.
+
+## 2026-09-22: Streamline failure identity and Ponder VRAM diagnosis
+
+Status: reproduced and identified; fallback verified live; memory repair pending.
+Evidence: full compatibility packaged-client runtime, native allocation counters, and persistent
+Streamline diagnostics.
+
+The NGX compatibility wrapper previously mapped every failed Streamline operation to
+`NVSDK_NGX_Result_FAIL_FeatureNotSupported`. A 3840x2054 Ponder reproduction proved that the real
+failure was `slEvaluateFeature -> Result::eWarnOutOfVRAM (39)`. Multiple full-window independent
+PT/RR pipelines overlapped during resize and a two-scene transition, and native reporting reached
+about 13.8 GiB of VRAM on the 16 GiB test card. The current-frame spatial fallback kept the JVM
+alive, but the unresolved pressure reduced the instance to about 2-3 FPS.
+
+Streamline errors now retain the failing stage, named/raw result, feature, viewport, frame, and
+dimensions in `radiance-streamline.log`. SR/RR feature requirements, including
+`maxNumViewports`, are queried at startup. Repeated identical failures are rate limited in the next
+build. The native Release build and CTest suite passed 30/30 before runtime deployment. This entry
+does not claim that Ponder's full-window resource design is fixed.
+
+## 2026-09-22: native failure containment batch 4, active-path slice
+
+Status: partially implemented; build-verified; automated-verified; deployed through the paired
+Radiance packaged client; runtime acceptance pending.
+Evidence: static, build, automated, build-host Vulkan GPU tests, and artifact hashes.
+
+Historical intermediate state: the source-closure entry above supersedes the current P1-03 status
+and removes the 61 exits that remained in this slice.
+
+Active present, submitted-frame readback and screenshot-fence failures now enter
+`Framework::recordFailure` instead of calling `exit()`. An optional NGX-directory failure disables
+DLSS cleanly. Missing ray-tracing shader packs and invalid overlay-buffer handles throw through JNI
+operations already guarded by `jni::invokeVoid`. A source-level regression contract prevents these
+specific active paths from regaining direct process exits.
+
+This does not close P1-03. Sixty-one direct exits remain in Vulkan construction, resource
+validation and the older Vulkan framework. They are deliberately retained until every reachable
+JNI and worker boundary is classified and protected; blindly replacing them with exceptions could
+allow an exception to escape C ABI or a native thread and call `std::terminate`.
+
+The Release build produced `core.dll` and all 30 CTest entries passed, including four Vulkan GPU
+tests. Radiance then completed `prepareRuntime build preparePackagedClient`. MCVR `bin/core.dll`
+and Radiance's embedded copy share SHA-256
+`0C58A958D1AD89C8997861733E7240CDBDF67AD574BBFF6A8C24D26487B1B6D7`. No live injected-failure or
+device-lost test has been performed.
+
+## 2026-09-22: external-section and Ponder resource repair batch 3
+
+Status: implemented; build-verified; automated-verified; runtime and visual acceptance pending.
+Evidence: static, build, automated, and build-host Vulkan GPU tests.
+Applies to: the same uncommitted paired worktrees as batches 1 and 2.
+
+External chunk handles now encode a slot generation. Released slots enter a free list only after
+their logical generation is invalidated; new allocations install a fresh `Chunk1`, while old GPU
+objects are retained through frame retirement. Queued CPU copies, pending build results and GPU
+batch completion all revalidate the captured generation before publication. The stress test cycles
+one slot 100,000 times without capacity growth and rejects every stale handle.
+
+Each Ponder scene now owns one composite image and descriptor table per swapchain frame. Stable
+draws rebind current inputs and reuse those objects; scene retirement retains their owner until GPU
+work is safe. Full-window tracing and the existing crop are unchanged pending an explicit viewport
+and visual design.
+
+The full Release build produced `core.dll`, and all 30 CTest entries passed in 3.76 seconds,
+including external-handle churn, Ponder resource ownership, shader/camera contracts, failure-state
+contracts and four Vulkan GPU tests. No Minecraft client was launched. Real Sable/Aeronautics churn,
+Ponder transition/resize behavior and visual framing remain unverified.
+
+## 2026-09-22: camera and dead Flywheel data repair batch 2
+
+Status: implemented; build-verified; automated-verified; runtime and visual acceptance pending.
+Evidence: static, build, automated.
+Applies to: the same uncommitted paired worktrees as batch 1.
+
+All camera-producing ray paths now call `buildWorldCameraRay`. The helper preserves the established
+perspective behavior and uses per-pixel origins with parallel directions for orthographic scenes.
+The audit was extended beyond priority/background to both world ray generators, advanced primary,
+volumetric light, and the direct-light surface reconstruction path. A source contract prevents any
+of these consumers from rebuilding projection rays locally; the normal build also compiled the
+shader tree. Ponder alignment still requires visual acceptance.
+
+The unused Flywheel dynamic light-section chain was removed end to end: JNI endpoints, CPU maps
+and copies, per-frame GPU buffer allocation/upload, descriptor binding 11, and 18-cube shader
+sampling helpers. Per-instance scene lighting and the shader-light inputs remain. The full Release
+build produced `core.dll`; JNI coverage, shader packaging, camera-ray, instancing, and failure-state
+tests passed. The paired Radiance JUnit suite also passed.
+
+No Minecraft client was launched or artifact deployed. Performance improvement and Create/Flywheel
+visual equivalence remain runtime acceptance items.
+
+## 2026-09-22: renderer failure-state repair batch 1
+
+Status: implemented; build-verified; automated-verified; runtime acceptance pending.
+Evidence: static, build, automated, and build-host Vulkan GPU tests.
+Applies to: uncommitted MCVR worktree based on
+`b0173ab855d4f693a0a62216ec07197b184490b5`; paired Radiance worktree based on
+`249f9a63bd861a3273d2d43ff6e594bff980c66e`.
+
+Frame acquisition now records acquire success independently from swapchain recreation. Two
+out-of-date acquisitions followed by successful recreations return `VK_NOT_READY` without
+publishing an image index or semaphore, and the old current context is cleared. Non-transient
+acquire and frame-fence failures enter the existing `recordFailure` channel instead of calling
+`exit()`.
+
+Streamline feature loading now returns a typed result. An absent runtime satisfies a request to
+keep FG disabled, while an enable request remains explicitly unavailable and SDK failures remain
+distinct. DLSS SR/RR evaluation now has an explicit output-valid state: failure requests a history
+reset, does not copy the undefined output into diagnostics, and throws before depth, motion,
+normal, or later render-graph consumers run.
+
+The new `mcvr.failure-state-contract` covers double-out-of-date exhaustion, suboptimal acquisition,
+Streamline-absent enable/disable decisions, SDK failure classification, and DLSS output/history
+state. A complete Release build produced `core.dll`; all 27 CTest entries passed in 3.75 seconds,
+including the existing tessellation, custom-vertex-array, exposure, and framebuffer Vulkan GPU
+tests. Radiance's complete JUnit suite also passed.
+
+No Minecraft client was launched and no DLL/JAR was deployed. The remaining direct `exit()` sites
+are still under staged review; this entry claims only the acquire and frame-fence slice. The full
+cross-repository scope is recorded in Radiance
+`docs/audits/2026-09-22-gpt6-pro-code-review-verification.md`.
+
+MCVR is the native renderer paired with the sibling Radiance mod. Product-level decisions and
+deferred work are recorded in Radiance `docs/DEVELOPMENT_LEDGER.md` and `docs/ROADMAP.md`; this file
+keeps the native half discoverable when MCVR is reviewed on its own.
+
+Investigation records that are not implementation claims:
+
+- `docs/research/NVIDIA_FRAME_GENERATION_AND_NEURAL_RENDERING.md` records Ada MFG, unofficial NR,
+  and GUI/background-blur FG findings.
+- `docs/research/NATIVE_RENDERER_INVESTIGATIONS.md` records the native side of the proposed
+  RenderPearl host migration and the PT/Ponder correctness backlog.
+
+## 2026-09-21: historical dirty-worktree checkpoint
+
+Status: superseded as a repository-state claim; retained as a historical snapshot.
+Evidence: static, build, and automated results described below; no independent client acceptance.
+
+> Historical snapshot. Its uncommitted-worktree instructions are superseded by the post-amend
+> correction below.
+
+Native work captured by this historical snapshot includes:
+
+- chunk generation/epoch validation, fenced batch publication, and per-frame native scheduling in
+  `src/core/middleware/com_radiance_client_proxy_world_ChunkProxy.cpp` and
+  `src/core/render/chunks.*`;
+- display-resolution HDR camera effects carried through `WorldUBO`, JNI, tone-mapping descriptors,
+  and `src/shader/world/tone_mapping/tone_mapping.frag`;
+- signed independent U/V fluid spans so the backend can consume either vanilla 4 by 4 UVs or the
+  exact values supplied by an actual Veil screen-quad call;
+- related denoising, ray-generation, Streamline, and world-prepare changes visible in the
+  checkpoint's Git diff.
+
+Evidence must distinguish C++/shader compilation, CTest, real command execution, displayed pixels,
+and user acceptance. Radiance owns the Minecraft launch and packaging boundary; MCVR is not tested
+as an independently launchable client.
+
+Historical handoff instruction, now superseded by the correction below: before committing, update
+this file with the final native file list, CTest count, packaged DLL hash, runtime result, and any
+validation messages that remain unresolved.
+
+Workspace organization on 2026-09-21 added shader-specific LF rules in `.gitattributes` and
+normalized the two modified `world.rgen` files from mixed CRLF/LF to LF. No files were staged or
+committed, and this normalization does not change shader behavior.
+
+## 2026-09-21: Windows generator guard
+
+Status: implemented; build-verified for configuration and generator selection.
+Evidence: static and build; no independent client runtime or visual claim.
+
+The complete Windows configuration with both FidelityFX and NRD is supported through a Visual
+Studio x64 generator. FidelityFX forces `CMAKE_GENERATOR_PLATFORM=x64`; its leaked cache value is
+forwarded by NRD's nested ShaderMake configure, while Ninja rejects generator platform arguments.
+
+`CMakeLists.txt` now rejects that exact Ninja combination before compiler and dependency discovery,
+and reports a working Visual Studio configure command. A fresh negative-path configure produced the
+intended failure in 121 ms. Radiance's `configureRuntimeDependencies` independently selects or
+reuses a Visual Studio generator, and a positive configure completed with `Visual Studio 18 2026`
+and x64. The Radiance entrypoint also ignored an externally forced `CMAKE_GENERATOR=Ninja` and kept
+the explicit cached Visual Studio generator. Direct builds that disable either FidelityFX
+upscaling or NRD are not blocked by this guard.
+
+## 2026-09-21: post-amend repository-state correction
+
+Status: implemented; static Git/remote verification. No new native runtime or visual claim.
+Evidence: static Git status, local/remote ref comparison, and commit inspection.
+
+The implementation baseline immediately before the current documentation-maintenance batch is
+MCVR `5150670796380bf128fecec551c864f480bb05f9` (`Initial port`). Its local `develop` matched
+`origin/develop`, and product source was clean. The native work described by the historical
+dirty-worktree checkpoint had been consolidated into that single commit and pushed.
+
+This correction supersedes only the old instruction to update the ledger "before committing" and
+the claim that the implementation was still uncommitted. The checkpoint's native file scope,
+generator evidence, and evidence-level cautions remain historical records. Documentation changes
+made after this verification remain intentionally uncommitted for batch review.
+
+## 2026-09-21: native-crash historical extraction
+
+Status: implemented documentation; no new native runtime or visual claim.
+Evidence: static current-source inspection plus complete pagination of five historical Codex tasks.
+
+Radiance now owns the cross-repository
+[native crash and runtime synthesis](https://github.com/RecRivenVI/Radiance/blob/develop/docs/research/CRASH_AND_RUNTIME_INVESTIGATION_HISTORY.md).
+The extraction preserves the repeated A/B/A evidence for the pipeline-layout ownership token while
+keeping the NVIDIA-driver mechanism explicitly unresolved. It also corrects a superseded task
+claim: at MCVR `5150670796380bf128fecec551c864f480bb05f9`, a descriptor slot retains its current bound
+resource and replaces that owner when rebound; it does not retain every historical generation.
+`DynamicGraphicsPipeline` separately retains the pipeline-layout/set-layout ownership token.
+
+The old whole-table E-02 experiment, partial device-loss recovery, transient diagnostic layers,
+historic test counts, and old deployment hashes are not current product contracts. Independent
+validation findings remain tracked in the Radiance roadmap until controlled attribution and
+baseline comparison are performed.
+
+## 2026-09-22: lifecycle acceptance instrumentation and RelWithDebInfo artifact
+
+Status: implemented for isolated acceptance; automated-verified; real client cases pending.
+Evidence: source inspection, RelWithDebInfo build, 30/30 CTest including four Vulkan GPU tests, and
+paired Radiance packaging checks.
+
+The default-off lifecycle acceptance hook adds a controlled runtime-fatal JNI path and read-only
+state reporting for the paired isolated client. It records successful and attempted frame submits,
+the injection boundary, post-fatal probe-body admission, and close count. The fatal uses the normal
+`FatalError` and JNI boundary, so the Java client receives the same class of propagated native
+failure used by production errors. Failure diagnostics and shutdown remain callable after sticky
+fatal. No device-lost flag is forged and no real GPU reset is attempted.
+
+The contract test covers the probe counters in addition to the existing deterministic thread
+creation failure, worker failure, diagnostic-allocation failure, first-cause/device-loss split,
+concurrent publication, borrowed-string, and close-gate cases. The actual Java VM will exercise the
+Unicode and null JNI-string path during each enabled lifecycle acceptance launch.
+
+The accepted native artifact was built with the existing Visual Studio RelWithDebInfo configuration
+and installed into Radiance before the complete distributable JAR was assembled. The matching
+`core.pdb` is retained with the machine-local evidence. JNI header generation and native compilation
+must remain sequential. MSVC also reported C1041 when the native target used parallel compiler
+processes against one PDB; the accepted rebuild used one job. This is a build-host constraint, not a
+runtime acceptance result.
+
+### Paired G0 result
+
+Status: passed through the paired isolated Radiance packaged client; G1/G2 pending; G3 deferred.
+Evidence: user gameplay observation, client/integrated-server log, process exit, and native
+lifecycle counters. MCVR is not treated as an independently launchable client.
+
+The loaded runtime DLL matched the packaged RelWithDebInfo DLL SHA-256
+`06707FC39F0679B78C066A89AB89611AB2AA7B34D029D1A9ABE6255E575AB8C9`. Across normal world
+entry, mutation, save/exit, re-entry and final exit, the hook recorded 60,485 attempted and
+successful submits, zero injections, no fatal state, no device-lost state, and one close call. The
+integrated server logged complete save/stop sequences on both exits and the process returned code
+0. The user confirmed persistence of the isolated block/container changes and observed no runtime
+or rendering problem. This is G0 evidence only; it does not close controlled-fatal, real
+device-lost, FG, or general visual acceptance.
+
+### Paired G1 result
+
+Status: passed through the paired isolated Radiance client after one Java lifecycle-boundary repair;
+G2 pending; G3 deferred.
+Evidence: controlled fatal, native counters, integrated-server save logs, Streamline shutdown logs,
+crash reports, and user-confirmed persistence after normal restart.
+
+Both controlled runs preserved first result `-13` and operation
+`lifecycle-acceptance/G1-runtime-fatal`, rejected the post-fatal ordinary probe without entering its
+body, and recorded no later submit attempt or success. The first run exposed that Minecraft's fatal
+process-exit path bypassed its ordinary close method. Radiance added a common fatal-exit close hook;
+no MCVR product change was needed for that finding because native close was already idempotent and
+fatal-aware. The repaired run saved all dimensions, called native close once, completed
+Streamline/NGX shutdown, and preserved the user's new world mutation after restart. This is not
+evidence of real device-loss behavior or recovery.
+
+### Paired G2 result
+
+Status: passed through a separate paired Radiance title-screen process; G3 deferred.
+Evidence: native lifecycle counters plus client diagnostics and the existing 30/30 deterministic
+CTest result.
+
+After the controlled fatal, diagnostic state remained readable, the ordinary JNI probe was rejected
+without entering its body, and first-cause data remained unchanged. Two consecutive native close
+calls completed and advanced the diagnostic count to two; the first released live resources and
+the second was accepted by the idempotent close gate. Submit attempts and successes after injection
+both remained zero. The title-screen scope intentionally makes no save/persistence claim. Real
+device loss and asynchronous Streamline failure remain outside this result.
+
+### Final paired lifecycle candidate and evidence index
+
+Status: candidate complete for local history folding; real device-loss G3 remains unperformed.
+The authoritative paired evidence is retained in Radiance's ignored
+`run/lifecycle-acceptance-20260922/evidence` directory rather than committed as logs or binaries.
+
+G0 and the first G1 run used Radiance JAR SHA-256
+`F01F2BE306B41F88C5FA6209A3FCF65A60D85FD6E8F9A008DC68C8171B724675`; repaired G1 and G2
+used JAR SHA-256 `B8B2287C16509A71A0991BD94C421B38E874ED7898FA5628B109DDDD48389F86`.
+All four runs used native DLL SHA-256
+`06707FC39F0679B78C066A89AB89611AB2AA7B34D029D1A9ABE6255E575AB8C9`. The final source
+snapshot is `evidence/source-snapshot/post-g1-close-fix`; its normalized MCVR product patch SHA-256
+is `7253F8098368158A5A5F52083B8AC9781A19D7368C63A57871CD9ACE5E0AE1AA`. Current product and
+test sources, including the four necessary new headers, match that snapshot. Documentation was
+updated afterward without changing the tested native product.
+
+G0 and initial G1 remain tied to the original JAR, while repaired G1 and G2 establish the final
+candidate's fatal-exit behavior. This does not establish real device-loss behavior, general visual
+acceptance, or public binary redistribution readiness.
+
+## 2026-09-22: paired external-section generation review
+
+Status: native implementation unchanged; static paired-contract check complete; named Radiance
+runtime smoke passed, with longer churn still pending. No native build or CTest result is claimed
+for this follow-up.
+
+Radiance's external-section admission repair retains each encoded native handle unchanged and now
+rejects stale work at the Java owner/revision boundary before publication. The corresponding MCVR
+allocation, release and build paths were rechecked at baseline
+`9ebf73cc57290dbbdc9a6dbdd8f19f5989c45dbd`: handle resolution occurs before CPU preparation and
+generation is checked again before native geometry publication; release invalidates that
+generation. The existing native churn test remains the supporting automated evidence. No MCVR
+product or cross-repository interface change was needed, so unrelated native tests were not rerun.
+
+The full isolated mod set created and separated a Sable structure and completed F3+A without a
+visible hole or failure. That is a bounded smoke result, not exhaustive Sable/Aeronautics runtime
+acceptance: repeated dirty update, unload, handle reuse and world-switch churn must still confirm
+visual convergence and bounded queue, CPU and VRAM behavior with the paired Radiance build. One
+separate repeat process encountered a driver-confirmed `VK_ERROR_DEVICE_LOST` shortly after world
+entry; the prior and following processes using the same JAR completed their named tests, so no
+causal attribution to this scheduling change is made.
+
+## 2026-09-22: thread-closure candidate for UI PT, FG composition and long-run resources
+
+Status: source implementation and automated contracts complete; unified client and visual
+acceptance pending. The worktree remains uncommitted. This entry does not supersede earlier failed
+or partial runtime evidence.
+
+The generic `UiPathTracingProxy` now owns the native UI-scene entry point, with Ponder as its first
+caller. Visible transition scenes publish transformed geometry into one shared `World` and TLAS,
+while each view retains separate camera buffers, temporal history, frame contexts and composite
+images. The PT extent preserves physical viewport aspect but is capped at 1920 pixels on either
+axis and 1920x1080 pixels in area; composition still targets the full physical UI image. Per-frame
+composite images and descriptors are reused, and an unchanged combined geometry hash skips entity
+and BLAS rebuild. Counters expose MCVR-owned UI PT views, geometry builds and composite images;
+they do not cover driver or SDK-private allocations.
+
+Frame generation no longer derives a binary UI mask from final-versus-HUD-less RGB. Tone mapping
+starts final alpha at zero, normal blended UI accumulates Porter-Duff source-over coverage while
+retaining Minecraft's RGB equation, and Streamline receives that fractional alpha. Full-screen
+blur, invert and other background-dependent passes explicitly write full coverage and remain
+final-color effects rather than pretend independent foreground colors. Real DLSS-G visual checks
+for translucent panels, antialiased text, blur, invert and UI PT remain pending.
+
+The texture-name risk was confirmed: IDs grew monotonically against a fixed 4096 descriptor
+capacity. Names 1..4095 now use a checked free-list. Priority and priority-background rays now
+publish matching depth, motion, normal/roughness and albedo guides when they replace final color.
+Flywheel TLAS transforms combine double-precision render origin and local translation with the
+camera before final float conversion, preventing visible transform collapse around 30 million
+blocks. Absolute light-grid lookup remains a separate float-precision boundary.
+
+Static recheck of DLSS SR/RR found camera-relative motion already includes absolute camera delta,
+previous matrices advance only after successful evaluation, and failed evaluation keeps history
+reset pending. Those contracts were retained; visual RR/SR history remains a runtime gate. Veil's
+fixed-version translation retains real bool/uint kinds and explicit failures for unsupported
+forms; this is not a claim that every Veil/OpenGL feature is translated.
+
+The real device-loss incident remains root-cause unknown. Its first recorded client error was
+`vkWaitForFences(frame) = VK_ERROR_DEVICE_LOST`; Windows recorded `nvlddmkm` Event 153, Java kept
+the original error, and the integrated server saved all dimensions. Native close completion was
+not proven. A default-off `MCVR_DEVICE_LOSS_TRACE=1` fixed-capacity trace now records acquire,
+frame-fence, submit, present, chunk/texture upload, reload boundaries and asynchronous Streamline
+device loss, then writes best-effort evidence after loss. It does not inject a fault.
+
+RelWithDebInfo core and shader compilation succeeded. The first complete CTest run exposed a stale
+generated Ponder JNI header and an obsolete source check that rejected writing the priority depth
+guide as though it were reading world occlusion. The generated header was removed, the generic
+implementation file now follows its JNI class name, and the check rejects an actual `imageLoad`.
+Final complete results and package hashes are recorded in the paired Radiance ledger after the
+unified build.
+
+### Final unified build corrections
+
+The paired startup preflight found a real texture-upload retirement defect. When the upload queue
+became empty, `flushQueuedUploadImpl` returned before polling the final submitted fence, so its
+buffers could remain retained indefinitely. Completed buffers are now polled before that return,
+and the reusable staging pool is capped at 64 MiB. A second pass showed that recycling the complete
+peak atlas capacity for tiny animated updates still caused roughly gigabyte-per-second host churn;
+replacement capacity now derives from bytes actually used in the completed batch. The final menu
+run stabilized near 517-524 MiB in MCVR-tracked host allocations, with idle zero-delta intervals and
+only bounded animated-texture batches. Driver and Streamline-private allocations are not included.
+
+Normal shutdown then exposed `slFreeResources` returning `eErrorInvalidParameter` for a DLSS/RR
+viewport which had received options but had never evaluated. The wrapper now records successful
+feature evaluation and frees only resources that Streamline actually created. A rebuilt paired
+client reached the menu, ran steadily and exited with Gradle code 0 without that error, device loss
+or JVM crash.
+
+The final RelWithDebInfo native build passed all 35 CTest cases, including four Vulkan GPU cases,
+JNI coverage and shader compilation. Paired Radiance passed 153 GAME tests and seven bootstrap
+tests (two skipped), runtime/distribution checks, packaging and the menu preflight. These are
+automatic and startup-level results; exact-artifact world, Ponder, FG, reload and long-churn visual
+acceptance remains pending, and the earlier real device loss still lacks a confirmed GPU root cause
+or proof of native close completion.
+
+## 2026-09-22: successor handoff correction before manual acceptance
+
+Status: directed source/provenance check; no native edit, build, test rerun, deployment or Git index
+change. HEAD and the pre-correction tracked diff match the unified manifest. Build, packaged and
+extracted DLL identities match `44F0FCC4517A133B1ED22909EB6D224B4A061173232827860113C541B0F76428`;
+the latest retained CTest log has 35 passes, which are historical execution evidence.
+
+The preceding entry's shared-pipeline/TLAS completion claim is corrected: `PonderSceneRenderer`
+creates a `WorldPipeline` per view; each has its own world-prepare TLAS. A shared `World`/geometry
+cache and reused composites are present, but full-window downscaling and immediate per-scene
+execution do not complete viewport or current-frame transition ownership. FG's full-coverage blur
+also differs from the unchanged HUD-less background; its experience has not been accepted.
+
+The texture pool bounds names, but immediate integer reuse is not a lifetime proof. Submitted
+uploads retain actual images; Java deferred glyph uploads still carry only an ID and can resolve a
+new owner after reuse. Recorded RT descriptors require their own retirement/generation proof.
+Full gameplay handoff is held for these source/contract gaps. Details and gates are in the paired
+[Radiance audit](../../Radiance/docs/audits/2026-09-22-gpt6-pro-code-review-verification.md#2026-09-22-successor-handoff-directed-verification-correction).
+Observed file/artifact hashes are preserved under Radiance's unified evidence directory as
+`HANDOVER-20260922.json`; they do not retroactively attest originally untracked native source bytes.
+No real-device-loss, visual or licensing gate was closed by this check.
+
+## 2026-09-22: recorded texture bindings and shared UI execution remediation
+
+Status: implemented; build-verified; automated-verified; bounded runtime-observed; visual pending.
+Applies to the retained dirty MCVR tree above `9ebf73c`, paired with Radiance above `e1e91a2`.
+Supersedes the preceding directed handoff source gaps, with the contract/runtime limits below.
+
+### Final design
+
+`TextureBindingSnapshots` gives recorded RT commands immutable descriptor/image/sampler ownership;
+texture integer reuse only affects later bindings. Java producer generations in the paired tree
+protect work that has not reached native yet. The pool remains 1..4095 with explicit exhaustion.
+No release introduces routine device-wide idle.
+
+UI PT now collects both scene owners before tracing, builds one common TLAS and uses one actual
+`WorldPipeline` with two view-history slots and six physical descriptor/output contexts. Transient
+dispatch resources are shared serially; temporal images and upscaler histories are independent.
+Current-frame common transforms, owner-selective primary rays and unrestricted secondary rays
+retain transition lighting semantics. Crop projection and output placement use actual UI bounds;
+the 1920-longest-side/1920x1080 budget remains explicit. Geometry/topology comparison reuses BLAS
+for unchanged or material-only content; frame fences retire replaced pipelines and output images.
+
+The client preflight found and repaired a first-batch initialization gap, replay of consumed upload
+queues, three-versus-six SBT indexing and overwritten mapped execution constants. New production
+helpers and Vulkan tests cover those exact paths. FG now resets world alpha at GUI entry, retains
+fractional coverage, mirrors source-only RGB modulation onto HUD-less and shares the real blur
+kernel. Local inversion and nested blur are not mathematically equivalent to ordinary alpha; the
+fixed SDK has no public arbitrary generated-frame GUI replay hook. P2-02 stays partially open.
+
+Asynchronous OUT_OF_DATE/SUBOPTIMAL now requests surface/history recheck without permanently failing
+FG or clearing an earlier fatal. A separate evaluate-result predicate accepts SDK eWarnOutOfVRAM
+only after successful evaluate, preserving output/history and feature retirement; it does not
+reinterpret options/state errors. Budget pressure remains a recorded condition, not a solved limit.
+
+### Evidence and deployment boundary
+
+RelWithDebInfo core/shader install and 41/41 CTest cases passed, including five Vulkan GPU tests.
+The paired Java results are 164 GAME pass and bootstrap 5 pass/2 skip. JNI/export, package and runtime
+checks were run; source scans are supplemental to behavior/GPU tests. Failed/intermediate client
+runs are retained individually. Advanced compilation initially failed on a missing camera-helper
+include, which was fixed; the subsequent Advanced run instead encountered natural device loss.
+Its Java first-error propagation, all-dimension save and native close completed. The GPU cause is
+unknown, and no TDR setting, illegal access or synthetic lost flag was used.
+
+Final DLL SHA-256: `EF6EE40675B257DA7AED26FEF812A1D0D09C196AB85C468264017FAF2C4B07D1`.
+Matching PDB: `584DA1BFD5725A56503F60401D9F94A14BC99FEEEA7E3BCE12EFC0747A0D93FF`.
+Paired Radiance JAR: `FAC591721430B18171A1243BFD31B7F7332D79FC7D0E78C49C8F65A2CCEEBCE5`.
+The ignored Radiance evidence directory `build/manual-acceptance/evidence/20260922-ownership-ui-fg`
+contains `MANIFEST.txt`, `final-sources.json`/ZIP, per-process identity/captures and `ACCEPTANCE.md`.
+These include new/untracked sources and fixed dependency identities; they do not retroactively
+prove the previous package's missing untracked-source fingerprint. Native allocation counts exclude
+SDK/driver-private allocations, and finite stability does not prove unbounded lifetime correctness.
+
+Detailed findings and remaining visual/contract gates are in the paired
+[Radiance audit](../../Radiance/docs/audits/2026-09-22-gpt6-pro-code-review-verification.md#2026-09-22-owner-tickets-shared-ui-pt-and-fg-input-correction).
+Public redistribution, Advanced GPU root cause, full generated-frame experience and sustained churn
+remain open. No staging, commit, amend, push, tag or binary publication occurred.
+
+### Final paired client observation
+
+The final PID 84892 exercised the complete automatic 135-second in-world sequence, including
+two-scene Ponder capture/trace, resize to 3840x2054, close/reopen, client reload, server reload and
+chunk refresh. All dimensions saved and native close completed with 3,983 submissions, fatal=false
+and deviceLost=false; Gradle exited 0 after 3m12s. One heavy executor remained active, transiently up
+to three old/new engines were live, then retirement returned to one. Common batches report one
+TLAS build and both current owners. The 4K Ponder VMA allocation interval was 6,701-6,702 MiB and
+dropped to 6,011 MiB after close, excluding SDK/driver memory. This is bounded runtime evidence,
+not a full-process VRAM/performance improvement claim.
+
+FG inputs now contain actual fractional coverage and equal final/HUD-less RGB on alpha-zero world
+pixels. Four capture requests completed; the last crosshair-labelled request retained pause-style
+coverage, so it does not establish a distinct crosshair scene. SDK interpolation state changed
+with window focus. No generated-display or visual result is claimed. The earlier Advanced loss and
+budget-warning failures remain linked to their own artifacts in the manifest.
+
+
+## 2026-09-22: FG affine replay, weighted blur and Advanced pass parameters
+
+Status: implemented; build-verified; automated-verified; runtime/visual acceptance pending final preflight.
+Evidence: source, native GPU regressions, Java/bootstrap/package checks; client capture results below.
+Applies to: retained dirty paired worktrees above Radiance e1e91a2 / MCVR 9ebf73c; no Git rewrite.
+Supersedes: the previous statement that local inversion necessarily requires opaque UI coverage;
+that argument assumed an unchanged HUD-less background. Historical runs and limitations remain.
+
+### Source changes and direct evidence
+
+- Actual Minecraft 1.21.1 / NeoForge 21.1.250 Gui.renderCrosshair uses
+  ONE_MINUS_DST_COLOR/ONE_MINUS_SRC_COLOR. The source-generated affine transform
+  T(D)=S+(1-2S)D can be applied to both final RGB and HUD-less while preserving UI alpha:
+  U'=(1-2S)U+S*A. The ordinary RGB draw and order are unchanged. The same geometry/shader,
+  viewport and scissor are replayed using a pre-draw depth/stencil copy so writes/tests do not
+  discard the second draw or change main depth. Per-frame scratch is bounded; it costs an
+  additional depth/stencil copy for each affine draw, not a GPU idle or opaque screen mask.
+- GameRenderer renders the HUD before ClientHooks.drawScreen; Screen.renderBlurredBackground
+  calls processBlurEffect. Thus blur after UI is reachable in ordinary pause screens, not just
+  hypothetical third-party nesting. The isolated audit mod also calls the actual route after
+  fractional text/panel and local inverse, before later UI, including over Ponder.
+- For a linear blur L, HUD-less is now L((1-A)*H)/L(1-A), with zero fallback only where
+  transmission is zero. A half-float intermediate preweights texels BEFORE linear sampling.
+  Normal final-color blur still computes L(F), and its alpha is L(A); no ordering or RGB rewrite.
+  Scratch/descriptors are per physical frame; pipeline resources are reused and die with the
+  framework. GPU tests cover varying alpha, moving inputs, opaque UI PT-like regions and edges.
+- First client candidate 4BB7D6DB... / 5D62DD89... exposed negative foreground residuals after
+  blur. Investigation found CPU std::round versus GLSL round disagreement for half-integer
+  radii (5*0.5). Host constants now preserve the fraction and the compute shader uses the same
+  GPU rounding as the fragment reference. A test invokes the production packing helper at
+  radii 2, 2.5 and 1.25. First failure/capture and later artifact remain separate.
+- Directed Advanced audit found per-pass execution buffers repeatedly retargeting a shared
+  UPDATE_AFTER_BIND descriptor before submission. RT and post-render stages now each keep one
+  stable execution-buffer address; existing inline command updates and barriers carry pass
+  values in queue order. A real compute test reads three distinct values through one descriptor
+  and repeats a frame. This defect is confirmed; the natural device-loss cause is NOT proven.
+- The existing default-off fixed 256-entry loss ring records numeric pass fingerprints/frame
+  indices. These are CPU recording breadcrumbs, not GPU-completed checkpoint evidence.
+
+### Evidence and remaining boundaries
+
+Evidence root (non-portable): Radiance/build/manual-acceptance/evidence/20260922-fg-boundaries-advanced.
+See ADVANCED-INVESTIGATION.md, inherited-evidence.json, source manifests, native-build*.log,
+ctest-affected.log, ctest-final-affected.log, java-test-results.json, capture checks and final MANIFEST.
+This run executed 19 selected Java tests, bootstrap 5 passed/2 skipped, and affected native tests
+including actual FG/framebuffer/execution-buffer GPU cases. Old 164/41 counts are historical,
+not claimed as a fresh whole-suite run. Native RelWithDebInfo + INSTALL and paired package gates
+were executed. No cross-repository JNI signature changed.
+
+The Advanced PID 61436 has first-error propagation, all-three-dimension saves and native-close
+return evidence; this corrects any implication that G3 has no real evidence. The failed artifact
+and configuration differ from the later 135-second successful Vanilla run. No complete exact
+preflight9 source snapshot is fabricated. GPU faulting command/address, SDK-private pressure
+and all asynchronous GPU retirement remain unproven. No Advanced stress repeat, TDR change or
+unsafe injection is part of this acceptance.
+
+The fixed Streamline 2.14.1 public contract does not expose a post-generated-frame GUI replay
+callback in this integration. The implemented background transforms modify the tagged scene
+inputs; real-frame algebra and captures do not prove that SDK interpolation keeps a moving
+local inverse perfectly anchored, blur edges artifact-free, or every generated pixel equivalent
+to re-executing the effect on a generated scene. Those dynamic checks remain user acceptance;
+no background freeze, hard edge or experience downgrade is pre-approved. Public binary license
+clearance and unrelated G3/root-cause boundaries remain open. All prior texture ownership,
+shared UI PT, resource-type isolation and section admission work is retained.
+
+
+### Additional capture correction and new Vanilla failure (same work session)
+
+Candidate 84037426... / 3190953E... passed the weighted-blur inputs but its returned-world capture
+had three hotbar pixels with invalid reconstructed foreground (minimum -0.0718). A direct contract
+check found that blend-disabled GUI draws copied RGB without blending while leaving fractional
+fragment alpha in the coverage channel. ShaderTranslator now wraps the actual fragment main and
+uses a native push constant to force opaque coverage for default-target, blend-disabled draws.
+Original RGB/discard/depth testing remain; blended/custom-framebuffer draws set the flag to zero.
+The new ShaderCoverageGpuTest compiles BOTH real vanilla and external translations, executes the
+native Vulkan harness and verifies discard/RGB/alpha over flag transitions 0 -> 1 -> 0. It passed.
+This does not assert that every unsupported third-party fragment layout has an equivalent capture.
+
+Candidate3 JAR 6FB7F409FDA2461057C00296F0CC3576E09AEC555B5B0BE328698912C9E9E1B1 /
+DLL FFD37BD714920E619F9BF8FBD4C72180E82477775BB7716260C697976DF8EE53 passed the
+88-second preflight4 (PID50564, 21:03:03..21:04:31, 2727 successful main submissions).
+All six FG input captures passed foreground bounds at 2/255; zero-alpha world pixels matched
+HUD-less RGB exactly. Ordinary pause, fractional UI -> inverse -> blur -> later UI, Ponder and
+transition were reached. The SDK reported window-not-focused and disabled interpolation; these
+are input-path/runtime observations, NOT generated-display acceptance. All dimensions saved and
+native close completed once. 63 selected GAME tests passed; bootstrap5 passed/2 skipped, and five
+native targeted tests passed before this run. Native GPU cases are not display-frame observations.
+
+The same candidate3 in preflight5 with FG OFF then suffered natural DEVICE_LOST at21:06:02,
+six seconds after world-ready, BEFORE any capture/Ponder/reload/resize. The first error was
+vkQueueSubmit(chunk build)=-4. 123 Event153 entries span21:05:58.669..21:06:02.009, GPUID100.
+All dimensions saved; original chunk-submit cause persisted across native close, completed21:06:03.
+339 main-submit attempts/338 successes include an unwanted subsequent frame submission after fatal.
+The process died before module sampling: its PID/live-module enumeration is unavailable; do not
+reuse preflight4's loaded-module observation as if it belonged to this failed process. Deployed
+candidate3 identity, source snapshot, launch log, crash report, new trace sections and Windows XML
+are retained in the evidence root/preflight5. The old Advanced trace sections remain separately.
+
+The confirmed post-fatal continuation is repaired by runCheckedStage at upload/world-module
+boundaries and a fatal recheck before final/readback submissions. Its behavior regression uses a
+callee that RECORDS an error and returns normally; subsequent callbacks are rejected and first
+cause preserved, without a real GPU loss injection. This is a failure-boundary repair, not the GPU
+root cause. The latter remains unknown; no extra speculative allocator/driver/shader setting fix
+was applied. No further world run is included in this handoff's validated scope.
+
+The final package below supersedes candidate3 after this guard. Its normal rendering shader changes
+are the same, but candidate3's gameplay results are not relabelled as final-artifact runtime results.
+Only separate final build/regression/menu preflight is claimed. Unified manual WORLD acceptance is
+paused by the new natural Vanilla fault; the previous Advanced-only exclusion is insufficient.
+The matrix remains available, with paused portions explicit. No FG visual downgrade is approved.
+
+### Final native artifact and evidence boundary
+
+Final RelWithDebInfo DLL: `A2356F8A1517A051A1502F460E1AB31C01F68B9E1D257F00AD0378E58D51873F`;
+PDB: `5DE50AC3D02F6C45F63261423ECA63FB1EA9B0CDBDC0FF0F0BB0DE9809E03622`.
+Paired Radiance JAR: `432BCDAC53446B92247ABA39E9C977578ADF7547F266064601DD0B479BA02DD6`.
+Native build8/9, including shader compilation and INSTALL, passed. Stage-guard tests passed 7/7
+(framebuffer GPU, JNI, coverage, loss trace, failure state, FG GPU, execution-buffer GPU). After
+the final WorldPrepare/RT/chunk call-site guards, the directly affected failure-state/JNI tests
+passed 2/2. No full native-suite rerun is claimed. Radiance packaging and runtime gates passed;
+its ledger records the 63 selected GAME tests, bootstrap5/2 and separate later GPU-test rerun.
+
+PID88792 loaded the final DLL from the isolated runtime cache; build/install/embedded/extracted
+hashes match. Menu/load/normal-close preflight observed title 21:21:12..21:21:37, 19776 successful
+main submissions, no fatal or lost state, close exactly once and exit0. It did not enter a world.
+Candidate3's six valid captures and its separate natural loss are not counted as this DLL's world
+acceptance. The post-fatal guard is behavior-tested but the underlying GPU cause remains unknown.
+
+Evidence is under the sibling Radiance `build/manual-acceptance/evidence/20260922-fg-boundaries-advanced`
+(non-portable), indexed by `MANIFEST.txt`, `final-sources.json`, `artifact-identity.json` and
+`ACCEPTANCE.md`. Exact tracked/untracked source ZIP plus ignored dependency/input fingerprints are
+retained. Product manifest `5BA1C61BB02F5CAD7A8FF10974575AF9C0CD25792EC155D76C40FB643B5B98EC`
+matches the preflighted stage-guard snapshot; final edits after that are documentation only.
+The fixed-capacity loss tracker stays default-off in product code; isolated launchers explicitly
+enable evidence collection. No unsafe loss injection, TDR modification or speculative driver
+workaround was used. World acceptance is on hold, while final menu-only checks are available.
+Generated-display visuals, complete G3 and public binary authorization remain unclosed. No Git
+mutation or evidence deletion was performed.
+
+## 2026-09-22 first GPU fault: directed repairs and capture boundary
+
+Status: implemented/build-verified/automated-verified for the named repairs;
+GPU root cause investigating, world acceptance paused. Paired Radiance evidence:
+`build/manual-acceptance/evidence/20260922-first-gpu-fault` (local/ignored).
+See its EXPERIMENTS.md and Radiance dated review's directed-investigation correction.
+This entry does not replace older G0/G1/G2 artifacts or any first-failure evidence.
+
+Product changes in this investigation: enable supported Vulkan13 privateData for
+Streamline's observed private-data-slot use; add COLOR_ATTACHMENT_OUTPUT producer
+to three post-color handoff/reuse/finalization barriers via post_color_sync.hpp;
+propagate vkBeginCommandBuffer failure before recording. No blanket barriers,
+per-free GPU idle, feature disable or removal of pipeline-layout keepalive.
+
+Default-off diagnostics now associate command/pass fingerprints, GPU checkpoint
+results, bounded EXT fault data, exact shader-module SPIR-V and a fixed-capacity
+AS create/destroy/instance/build ring. CPU records never imply GPU completion.
+An optional borrowed external-agent ABI permits local Aftermath resource/shader
+capture before device creation and one bounded post-save/pre-release status wait.
+No SDK load/distribution dependency is added to MCVR. The ignored diagnostic agent
+uses the installed signed SDK, serializes capped callback writes, does not enable
+extra shader-error reporting, and never waits for faulted GPU idle. External-agent
+source, CMake inputs, SDK hash, DLL/PDB and actual loaded identities are archived.
+First agent preflight's incorrect literal flags were detected, normally stopped
+and corrected to installed enum constants; product safety mask excluded unwanted
+automatic checkpoints. No preflight failure is relabeled as successful capture.
+
+Native RelWithDebInfo INSTALL and matched Radiance package/bootstrap/runtime gates
+passed per diag1..diag5 logs. Actual selected regressions: diag2 six passed
+(framebuffer GPU, new post-color-sync GPU, JNI coverage, shaders, loss trace,
+failure-state); diag4 three passed; final diag5 five passed(framebuffer GPU,
+post-color-sync GPU, JNI coverage, loss trace, failure-state). No final whole-suite
+rerun is claimed. The production barrier helper is tested by a real color-attachment
+write/readback under synchronization validation. Bounded fault-result truncation,
+64-bit ownership ring wrap and absent-agent behavior have direct tests. The external
+capture wait's fake-clock test covers finished/failed/error/timeout without GPU loss.
+A real JVM agent initialization/unload smoke also passed, separately from client use.
+
+Core validation's privateData VUID04564 and the application LDR handoff hazard
+vanished on actual-device retest. SDK-private nv.ngx.dlssd clear/fill SyncVal hazards
+remain unclassified; no speculative synchronization patch was applied to them.
+Inspected AS ownership, frame-retained builders, build-batch inputs, texture snapshot
+retention and upload retirement did not establish the first fault's cause.
+
+The installed VVL AS-build checker was independently disproven for a legal retire
+sequence: destroying one separate unused AS corrupts its address registry, then it
+rewrites256 live TLAS references. Core and AS-checker-disabled GPU-AV controls each
+pass four unchanged-input rounds. Original app AS warnings and the instrumented E3
+fault are retained with this confounder; no application-UAF conclusion is drawn.
+Selective shader-only GPU-AV ran52s clean but at1-6fps. Actual resolution was2560x1440,
+not the initially planned720p. A requested10s audit source had not reached its JAR;
+the observer stopped it, and the external audit build/deploy was explicitly corrected.
+
+Normal-config E6 PID36856 (diag4) still lost the device around5s after world entry,
+no VVL/trace, Vanilla PT/RR Balanced/FG off/Reflex1/8chunks, before UI PT or actions.
+First error survived; all dimensions saved; native close1 returned;352 submissions
+remained352. This is genuine save/close evidence, not a solved GPU fault. Aftermath
+shader-debug E7b PID71588 (diag5) ran20s with886 submissions and normal close, but
+changed compilation/timing and cannot establish normal stability. Resource-only
+capture and subsequent findings are indexed separately in the evidence manifest.
+
+Diag5 main DLL `D0DDEDB31C65BDAE6E7C160BF04E27614DDF141B785BBC054FA20CDE5CCDC9D5`,
+PDB `D5566E0D2AF71E1FDE0F8531D427A245A51DA1AF2A81BC7BAE0507A94007B091`;
+Radiance JAR `FE6E10F0FE731E919C9B6FDFB548613931626205816C3F5B696EB4CD57D4D455`.
+Raw and normalized tracked/untracked source manifests plus ignored build inputs
+are in diag5/diag5b/diag5c snapshots; only external diagnostic source varies there.
+Product manifest `A15B404E44FAA61DDCB283E8467D880FCCB4B745D46830FD02253D4D6DE3E3F1`.
+This is an investigation package, not restored unified world acceptance. No staging,
+commit, push, production-data access or evidence deletion. Public DLL license gates,
+FG generated-display visuals and complete G3 remain open.
+
+## 2026-09-23 follow-up: diagnostic-device correction and normal world control
+
+Diag6 explicitly queries/enables VkPhysicalDeviceDiagnosticsConfigFeaturesNV when the
+external capture agent requests configuration, and rejects unsupported requested capture.
+The normal/default-off branch is unchanged. This corrects an incompletely specified
+local diagnostic device chain, not the original GPU cause. The earlier NVIDIA example
+alone was insufficient; the Vulkan feature contract is recorded in EXPERIMENTS.md.
+Native INSTALL, selected CTest5/5(post-color GPU, JNI, shaders, loss trace, failure-state)
+and matched bootstrap/package/runtime/Maven-development checks passed after this change.
+
+Final investigation DLL `78AD12E7F816B94564924E20C65E57F3D42D14DCFE2A93233FF1EBA9A6B4B192`,
+PDB `46F68F42CC2490E765E40814B004539DA0F20C8E45DD6A42C162B1E85EB0C93C`,
+JAR `3B735ECF7C8DA943EF3A94235F4C6194AD0180DD759BF55F40A72371FDA2164C`.
+Diag6 product manifest `8815A38FE5D298056838278BAE81B526FD26FAE5F57FE7A1B970337010FB0F4F`;
+source ZIP `CD45EC30E04C04B955B6C11CF76632F7146AE74F30C4821EB667985909608EF7`.
+Complete exact/normalized source manifests retain necessary untracked files and ignored
+build/agent inputs. Later maintained-record edits do not change the product digest.
+Aftermath is absent from the JAR; the local SDK's existing DLL remains outside distribution.
+
+Configured resource-only capture PID36448: world00:02:40..00:03:00,811 successful
+submissions,save/close1,exit0. Normal PID60552:00:04:53..00:05:13,768 successful
+submissions,save/close1,exit0, no capture/validation module loaded. Both actual DLLs match
+build/embedded/extracted bytes. Both process windows have zero System nvlddmkm events.
+No fault dump was generated, so GPU fault mapping and the new real-fault capture wait
+remain unexercised. The normal run exceeds the earlier five-second entry phase but does
+not establish a causal repair or persistent stability. E6's real loss remains valid.
+
+World acceptance remains held pending a useful unvalidated first-fault capture/invariant
+and a corresponding repair or adequately scoped explanation. The prepared next capture,
+exact missing evidence and SDK-isolation follow-up are in EXPERIMENTS.md/ACCEPTANCE.md;
+no repeated blind crash loop or SDK-disable product workaround was introduced. All inherited
+fixes and public-binary/FG/G3 gates remain. No staging, commit, push or evidence deletion.
+
+Successive isolated runs used matching settings but an evolving Minecraft/Sable save;
+there is no claim of byte-identical world-state A/B. The stopped post-E11 save is archived
+once in Radiance evidence for future cloned-state controls. It cannot recover pre-E6 state
+or establish/exclude a Sable cause. Do not omit this confounder when interpreting timing.
+
+
+## 2026-09-23: Bounded local closeout and acceptance checkpoint
+
+Status: implemented; build-verified; automated-verified; natural device loss still observed.
+Evidence: static, build, automated, seven GPU fixtures and one failed client with save/close evidence.
+Applies to cumulative candidates over `9ebf73cc57290dbbdc9a6dbdd8f19f5989c45dbd` (122 paths).
+Supersedes the previous requirement to establish first GPU cause before local source checkpointing;
+historical runtime results and failures are unchanged. See Radiance's dated review closeout for
+the canonical paired thirteen-item and expanded-scope table.
+
+`render/upload_retirement.hpp` now controls the production texture retirement loop. Failed polls
+stop the caller immediately while failed/unpolled batches remain owned; upload-submit failure
+propagates immediately too. Previously recording failure could return to additional upload work
+before an outer stage guard. `vulkan/command_result.hpp` checks begin/end/reset, preserving the
+first error and preventing chained recording/submission after a failed prerequisite. End/reset
+previously ignored VkResult. These are confirmed post-error defects, not an established GPU cause.
+
+`pending_uploads_test` calls the actual retirement helper with success/not-ready/lost batches and
+checks ownership, poll/recycle counts and rejected second calls. `failure_state_contract_test`
+injects all three command-operation failures and tests no continuation, original cause and sticky
+rejection. No real GPU fault is fabricated; test reset applies only to fake operations. Final
+RelWithDebInfo INSTALL/shaders passed; CTest 43/43 passed including seven GPU cases. Java165 and
+bootstrap5/2-skipped plus package/runtime/Maven-purpose checks passed in the paired repository.
+Source-scan contracts are supplementary, not exhaustive behavioral proof. No additional idle,
+unconditional barrier, resource keepalive or disabled-feature workaround was introduced.
+
+Final DLL `9DC8A04445541A5FB72E84F4D48E3ABFA95456DB122AED46C4DDABEC18B56C99`, PDB
+`6FE66854C3EBB1C9DAE3B43321456F304A9399A91DF560BBB6A9B88093DE6916`, JAR
+`CBDEBEB8EB8011831F04C06920D54531D8092CFAC45E507903C9073DB94D5451`. Build/embedded/extracted/PID30596 loaded DLL hashes agree.
+Non-portable evidence is in paired Radiance's
+`build/manual-acceptance/evidence/20260923-local-closeout`: product/final source manifests,
+exact source archive, dependency/runtime/shader hashes, build/test logs, matched symbols and
+`normal-closeout-*` process/events/crash evidence. Product archive SHA-256
+`5CD7294FBCB98142F77598AF1B065246ACF84298824948008F76F66E46C2CE88`, normalized product
+`07744F338FF6289BA044224C761D0E3CB32F3B852DAC6FA19CDB7AB5E193CC6F`. Records-only changes do not require a rebuild.
+
+The final normal client reached the world at00:38:54 and naturally lost the device near00:39:06
++0800 on2026-09-23, before the20s target. Vanilla PT/RR Balanced/FGoff/Reflex1/8chunks/2560x1440,
+driver616.92, no VVL/Aftermath/host trace/Ponder/reload/resize. First detection was frame-fence -4;
+Event153 at00:39:04/06 does not identify the causal command. All dimensions saved; before/after
+close submissions stayed242/242, closeCalls1, first cause retained; exit1. No retry followed.
+No async vendor completion, normal-lifecycle pass, full G3 or long stability is inferred.
+
+Unknown first cause no longer blocks the user's normal manual acceptance or local amend. The
+failed case remains paused, with no repeated pressure path requested. Current generated-frame
+visuals, shared-view memory/transition churn and gameplay results remain pending. Default-off
+external diagnostics, pipeline-layout workaround boundaries and public binary license gate remain.
+No new rendering feature, remote update, tag or binary release is part of this checkpoint.
+
+## 2026-09-23: Frozen-package manual feedback and source synchronization scope
+
+Status: runtime-observed; user accepted the limited simple-play observation; specialist acceptance
+remains incomplete. Evidence: user feedback, archived client/module/lifecycle logs and process exit.
+Applies to the native product in frozen checkpoint `2f62a34e768a07c6dd4fd9e024f4bd7a2148ca35`;
+this follow-up changes documentation only. The paired Radiance dated review owns the session index.
+
+The user reported no obvious problem during simple play and ended this observation round. Isolated
+manual PID73024 (2026-09-23 01:24:03-01:27:04 +0800) used the preceding entry's exact JAR/DLL.
+Its loaded core hash was `9DC8A04445541A5FB72E84F4D48E3ABFA95456DB122AED46C4DDABEC18B56C99`.
+New World and Test were two different short world sessions (approximately 10 and 36 seconds).
+Each completed all-dimension saves; final native close returned once, submissions remained
+15175/15175 across close, fatal=false/deviceLost=false, and process exit was 0. This does not
+verify reopening the same save or persistence of particular block/container edits.
+
+Vanilla PT/RR Balanced/model6/Reflex1/FGoff, jitter and SHARC on, view8/simulation32, no resource
+pack. Output changed from2560x1440 to3840x2054 during the user session; this is not a pressure-test
+pass. No Ponder or generated-FG visual acceptance is inferred. Host loss trace/Aftermath were off.
+Evidence is retained in the paired checkout's non-portable
+`build/manual-acceptance/evidence/20260923-local-closeout/manual-20260923-012403-334`.
+
+Keep separate: automatic PID30596 lost this same device/package after about12s in-world; manual
+PID92452 failed Java initialization before any native submission when early resize/texture release
+requested the not-yet-initialized TextureManager. The latter closed native once with no device-loss
+state, exit-1. Neither failure is erased by PID73024. First GPU cause, full G3/vendor asynchronous
+cleanup, long stability, specialized runtime/visual cases and public binary permission remain open.
+
+No source behavior, artifact, settings or test result changed in this record-only follow-up. No
+build/GPU/client test was rerun. Source synchronization is authorized independently of those open
+gates; it grants no tag, Release or binary distribution authorization.
+
+## 2026-09-23: Native face rules and bounded priority chunk batches
+
+Status: implemented; automated-verified and GPU-verified for the named fixtures; client/performance
+acceptance pending. Evidence: static, build, automated, GPU. Applies to the uncommitted worktree
+based on `8208f305a71d0ffa56e761cd7b62c1b667572cb4`, paired with Radiance's uncommitted worktree.
+
+The [paired ledger](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-23-per-draw-face-rules-and-interaction-aware-chunk-scheduling)
+owns the product contract, reference snapshots and comparison protocol. Native material_faces.hpp
+and util/material_faces.glsl now share per-geometry FRONT/BACK/CW handling, with uniform hardware
+fast paths and a determinant correction for mirrored instances. Entity/chunk/Flywheel/UI PT geometry
+carries face flags through AS construction and InstanceAppearance. Both bundled ray pipelines,
+including shadow and specialized groups, consume them. No primary-camera geometry removal or
+blanket non-opaque policy was introduced. CW bit22 avoids the intermediate bit15 collision with
+Flywheel depth ALWAYS; the initial A snapshot/artifact is retained as a superseded candidate.
+
+ChunkBuildTask priority is separate from ordered/immediate publication. Interaction does not wait
+for a full batch; background has a 25 ms admission wait and 250 ms aging. Aged background admission receives
+one in four slots while interaction is pending; the ordinal survives batch/byte-budget boundaries.
+The intermediate rule placing all old work before interaction was corrected and regression-tested
+with a thousand old requests and continuous input into one-section batches. Production top-K selection uses
+bounded candidate storage. Per-poll CPU/input budgets and aggregate 32 MiB in-flight input plus the
+existing fence count bound submission; oversized sections run alone. This does not account for
+all AS/SDK/driver memory. Stale input is rejected before packing and again under ownership lock;
+existing slot generations, completion gates and resource retirement remain necessary.
+
+Default-off chunk_trace.hpp holds 16384 bounded events and preserves revision/build/TLAS/frame
+relationships. Clock brackets support cross-JNI correlation; CPU fence observation is not a GPU
+execution timestamp or visual acceptance. No driver reset, unsafe loss injection or global GPU idle
+is used by this change. The external audit mod provides opt-in client scenarios.
+
+`Radiance/build/manual-acceptance/evidence/20260923-faces-chunks/ctest-final.log` records 48/48 passed,
+including 40 Vulkan rays from the material-face fixture, production selection/admission policy,
+trace on/off/overflow/concurrency, and existing lifecycle/handle/texture tests. Old supplemental
+source assertions for gl_RayFlagsNoneEXT and189 JNI entries were corrected; exported JNI bodies
+and the independent declaration/export comparison remain checked. Builds use RelWithDebInfo.
+Final package/reference identities are indexed by the paired evidence `deployment.json`, source
+ZIP/JSONs and native dependency manifest. Build, embedded and installed JAR hashes match; actual
+loaded DLL and world comparison remain pending. Other-client
+GPU use is a pending comparison condition explicitly retained by the user. No measured FPS,
+latency or total-VRAM improvement is claimed. Existing first-device-loss cause, broader visuals
+and public NVIDIA redistribution permission remain open. No Git history or public artifact changed.
+
+Final B core SHA-256: `CFB6294C5F28FBFC058297B3F8F08151457663A29C0DCC62F1EB4EBE829B6A7F`; paired JAR
+`C94D647DE56AC0CF806CFB348411AC52034DA66AA74703D7C19AA315F4B878B1`. RelWithDebInfo build/shader/packaging
+logs and matching PDB are retained. Trace-only corrections record first presence at an unchanged
+revision and submitted batch payload bytes. These are neither GPU execution timestamps nor total
+process VRAM. The standalone GPU fixture uses device-reported scratch alignment and bounded memory
+type lookup. No new client run or performance gain is inferred from these automatic checks.
+
+## 2026-09-23: Paired Java startup correction
+
+Status: native unchanged; paired bootstrap correction build/automated-verified.
+Radiance PID46548 failed before the menu due to broad SERVICE transformation targets
+resolving optional Veil/Sodium types. Loaded core was CFB6294C5F28FBFC058297B3F8F08151457663A29C0DCC62F1EB4EBE829B6A7F;
+there is no new device-loss evidence. Radiance narrowed targets to actual GL calls and
+rebuilt its JAR as 1CB6A559DC800C9B61C73542901B535EB9EB46EE6BA8C6A901E16E42D8221E60. Embedded native/shader entries were
+compared to the prior package and are byte-identical; native tests were not rerun.
+Paired source/deployment and retained failure logs are in
+`Radiance/build/manual-acceptance/evidence/20260923-faces-chunks`. Runtime/visual and
+performance acceptance remain pending; no Git history or binary release changed.
+
+## 2026-09-23: Paired manual feedback, native unchanged
+
+Status: observed face/chunk/Sable cases visually-accepted; six visual reports investigating.
+PID68896 loaded core CFB6294C5F28FBFC058297B3F8F08151457663A29C0DCC62F1EB4EBE829B6A7F
+with corrected Radiance JAR1CB6A559DC800C9B61C73542901B535EB9EB46EE6BA8C6A901E16E42D8221E60.
+Ponder flat-colored transitions, water reflections and crop edges; ground-facing glow
+lichen emission/UV; Sable particle light; and missing F3+G fine/red line geometry remain
+reported failures. Native UI logs show1pixel viewports, executor replacement and a DLSS-D
+maximum-viewport warning; none alone proves the flat-color cause. No product changed.
+
+The paired Radiance manual-feedback ledger owns detailed observations and local evidence
+under20260923-faces-chunks/runs/manual-20260923-221257-300. The client and observer vanished
+after22:34:14 without exit/native-close evidence. No close command was issued or new GPU
+loss established. Last dimension/sublevel save22:33:36 is partial persistence evidence,
+not a normal-shutdown pass. No automatic restart or performance improvement claim.
+
+## 2026-09-23: Ponder history retirement, coverage and continuation visibility
+
+Status: implemented; build-verified; automated-verified; visual acceptance pending.
+Evidence: PID68896 viewport exhaustion/crop logs, native behavior tests and actual GPU fixtures.
+The current face/chunk worktree retains both transition worlds. On rare executor capacity or
+parent changes, UI PT waits submitted frame fences before closing old SDK histories; an
+unsubmitted same-frame recording is explicitly rejected. Cached geometry transfers to the new
+executor. No per-frame global idle, screenshot fallback or layout-keepalive removal was added.
+Ponder coverage classifies depth before filtering and removes input jitter before compositing.
+Both PT primary loops limit view-owner filtering to the first camera segment; continuation rays
+can hit the other transition world. These are confirmed defects, not proof of all water/flat-color
+symptoms or the prior GPU-loss cause. Existing explicit captures now include both views and can
+capture main-world material guides, bounded to8 evaluations and disabled without request files.
+
+RelWithDebInfo INSTALL and shaders passed; CTest50/50 includes the production coverage shader,
+UI-owner helper GPU cases and safe history-retirement behavior. Paired GAME177, bootstrap8/2skip,
+complete JAR/runtime/Maven artifact gates passed. Retained evidence and PDB:
+`Radiance/build/manual-acceptance/evidence/20260923-faces-chunks/artifacts/visual-feedback/B`.
+JAR F155373DDBF3E69589386D25862C5B67646C820E63BC13B345FCE85C431CAC22; core DEFA112156C982207A1C9600FEEFE2E63818682F22866EF3C577C6FEEE30559A.
+Snapshot `B-visual-feedback-source.zip/json` includes necessary untracked files. UI appearance,
+rare-resize stall cost and long runtime remain pending; no Git operations/public binary release.
+Radiance also corrects particle ambient sampling and moving content viewport; its ledger owns
+the six-report status, including the Sable F3+G explanation and unresolved ground lichen.
+
+Startup observation for the visual-feedback package: PID92456, supervised independently by
+PID74100, completed pipeline warmup/resource loading and resumed responsive2560x1440
+presentation by23:14:17 local. Actual extracted/loaded core matched
+DEFA112156C982207A1C9600FEEFE2E63818682F22866EF3C577C6FEEE30559A.
+Run `manual-20260923-231305-345/startup-identity.json` records this startup-only evidence;
+world, Ponder and particle visuals remain unaccepted. Existing unsupported Veil shader/layout
+messages are not new fatal evidence or proof those optional features work. No client was stopped.
+
+## 2026-09-23: Ponder PT archived by the paired Java entry
+
+Status: native product unchanged in this sub-batch; Ponder PT archived, paired raster implementation
+build/automated-verified. The user superseded the mutual PT transition requirement with default
+Ponder rendering. Radiance unregistered both PT hooks and retained native service, resource guards,
+shaders and tests as dormant implementation. No layout-lifetime workaround or world face/shader
+protection was removed. The [Radiance archive](../../Radiance/docs/history/ponder-pt-2026-09-23.md)
+and its development ledger own the activation inventory and remaining visual boundaries.
+
+Create configuration failed in PID92456 at contextless GL11.glDisable(STENCIL_TEST), not a proven
+GPU device loss. Radiance now routes supported raw capability toggles through existing Vulkan
+state APIs and preserves default block/fluid shading in Catnip raster previews. No JNI ABI or
+native product edit was necessary. GAME180 / bootstrap8 pass2skip and packaging passed; previous
+CTest50/50 was not rerun for this Java-only change. First two real preflights completed original
+Ponder/config rendering, forward/back, all-dimension saves and native close, exit0; their JAR was
+323E72F94DED4465BDE274484E14788A28FF3CA2819CF6E43D56D3A641D208A3.
+Final JAR is9B13C9E8CFAED8F861F4526DB84B902DC20AC595AE1DCF68C262547FF25146F4, same core
+DEFA112156C982207A1C9600FEEFE2E63818682F22866EF3C577C6FEEE30559A and retained matching PDB.
+Evidence/snapshots are under Radiance's `20260923-faces-chunks` root; final runtime outcome is
+recorded there and in the paired ledger. Lichen missing pixels and intermittent raster widget
+icons remain unconfirmed causes; Ponder PT crop/reflection failures are archived, not repaired.
+Sable particle/debug/structure observations are user-accepted in their stated earlier package.
+No staged changes, commits, deployment to production or public binary distribution.
+
+Final pair PID38908 (`raster-20260923-235016-497`) completed the same47-second real-world/config/
+Ponder forward-back smoke using final9B13C9E8 JAR and DEFA1121 DLL. All dimensions/sublevels saved,
+native close completed once with fatal/deviceLost=false, exit0. Captured icons rendered in this
+run; agent observation does not close user visual or long-stability acceptance.
+
+Manual deployment/startup observation: the final pair is deployed to the preserved `manual-2`
+isolated world/settings. Independent supervisor63652 launched PID46312 at23:55:37;
+resource loading completed by23:56:02 and the responsive window loaded the exact DEFA1121 core.
+`manual-20260923-235537-286/startup-identity.json` fixes package/path evidence. Automatic Catnip
+smoke and stop are explicitly disabled for this user run. User interaction/visual results remain
+pending. This appended startup record is documentation-only after the final product snapshot.
+
+## 2026-09-24: Ponder retirement versus independent native fixes
+
+Status: investigating; no native source/build/deployment change.
+Evidence: static inspection of the dirty `8208f30` tree, historical `b0173ab` differences and
+existing test implementations; no newly executed GPU or performance test.
+Supersedes: no historical validation fact.
+
+The paired [raster/Ponder assessment](../../Radiance/docs/research/RASTER_PARITY_AND_PONDER_RETIREMENT.md)
+documents the exact inspection fingerprint and proposed disposition. Ordinary submissions still
+include `uiPtCommandBuffer`; cross-view image aliasing does not reduce main-world allocations
+with one view. Scene overrides, per-view histories and UI-owner predicates are Ponder/UI-only
+specializations to isolate, not demonstrated main-world optimizations. Texture snapshot ownership,
+producer generations, last-upload retirement, bounded staging reuse, stable pass-parameter
+descriptors, synchronization/fatal guards and layout keepalive retain independent contracts.
+
+Do not revert shared files wholesale or count correctness repairs as measured speedups. The
+proposed GL/Vulkan comparison must exercise production translation with matched inputs and keep
+main-world PT/FG output differences separate. Current client and artifacts remain unchanged;
+runtime equivalence, cleanup implementation and measured effects remain unverified by this entry.
+
+## 2026-09-24: Lazy archived UI commands and Simulated material/diagram contracts
+
+Status: implemented, build/automated-verified, bounded client observations; user visuals pending.
+This implements part of the preceding authorized retirement recommendation. Ponder PT stays
+archived. No wholesale shared-renderer rollback or new main-world performance claim is made.
+
+`DeferredFrameCommands` separates retained command storage from active recording. Main frames
+allocate/begin/end/submit no UI PT buffer unless the archived UI executor requests it. Its recording
+still precedes overlays; fence retirement, split readback and failed begin behavior are retained.
+The behavioral test covers 500 unused frames, shared storage, one begin per frame and begin failure.
+
+`diagram_math.glsl` restores the original eight-level interpolated fade output rather than a binary
+dither decision, exact UNORM8 Bayer thresholds and bottom-up logical UI coordinates. Directional
+depth-outline sampling uses the corresponding Y direction. Physical-resolution diagram rendering
+remains intentional. `surface_overlay.glsl` unifies stress and hurt as surface-albedo recoloring,
+without converting stress to opacity/emission. Both PT packs have a lock priority hit group;
+`priority_coverage.glsl` applies the original 0.1 cutout to ordinary lock surfaces in both any-hit
+and closest-hit, while retaining fractional text alpha. The first threshold-only implementation
+was corrected before final delivery because it incorrectly retained fractional lock edges.
+
+Evidence in sibling Radiance `build/manual-acceptance/evidence/20260924-raster-simulated/`:
+RelWithDebInfo INSTALL/affected test build; `ctest-priority-final.log` selected 14/14 passed;
+GPU sweep of 263,168 diagram/stress/hurt/priority samples including exact cutout equality and
+fractional text; ten affected Vanilla/Advanced hit shaders compiled using preset defaults.
+This is bounded behavior/compilation evidence, not all-mode runtime or visual acceptance.
+
+Final native SHA-256 `D9257915FBAA5E69F7C36746173BC95E9D78F9FF4E633137C29673A7C34828A0`,
+matching PDB and complete source snapshot are retained there. The final build relinked dependency
+outputs; do not use the earlier D34B76C8 native identity for it. The paired Radiance ledger owns
+JAR/deployment/client outcome indexing and original Simulated producer semantics. Temporary probe
+errors and the initial Java Mixin loading failure are retained there, not classified as native
+GPU failures. Existing pipeline-layout workaround evidence and historical device-loss/permission
+boundaries are unchanged. No staging, commit, push or public binary release occurred.
+
+Final paired client evidence: Radiance `20260924-raster-simulated/RESULTS.json`, PID3896, roughly
+79 seconds in-world with raster diagram/Create/Ponder and captured staff geometry. The final DLL
+was actually loaded; all dimensions saved, native close completed with no fatal/lost state, and
+exit was 0. This is bounded runtime evidence, not Advanced, stress-spring, mirror or user visual
+acceptance. `MANIFEST.txt` and `ACCEPTANCE.md` index the final isolated manual entry and limitations.
+
+Paired packaging update, 2026-09-24: Radiance/audit moved to NeoForge 21.1.251 and added outer
+launcher display metadata. MCVR source, shader payload and D9257915 native artifact were reused
+without a native rebuild. Radiance's corresponding ledger/evidence entry records isolated menu
+PID3528 and the replacement JAR `39F76BC4...`; no native-suite rerun or new world/GPU acceptance
+is implied by this Java/packaging maintenance.
+## 2026-09-24: Source checkpoint before standalone replay work
+
+Status: source/evidence reconciliation; no new renderer change or runtime acceptance.
+Evidence: static, artifact hashes and existing named build/automated/runtime records.
+
+The user authorized folding the accumulated face-state, chunk scheduling, archived UI PT,
+diagram/material/priority and deferred-command changes into the single signed `Initial port`.
+All native candidate files, including necessary new headers, shaders and tests, match the exact
+bytes in Radiance `20260924-neoforge-metadata/final-source.json`; its native payload remains
+`D9257915FBAA5E69F7C36746173BC95E9D78F9FF4E633137C29673A7C34828A0`.
+The preceding native build, selected 14-test result, shader checks and bounded runtime evidence
+are reused with their original dates and scopes, not reported as rerun for this Git operation.
+
+Original parent, author/committer identities, dates/time zones and message are retained, with a
+new SSH signature. Source reconciliation and recoverable pre-rewrite bundles are recorded under
+`D:\Workspaces\Artifacts\RadianceCommitMaintenance\20260924-amend-push` (non-portable).
+Radiance records the resulting native SHA in one direction. No binary publication is authorized.
+Outstanding visual, quantitative performance, GPU-causation and licensing limits remain open.
+Standalone same-scene replay is subsequent work, not an existing capability proven by this checkpoint.
+
+## 2026-09-24: First static scene capture and standalone MCVR replay
+
+Status: implemented, selected automatic checks passed, bounded capture/replay demonstrated.
+Evidence: source, builds, behavior tests, GPU readback and native window inspection.
+Applies to: worktree after `4778983778d53084132ce84ed0e567579ed6ed7b`.
+Remaining acceptance: representative high-distance scene and controlled performance comparison.
+
+The local-only scene replay tool (subsequently [retired](#2026-09-24-one-shot-scene-replay-retirement)) captures actual main-world
+TLAS/BLAS inputs, material/appearance data, textures, uniforms, options and the pipeline graph.
+Its native executable rebuilds geometry and invokes the normal rendering modules without a JVM.
+Address registration/build metadata are opt-in from process startup; readbacks retain owners
+until the actual frame fence, and an event prevents publishing an unexecuted snapshot. An expired
+address key initially hid a larger live allocation; the corrected live-range resolver and behavior
+test preserve source ownership without globally pinning buffers. Earlier rejected captures remain
+evidence. The legacy Exposure slot was excluded after confirming it has no consumer; real tone
+mapping/history resources warm up independently in replay.
+
+RelWithDebInfo core/tool/test builds passed. Final selected CTest was 8/8, including actual
+`material-faces-gpu`; the new contract test executes address remapping, stale-key resolution,
+bounds/overflow and capture-budget checks. Not a full CTest or Java-suite rerun. A transient test
+compile failure lacked `<string>`; it was corrected and the new executable was rebuilt before
+the final passing run. Full Radiance distributed JAR and runtime/package verification passed.
+
+Evidence root (non-portable): `D:\Workspaces\Artifacts\MCVRSceneReplay\20260924`.
+`iteration-3`: 972 instances/unique BLAS, 1,107 geometry slots, 396 buffers, 176 textures,
+332,214,176 bytes including same-frame reference output; capture client PID83828 saved all
+dimensions and closed native with `fatal=false`, exit0. Captured core `BEB74D66646A063CB9DC7F66D87877BE23D2FBC3C597EB145C35DC5FCB5FD4CD`.
+The first standalone attempt safely returned NOT_READY from menu-specific warmup; standalone
+setup now recreates the graph before acquiring a frame. `replay-loader-2`, PID82060, loaded core
+`681AE67F1D50AA2F9AC8E5B5C73EC9749EE567936800AE8178A30D9110D18D34`, no jvm.dll, rendered
+4,497 frames in40.0034 seconds and exited0. Geometry/hand/priority icon corresponded to the
+reference during agent inspection. Snapshot ABI stayed unchanged between these generations.
+
+CSV separates completed GPU timestamps from CPU intervals and records focus. Excluding first600
+frames, observed CPU p50/p95/p99 were8.471/10.315/11.283ms; GPU8.351/10.132/10.787ms. Focus varied;
+these are functional-run data, not a Minecraft speedup claim. UI/ticks/physics/streaming are absent,
+textures and geometry are frozen, temporal histories differ, and capture overhead is excluded from
+any future comparison. FG, packed emission tables and post-raster world batches are rejected.
+512MiB readback limit remains explicit; high-distance capacity is not yet demonstrated.
+
+`iteration-4` holds final source/artifact identity and the full paired JAR. The user requested a
+normal repository client for selecting a pressure scene; it has no automatic capture/exit, while
+device-loss logging remains enabled and Aftermath remains off. No pressure loop, production/Prism
+operation, new commit/push or binary publication was performed for replay work. Existing fault
+causation, visual and licensing boundaries remain unchanged.
+
+## 2026-09-24: Bounded pressure capture and Streamline replay lifecycle correction
+
+Status: implemented; build-verified; automated-verified (named contract); runtime-observed.
+Evidence: source, RelWithDebInfo builds, behavior test, GPU readbacks and process/module logs.
+Applies to: dirty replay work after `4778983778d53084132ce84ed0e567579ed6ed7b`.
+Supersedes: the preceding native RR comparison and 512 MiB-only capacity statements.
+Remaining acceptance: fixed-condition performance comparison and user visual inspection.
+
+The user's 32-distance capture exceeded512MiB and was safely rejected. The diagnostic buffer
+registry also scanned every entry on every allocation above8192 entries, slowing the client;
+pruning now occurs once per4096 registrations and registration ends after the one request resolves
+owners. Tests cover100,000 registrations, capture-budget parsing/bounds, overflow, address relocation
+and stale weak owners. Larger captures require explicit64..8192MiB authorization. Before issuing
+copies, preflight counts buffer/texture/reference bytes and checks disk and one quarter of free
+physical RAM on Windows. Readbacks require non-device-local HOST_VISIBLE memory; VMA invalidation
+is checked. Source owners remain fence-retained and an event still gates snapshot publication.
+Ordinary renderer allocation policy and disabled-capture behavior are unchanged.
+
+The standalone loader uploads in64MiB batches and builds64BLAS per batch, retaining staging,
+scratch and command/fence owners until actual completion. A failed preparation retains owners
+for normal close/error handling. Static JSON/instance/address parsing runs once before timing.
+The normal per-frame world preparation, TLAS, PT, RR and post-processing remain active.
+
+History inspection found a separate integration defect: standalone omitted the SDK beginFrame
+and Reflex/PCL entry normally supplied by Java. First-frame geometry looked correct, then RR
+became overbright or black. Added the real SDK frame entry/markers and nonrepeating-token check;
+CSV now records tokens. Optional history captures at frames1/32/256 are off unless explicitly
+enabled and disturb timing. This finding invalidates earlier `replay-loader-2` and
+`replay-pressure-1`/`replay-pressure-history` full-RR timing/visual equivalence; their normal exit,
+absence of JVM and reconstructed geometry remain historical evidence. No Minecraft RR defect
+or first-device-loss cause is established by this launcher correction.
+
+Non-portable evidence: `D:\Workspaces\Artifacts\MCVRSceneReplay\20260924`.
+`iteration-5/snapshot-1`:13,038 instances/unique BLAS,12,501,568 triangles,5,988 buffers,272 textures,
+2,913,864,624 readback bytes under explicit4GiB budget. Capture PID41104 saved all dimensions,
+retired the capture during normal close, native fatal=false/deviceLost=false and process exit0.
+Capture core `CDE37551C50E95F654FC79C966F2DCA54038696254D20274DEB281BD5B029F4A`; paired
+Radiance ledger records the JAR and unchanged saved world/camera. ABI-compatible corrected
+replay core `56CF0A565481FB074EB207B978EA7A93E15F4653AC9071F79E4F12D7C3E10F10`, PDB and
+source ZIP/manifest are in `replay-pressure-2`; source-manifest SHA-256
+`E260784F7C0C0182AE4B8161273BD4D63D687B95559C1B518A52096D93A5BB60` includes necessary new
+files with raw/LF hashes. Documentation appended later does not alter those product inputs.
+
+Corrected PID51796 rendered40.007seconds/2,783frames with2,783 unique SDK tokens, no JVM, exit0.
+2560x1440, VanillaPT/RR balanced1485x835/presetF,4bounces,SHARC+jitter,Reflex1,FGoff/vsyncoff;
+RTX4080SUPER/616.92. Reference/history/final color agreement is agent inspection (RGB MAE2.856/255),
+not user visual acceptance. Excluding first10seconds, real CPU intervals p50/p95/p99 were
+12.791/20.739/27.058ms, GPU12.368/13.247/14.003ms; only149/2,139 measured frames were focused.
+Minecraft still loaded the region and native freezes that captured state, so its86.817ms
+pre-capture median cannot establish a controlled speedup. The full-card13,945/13,029MiB peaks
+include non-MCVR memory; VMA also contains host allocations and omits SDK allocations.
+
+This round ran core/tool/test builds and scene-replay CTest1/1 after preparation/contract edits;
+the later SDK-entry build and corrected real replay add bounded integration evidence. Radiance
+distributed/runtime checks and external audit build also passed. Historical8/8 native and other
+Java results were not rerun or promoted to this snapshot. Full logs, rejected attempts, separate
+source/artifact identities and original saves remain. No staging, commit, push or publication;
+first GPU fault, broader runtime/visual acceptance and third-party permission remain open.
+
+## 2026-09-24: Free camera for standalone scene inspection
+
+Status: implemented; build-verified; automated-verified; runtime-observed for scripted movement.
+Evidence: camera/transform behavior test and a bounded native GPU run; manual input feel pending.
+Applies to: standalone replay work after `4778983778d53084132ce84ed0e567579ed6ed7b`.
+Supersedes: fixed-camera-only limitation for interactive (seconds=0) runs; timed defaults unchanged.
+
+The user requested movement and turning within the captured scene. Added `scene_replay_camera.hpp`
+and GLFW input in the standalone loop: hold RMB to look, WASD to fly, Space/C vertical, Shift/Ctrl
+fast/slow, R to return, Escape to exit. Loss of focus releases capture and suppresses movement.
+Camera rotation uses a quaternion, including the pressure snapshot's straight-down initial view.
+Position remains double precision. Captured camera effects remain relative to the view matrix.
+The renderer receives rebased current TLAS transforms and last-rendered camera-relative instance
+history; geometry/BLAS remains immutable. History matrices are indexed by instanceCustomIndex,
+matching the shader consumer, rather than relying on TLAS array order. Each frame logs camera
+position/orientation. R alone uses the existing GPU-idle history-reset boundary (including SHARC
+and RR); ordinary movement has no added idle or pipeline rebuild.
+
+RelWithDebInfo core/replay/test builds passed with existing Options narrowing warnings. Selected
+CTest `mcvr.scene-replay-contract` passed1/1, including diagonal speed, view-relative movement,
+large world origins, current/previous geometry rebasing, exact restore, vertical orientation and
+stall-step bounds. No full native or Java suite rerun was needed for this standalone-only addition.
+The explicit, default-off camera smoke entry exercised the same camera update/transform path for
+20.0084seconds/1,595frames, PID53140, no JVM, exit0. It rotated, moved39.905blocks, reset once and
+returned exactly to captured camera (0.5,513.6199998855591,0.5). This is the eye position; saved
+player feet were at Y512. Moved-image RGB MAE61.255/255; restored-image MAE2.218/255 versus the
+pre-move image. Agent image inspection agrees with those changes. These are not perceptual quality,
+interactive mouse-focus acceptance, benchmark improvement or long-term stability claims.
+
+Non-portable evidence/deployment:
+`D:\Workspaces\Artifacts\MCVRSceneReplay\20260924\replay-free-camera`.
+Core `E06B2AD5A6C76528EC5E59DFF4622E6F45D5AA7BDEED549A057C64C022DEA29F`, matching PDB,
+loaded-module record, test/build logs, source ZIP and manifest
+`280EB8F902EA4A615E55213A3F597DDA30BF064957D66DD1AD257DA135DEB113` preserve the tested inputs.
+Later documentation edits do not change that product snapshot. `Start-Interactive.ps1` pins the
+new core and original scene hashes and clears scripted input/history-capture variables. Existing
+fixed-camera benchmark artifacts remain intact. No Minecraft JAR or Prism instance was changed.
+
+Limits: only the captured geometry exists; no collision, streaming, physics or animation. Hands,
+entities, fog/fluid state and time remain frozen, so free flight can leave the captured hand behind
+or leave the captured region. No resampling/reconstruction of missing world data is implied.
+Both repositories remain unstaged/uncommitted; public-binary permission and GPU-fault limits stay open.
+
+
+## 2026-09-24: Focus-matched Medium snapshot benchmark
+
+Status: runtime-observed, bounded GPU comparison; no new native implementation/build in this
+step. Source-normalized verification against the tested free-camera snapshot found only later
+documentation differences. Existing uncommitted replay work is retained.
+
+The user's saved Medium world was measured in a separate Radiance run directory, then its actual
+PT scene captured and replayed sequentially. See Radiance's
+[full conditions and CPU investigation](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-24-medium-scene-sequential-game-and-native-comparison).
+Snapshot8511 instances/BLAS,17112 geometries,11544798 triangles,3552 buffers and264 textures;
+scene SHA `120844AACB8B1BF6F366AF167766C667A4688EC8EC7CB61751E14363686A3E82`.
+Readback2628051232 bytes,4GiB explicit budget. Manifest published during safe normal shutdown;
+CPU capture/write time is excluded from benchmark intervals.
+
+A first native60s run lost focus and is not the matched baseline. Second run PID24520 completed
+4386 frames/60.0009s,4386 unique SDK tokens, exit0 without JVM. Focused20-60s contains2997 real
+frames: mean13.346ms, p5013.256, p9514.381, p9915.343 (74.93FPS); GPU2996 completed samples
+mean13.310ms, p9514.154, p9914.744. Capturing game PID36400's focused90-150s:1348 frames,
+mean44.502ms, p9550.691, p9958.397 (22.47FPS), GPUmean13.635ms. Same2560x1440/RR1485x835,
+modelF,VanillaPT,four bounces,Reflex1,FGoff,vsyncoff; shaders/options frozen with capture.
+Renderer still prepares the static scene/TLAS and runs PT/RR/post/present; ticks, GUI, streaming
+and dynamic geometry production are absent. Observed3.33x FPS is not a game optimization.
+GPU timestamps also do not measure all CPU/native allocation/driver work.
+
+Game reached8207 ready chunks by30.68s after entry and stayed at that count; sampled queues
+were empty before capture, with small legitimate updates between samples. Save/native close
+and exit0 were confirmed. Screenshot RGBMAE1.222/255; agent inspection agrees on camera/terrain;
+independent temporal warmup and lack of user visual inspection prevent an equivalence claim.
+Whole-card peaks13662/13454MiB include unrelated applications. Native VMA totals remain about
+5129MiB; game steady totals5818-5836MiB. VMA's vram_mb label is not device-local-only VRAM.
+
+Non-portable evidence: `D:\Workspaces\Artifacts\MCVRSceneReplay\20260924\iteration-7`,
+`replay-medium-1` and `replay-medium-focused`. Native core
+`E06B2AD5A6C76528EC5E59DFF4622E6F45D5AA7BDEED549A057C64C022DEA29F`/matching PDB reuse the
+prior tested source manifest `280EB8F902EA4A615E55213A3F597DDA30BF064957D66DD1AD257DA135DEB113`;
+loaded-module records, snapshot/runtime hashes, per-frame CSV and final images are retained.
+Capture uses distinct DLL `CDE37551C50E95F654FC79C966F2DCA54038696254D20274DEB281BD5B029F4A`
+from the unchanged Minecraft JAR. Only the external diagnostic was rebuilt in this step;
+previous CTest/build results remain historical rather than being re-reported as new execution.
+No renderer optimization, staging/commit/push, Prism changes or public binary distribution.
+GPU-fault, long-term stability, moving-scene attribution and license boundaries remain open.
+
+## 2026-09-24: Native consumers in the three-path CPU investigation
+
+Status: investigating; optimization proposed. Evidence: static and existing JFR/allocation records.
+Applies to: MCVR `4778983778d53084132ce84ed0e567579ed6ed7b` plus retained replay work;
+Radiance `b8568cafd222c8169cd6c8fd3d5771690e3425ca`. No native source change/build in this step.
+
+See the [paired investigation](../../Radiance/docs/research/2026-09-24-medium-scene-cpu-hotspots.md).
+`Textures::queueUpload`/`ImageBufferCache::append` copy the complete source-image allocation into
+host staging even when the GPU transfer selects one animation frame. Entity batch construction
+allocates three aggregate geometry buffers plus AS storage/scratch each frame, so the earlier
+114.6 allocations/s is not an entity or BLAS count. Java-cached clouds use the same uncached native
+path. Neither record isolates CPU packing, allocation, transfer or completed GPU-AS cost.
+
+The direct sampler check additionally found an asymmetric mipmap-mode comparison on regular
+textures versus frame aliases. It is recorded as a concrete contract follow-up, with no claim
+that it caused the measured slowdown or that it has been repaired. Existing generation checks,
+descriptor ownership, in-flight retention and Flywheel/UI cache contracts must survive any later
+optimization; global idle or freezing dynamic geometry are not acceptable substitutes.
+
+Non-portable evidence: `D:\Workspaces\Artifacts\MCVRSceneReplay\20260924\hotspot-investigation`;
+inspected-source manifest SHA-256
+`48DF929BAFE1C84ED851EAAFF541538920F2F73C10F9BF3049AFB39958161A06`.
+The prior JFR was re-exported with deeper stacks, not rerun. No new tests, game/GPU process,
+deployment, product changes or Git staging/commit/push. Per-change gains and regression acceptance
+remain unmeasured; previous runtime/build results retain their original scope.
+
+## 2026-09-24: Compact texture staging and submitted cloud geometry reuse
+
+Status: implemented; build-verified; automated-verified; runtime-observed; deployed with Radiance.
+Evidence: source, behavior tests, GPU suite, bounded game comparison and reload regression.
+Applies to MCVR `4778983778d53084132ce84ed0e567579ed6ed7b` plus retained replay work and this
+uncommitted optimization; paired Radiance `b8568cafd222c8169cd6c8fd3d5771690e3425ca` worktree.
+Supersedes the prior investigation's no-implementation boundary for this stage only.
+
+`TextureUploadRegion` validates source stride/offset/extent; `Textures::queueUpload` also validates
+the destination mip and stages only packed rows. `ImageBufferCache::appendRegion` aligns to both
+Vulkan's existing four-byte rule and texel size, preserves earlier queued data during growth,
+and accounts actual staged bytes. Existing staging detachment/retirement and descriptor/texture
+ownership remain active. The Java side supplies only needed auxiliary rectangles and preserves
+generation identity through the existing upload path.
+
+`Vertex::appendPackedVertices` removes two intermediate vectors per geometry using the existing
+field conversion functions. Explicit cloud capture separates its aggregate geometry storage
+from ordinary entities. `SubmittedGeometryCache` admits reuse only after successful frame or
+readback-flush queue submission; recorded-but-unsubmitted work is never reusable. New frames clone
+entity transform metadata while sharing immutable geometry/BLAS ownership. Revision changes and
+inactivity evict the bounded cache, while existing frame/history owners retain in-flight resources.
+BLAS input/upload ordering uses the existing world transfer and AS barriers. No global idle,
+camera culling or generic animated-entity caching was introduced. Ordinary batches still allocate.
+
+RelWithDebInfo INSTALL build and CTest 56/56 passed. Added native behavior tests cover packed
+rectangle content/guard bytes/overflow, exact vertex field equivalence, submission admission,
+abandoned work, revision replacement and in-flight retention. These tests plus the paired Java
+suite and actual cloud/reload game path complement each other; helper tests alone are not a GPU
+ownership proof. The actual two JNI cloud entry points were exercised by the client.
+
+The [paired ledger](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-24-region-uploads-block-entity-index-and-submitted-cloud-cache)
+owns configuration and full timing results: one focused Medium pair, same initial world/settings,
+90-150 s real-frame mean 44.718 -> 41.180 ms (22.362 -> 24.284 FPS), GPU 14.261 -> 13.433 ms.
+Entity allocation remains 258.97 -> 273.78 MB/s with higher frame throughput; normalized per-frame
+bytes fell only about 2.7%. VMA totals include host allocations. This does not attribute individual
+gains or prove general/long-term performance. Both roughly 162 s game runs saved and closed.
+Separate 110.18 s reload/chest/cloud regression recorded 7 cloud build requests / 2,404 reuse
+requests, returned to 8,207 ready sections and saved/closed normally. No device loss occurred in
+these three processes; prior GPU-fault facts are not superseded.
+
+Non-portable evidence: `D:\Workspaces\Artifacts\MCVRSceneReplay\20260924\optimization`;
+product-source manifest SHA `C7EDE053BB8DE2597A6459D2D70820B9991B4E90B9721C6FB49F9A8DFBE29DA4`.
+Core DLL `D296C930B0E65E71646695B6B7E42019570F0779DAB65310623D75571434CCA2` matches build,
+JAR embedding, extraction and actual loaded-module records; matching PDB is retained.
+Paired JAR `5508403622385BD98B07B76A42C2FD2AC64A3B19D61818D8DED7ADD96C21E605` and the diagnostic
+mod were copied only to the authorized Prism mods directory. Visual/PBR/world-switch acceptance,
+per-change attribution, dynamic-entity buffer pooling, the separate sampler follow-up and vendor
+binary-distribution permission remain open. No staging, commit, amend, push or public release.
+
+## 2026-09-24: Optional native audit provider boundary
+
+Status: implemented; build-verified; automated-verified; bounded runtime-observed.
+Evidence: C ABI tests, RelWithDebInfo INSTALL, CTest 57/57, matched DLL attachment and normal close.
+Applies to MCVR `4778983778d53084132ce84ed0e567579ed6ed7b` plus preserved replay/hotspot work.
+
+`diagnostics/audit_api.h` defines the versioned install-once provider; `alloc_trace.hpp` and
+`fg_timing.hpp` are now thin event hooks. Allocation aggregation, timing summaries and formatting
+live in Radiance's tracked `Modules/RadianceAudit/native/collector`, separately built and bundled
+only with the diagnostic JAR. Without a provider, timing avoids the diagnostic clock/lock and
+allocation events do not create maps/strings. Framework no longer writes periodic radiance-perf.log.
+The provider cannot unload while native resources may report retirements. First-party collector
+state is bounded and process-lived, with no STL ownership or exception crossing the C ABI.
+
+Lifecycle injection requires an explicitly armed capability; ordinary error propagation and real
+fatal/close logic remain unchanged. GPU readback request polling is gated. Native early-fault hooks,
+GPU-owning capture/replay internals and other explicit traces are retained, not silently removed.
+The built core DLL is `31A3357C8E690A29738BB5F38F6BEB6439E96025BA0DBC6B3FCB47B6A277A6B6`;
+its install/JAR/extraction/actual-load identities agree. Full source, artifact and run evidence is in
+[the paired ledger](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-24-tracked-optional-radiance-audit-module-and-native-collector).
+The preliminary missing-JNI-header build failed during concurrent header regeneration; sequential
+rebuild succeeded. New checks do not repeat G1/G2, establish GPU-loss cause, prove world/visual
+stability, or authorize vendor binary redistribution. No staging, commit, amend or push.
+
+## 2026-09-24: One-shot scene replay retirement
+
+Status: implemented; build-verified; automated-verified; deployed (no new gameplay acceptance).
+Evidence: static, build, automated, GPU fixtures and deployment; applies to the dirty paired worktree.
+Supersedes: active maintenance of the preceding standalone replay experiment, not its historical
+measurements or captured evidence.
+
+At the user's request remove `scene_replay.*`, the camera/relocation contract, standalone executable
+and contract test; remove its world-prepare and output hooks, pipeline JSON description, buffer-address
+registry and BLAS capture geometry fields. Source files and obsolete generated tool outputs are sent
+to the Windows Recycle Bin. This restores the six replay-only integration files to their HEAD bytes;
+world preparation retains the unrelated cached-cloud submission. Optimized uploads, packing, clouds,
+resource retirement, failure handling and the optional Audit C ABI are preserved.
+
+The general GPU readback/fault tooling is not this retired scene snapshot facility. Historical
+captures/source archives under `D:\Workspaces\Artifacts\MCVRSceneReplay\20260924` (non-portable)
+and Radiance's ignored run evidence remain intact. No dummy export, disabled implementation or
+alternate active replay build target is retained. Java removes its one-shot scene controller too.
+
+Verification and artifact evidence are recorded under the sibling Radiance
+`run/replay-retirement-20260924`; the [paired retirement record](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-24-one-shot-scene-replay-retirement-and-amend-preparation)
+owns the shared build settings and source-hygiene correction. No new world or visual acceptance,
+GPU root-cause closure, Git write or binary redistribution approval follows from this retirement.
+
+### Executed validation
+
+RelWithDebInfo INSTALL and shader/runtime installation passed. CTest passed 56/56 including GPU
+fixtures; the only count reduction from 57 is deletion of the replay-only test. DLL export inspection
+confirmed no replay entry and a retained Audit provider. The paired Java/package gates passed
+(GAME 192, Audit 6, bootstrap 10 passed/2 skipped; native collector 1). No new client was started.
+
+Final core SHA-256: `ABDA7889AF78F8C6F7FF7B3B897D53619580C1D1FABFE395C36D4246BBD17FB6`; build/install/JAR bytes match.
+The paired product/build/test snapshot SHA-256 is `9180BCD9DC6B599A54678A2FB7FFA1030118672ABEF3AF1A1D985FBE7A040CD5`.
+Full paths, Java artifact hashes and deployment identity are in the paired ledger/evidence manifest.
+Root/meta/history are unchanged and the worktree remains unstaged; no amend, push or release occurred.
+
+## 2026-09-24: User feedback and native source checkpoint
+
+Status: build/automated evidence retained; bounded client observation and user feedback received.
+The user reports no issue in actual play with the replay-retirement pair and authorizes source
+amend/synchronization. Core DLL remains
+`ABDA7889AF78F8C6F7FF7B3B897D53619580C1D1FABFE395C36D4246BBD17FB6`; native source matches the
+preceding exact-byte snapshot. No native product or test changes are added in this checkpoint.
+
+The [paired manual record](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-24-manual-feedback-and-source-checkpoint-after-replay-retirement)
+owns the two-world save/exit logs, installed artifact identity and residual Veil/map-data messages.
+There is no fresh per-process DLL hash/native-close assertion, exhaustive rendering acceptance or
+proof of long-term stability. Existing GPU/root-cause and binary-license boundaries remain open.
+
+## 2026-09-24: Glow lichen opposite-face UV evidence
+
+Status: specific model-input mechanism confirmed; no native product change or repair.
+The paired [lichen investigation](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-24-glow-lichen-opposite-face-uv-investigation)
+owns the source-model, actual baked/PBR vertex and GPU evidence. On core
+`ABDA7889AF78F8C6F7FF7B3B897D53619580C1D1FABFE395C36D4246BBD17FB6` (source
+`b70d2a149fd86f8a03c81dc7b9c8bdcc5f7fae57`), eight primary floor readbacks retain all 105 opaque
+texels, with zero mismatches among 54,880 interior samples. The source baker instead assigns
+opposite horizontal faces UVs differing by a half-turn; only 48 opaque positions overlap.
+Native vertex packing and the inspected Vanilla PT/Advanced hit consumers preserve and use the
+selected face's UV, explaining how camera-facing and support-side light paths can disagree.
+
+The new runtime case exercises Vanilla PT / RR D only; no new Advanced or Sable runtime claim.
+No native shader, culling, BLAS, texture or emission setting was changed. A scoped correction and
+its indirect-light/reflection acceptance remain pending; global two-sided-material normalization
+would be unsafe for models intentionally using different surfaces. Existing lifecycle, device-loss
+and redistribution boundaries are unchanged. See the paired record for interrupted runs and exact
+artifact identities; no historical test results are reclassified as new tests.
+
+## 2026-09-24: Glow lichen accepted without native changes
+
+Status: reported symptom closed by explicit user acceptance; no product correction.
+The [paired decision](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-24-glow-lichen-accepted-as-normal-upstream-behavior)
+supersedes the preceding pending UV-correction proposal. The user accepts the inherited model's
+two opposing single-sided quads and their horizontal-face UV difference as normal behavior.
+Retain existing native geometry, culling, UV and emission handling; no new build or client run
+was performed for this documentation-only decision. Existing measurements are retained with
+their original scope, without claiming physical equivalence or general visual acceptance.
+
+## 2026-09-24: Diagram raster resource and composition re-audit
+
+Status: investigating; static findings only, no native product change or new execution.
+Applies to MCVR `ead8d47d80ad2bc9cf81740c29f0ec230b61f92f`, paired with Radiance
+`6e9b97a53049fad833e673da647ac517efde5fe3` (clean before documentation changes).
+The [paired re-audit](../../Radiance/docs/research/RASTER_PARITY_AND_PONDER_RETIREMENT.md#2026-09-24-diagram-semantic-re-audit-and-correction)
+corrects the earlier incomplete diagram parity assessment; historical GPU fade tests remain
+bounded evidence, not full original-renderer equivalence.
+
+Native source inspection confirms that queued writes target one lightmap image before overlay
+draw submission, so binding/lifetime snapshots do not retain the Java producer's different
+block/BE/restored image contents. `beginDiagram` also shrinks the viewport to a clipped window
+rectangle instead of preserving projection and clipping coverage alone. The native post embeds
+default palettes/dither, unlike original resource-pack-resolved inputs. The report separates
+these static gaps from unresolved Sable lighting/backend and visual questions. No device-loss
+cause or new synchronization-validation result is inferred from this investigation.
+
+Source/decompilation hashes and coverage are in sibling Radiance's ignored
+`build/research/20260924-diagram-reaudit/EVIDENCE.json`. No build, CTest, GPU/client run or
+deployment occurred. Future correction needs production-path stage-content/overlap readback,
+fractional/offscreen composition, pack override and Java/native cleanup cases; tests of helper
+names or default shader constants alone do not establish them. Existing Ponder archive, world
+PT contracts, layout keepalive and GPU/licensing boundaries remain unchanged. No Git staging,
+commit/amend or push.
+
+## 2026-09-24: Diagram producer restoration uses existing Vulkan raster translation
+
+Status: paired implementation build-verified; bounded GL/Vulkan runtime comparison; native product
+unchanged. Applies to MCVR `ead8d47d80ad2bc9cf81740c29f0ec230b61f92f` with Radiance's uncommitted
+diagram correction above `6e9b97a53049fad833e673da647ac517efde5fe3`.
+
+The [paired implementation and evidence](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-24-original-diagram-producer-restored-with-physical-resolution-presentation)
+replaces the custom diagram caller with original Simulated group/post/GUI execution through existing
+Vulkan raster/Veil translation. Separate immutable lightmaps preserve stage contents, original
+layer/compile-time sort/AO semantics are restored, and physical-size targets retain original GUI
+placement/fade. The previous native hardcoded diagram post/clipped viewport path is no longer used
+by this UI; it was not deleted or modified in this batch. Ponder PT remains archived.
+
+No native rebuild or CTest rerun was needed or claimed. DLL SHA-256 remains
+`ABDA7889AF78F8C6F7FF7B3B897D53619580C1D1FABFE395C36D4246BBD17FB6`, checked in the package and actual
+isolated client load. Final Vulkan PID 75476 completed rotation, GUI resize, reload, save and exit.
+Its fixture material RGBA matches GL exactly; final paper alpha matches, with 19/81 remaining RGB
+edge differences. Small extra regions in earlier runs remain unattributed; a later clean capture
+does not explain them. This is bounded execution evidence, not all-raster visual acceptance.
+
+Evidence resides in sibling Radiance `run/diagram-semantics-20260924/evidence/`, including normalized
+native source file-list hash `cb4364f6fb213f2fa1efb59e287272ebe208fbcf0866c91af158aa07171b3065`.
+Native product unchanged; only this ledger is modified. Mechanism/note/override/backend acceptance,
+GPU-fault uncertainty and redistribution conditions remain open. No staging, commit/amend or push.
+
+## 2026-09-24: Optional native frame observer and per-context GPU timing
+
+Status: implemented; build-verified; automated-verified; bounded runtime-observed.
+Evidence: static, RelWithDebInfo build, CTest, actual client load/query results; not visual acceptance.
+Applies to worktree above `ead8d47d80ad2bc9cf81740c29f0ec230b61f92f`; paired with Radiance worktree
+above `6e9b97a53049fad833e673da647ac517efde5fe3` and its formal `Modules/RadianceAudit` collector.
+
+### Implementation
+
+Added separate `profile_api.h` process-lived observer ABI, disabled by default. Scoped host durations
+subtract nested children, preserve exception paths and thread ownership, and reject scopes crossing
+capture generations. The low-cost product hooks cover entity conversion/copy/packing/build recording,
+chunk copy/packing/build recording, textures, pipeline modules, acquire/fence/submit/present/pacing.
+The collector/aggregation/output remains outside core, in the optional diagnostic mod.
+
+Framework contexts lazily own bounded timestamp pools (96 spans) during a requested capture. Reset
+follows the ordinary acquired-image fence. Main command buffers and world modules are sampled;
+reads use availability without additional wait. Partial readbacks invalidate that frame's optional
+measurements. Submission assigns Java frame identity because acquire at the end of a Java frame
+prepares the following frame. Query pools retire with their context. Layout keepalive, fatal
+propagation, scene ownership, GPU completion requirements and rendering semantics are unchanged.
+
+### Validation and limits
+
+- Full RelWithDebInfo native build/install and **58/58 CTests passed**. Two new tests exercise actual
+  scope nesting/exception/worker ownership and GPU-helper reuse/read-availability/no-WAIT/invalidation
+  with controlled API substitutes. Existing GPU execution fixtures also passed.
+- Two real matched clients loaded DLL
+  `8F7772C3547A9B800C13D210474B30DC1ECD0250F210DB191459DC079380098A`, with matching built/embedded/extracted
+  hashes. PID 99568 captured 2,124 warmed frames in 30 s; PID 58284 captured 930 initial-loading
+  frames in 15 s and exercised worker compilation/native chunk enqueue. Both saved all dimensions
+  and exited normally. No renderer failure was observed in these bounded runs.
+- Evidence and all artifact identities: sibling Radiance `run/frame-profile-20260924/evidence/`;
+  normalized tracked/nonignored source file-list hash before this ledger entry:
+  `B8C6BC9148EA72A5711A8EA0F94370B1812EAF267AE50DD8CCB0F7E68F3E1FE1`.
+  DLL-matching PDB is retained at the build path identified and hashed by the manifest.
+
+CPU preparation and GPU completion intervals overlap. Module intervals are inside world-buffer
+intervals; these must not be totaled with CPU or each other. Background GPU chunk queues, archived
+UI-PT commands and SDK-owned FG GPU submissions are not independently measured. Missing tail and
+unavailable/readback frames are omitted, not zero. Instrumentation overhead and representative
+heavy-scene bottlenecks remain unquantified. No rendering optimization, driver change, GPU-fault
+root-cause claim, public-runtime authorization or new visual acceptance results from this work.
+
+See [paired implementation and observations](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-24-optional-frame-stage-profiler-with-correlated-java-native-and-gpu-samples).
+Only local source/docs/build and isolated runs were changed; no staging, commit, amend or push.
+
+### Same-day query-failure boundary follow-up and final profile delivery
+
+Optional timestamp operations preserve a real device-lost result for Framework's established fatal
+path; diagnostic absence must not swallow the first real GPU failure. The query-helper substitute
+now tests this result preservation. Rebuilt RelWithDebInfo + package verification passed; targeted
+native scope/query/audit/failure-state tests passed **4/4** after this change. The earlier 58/58 run
+remains attributed to the previous candidate. No real device-lost injection was performed.
+
+Final core.dll SHA-256 `5D4E0AD4C194F9DF8DCBF6B6F3EF33EE82FE2DD4039013AA4FBAD51105939915` was confirmed
+in the build, package and actual loaded isolated client PID 86080. Profiling attached late with
+legacy observer flags 0 (no experiment activation), collected 680 frames over 10 s with zero drops,
+then normal window close saved all dimensions and exited 0. This is bounded client evidence only.
+
+Paired Radiance final delivery is recorded in its preceding linked ledger. Exact final source list,
+paired JARs, DLL/PDB identity, snapshot ZIPs and copied-mod deployment checks reside in sibling
+`Radiance/run/frame-profile-20260924/evidence/final/`; normalized MCVR source-list hash before this
+append is `B5E9268B13DF6EC1D2D2010B2C7C506E0338C0B650E93392DE92D6D9B7E5227A`.
+Original and final candidate evidence remain separate. The user's slow eight-chunk scene remains
+pending; no CPU/GPU optimization or renderer-wide acceptance is claimed. No Git actions performed.
+
+### Final locked-invalidation delivery
+
+The optional `flushForReadback` profile invalidation now occurs inside the existing recreation mutex,
+after current-context validation, avoiding a new unprotected observer access. Incremental native
+build/install + paired package verification passed; profile/query/audit/failure/readback contracts
+passed **5/5**. Final DLL SHA-256:
+`1913C869934F63399EDF17F41D25A7FA67DAC60CEA917ABC403E56B1430A832B`.
+
+Real final client PID 79228 captured 685 frames / 10 seconds without experiment activation and
+without writer/native/output-cap loss; normal close saved all dimensions and exited 0. The final
+build/embedded/extracted/loaded chain and matching PDB, paired Prism copies and source ZIPs are in
+sibling `Radiance/run/frame-profile-20260924/evidence/delivery/`. Normalized source-list hash before
+this append: `D760F21F5A728A748DB217D7F5E076F0658F61635819E01B5445BE9D621943EC`.
+Earlier candidate measurements retain their own identities. No later code changes or Git actions;
+representative slow-scene measurements and preceding product/GPU/licensing boundaries stay open.
+
+## 2026-09-24: Detailed host preparation attribution after the eight-chunk profile
+
+Status: implemented; build-verified; automated-verified; bounded runtime-observed.
+Evidence: scoped host measurements, controlled tests, matched isolated clients; no GPU offload or
+performance improvement claim. Applies to worktree above `ead8d47d80ad2bc9cf81740c29f0ec230b61f92f`.
+
+The user's static Prism capture measured 6.82 ms/frame in the host PT module, inside an 8.81 ms
+submission/recording stage. That does not establish a shader or vertex-arithmetic bottleneck.
+Added stack-only `profile::Phases` using the existing optional observer. WorldPrepare now separates
+scheduling, lock acquisition, BLAS command recording, entity/Flywheel/chunk metadata/history,
+TLAS build-command preparation, metadata allocation/copy/upload and temporary cleanup. SBT lookup
+and allocation/copy/recording, descriptor materialization/binding, runtime/execution buffers and
+pass recording have their own nested rows. No rendering order, allocation strategy, scene ownership,
+material behavior, synchronization or GPU code was intentionally changed; all capture remains opt-in.
+
+RelWithDebInfo build/install succeeded. Targeted native frame-profile, GPU-profile and audit-sink
+CTest contracts passed **3/3**; new phase-transition tests exercise real nesting, exception unwinding,
+disabled mode and exclusive-sum accounting. These are this batch's tests, not a rerun of all 58.
+Paired Audit has **17 Java tests + 2 collector tests passed**, including repeated native invocation
+versus per-render-frame denominators and nested world-stage accounting.
+
+Final core.dll SHA-256 `3A09E358A5BE8C7636469D29ECAC17748A7B6612469A31CAE7046DC3F5D69025`
+matches build, installed resource, outer distribution JAR, extracted and actually loaded files.
+Isolated PID 1236 captured 634 frames/10 s with the initial Java subdivisions; final PID 51976 used
+the additional LevelRenderer/camera/uniform scopes and captured 633 frames/10 s. Both reported zero
+writer/native/output-cap drops and saved all dimensions before exit 0. The second process lasted
+70.14 s including startup. These different Audit candidates remain distinct, and neither test scene
+is a performance comparison against the user's 2560x1440 eight-chunk scene.
+
+Evidence, matching PDB and tracked/nonignored source snapshots: sibling Radiance
+`run/frame-profile-detail-20260924/evidence/`; final runtime in the sibling `final/` directory.
+See [paired observations and manual steps](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-24-static-prism-profile-and-detailed-preparation-timing).
+GPU-offload decisions await representative detailed measurements. GPU-fault, visual and runtime
+licensing boundaries are unchanged. No staging, commit, amend or push.
+
+## 2026-09-24: Sixteen-chunk host preparation measurements and attribution correction
+
+Status: runtime-observed; investigating. Evidence: user-operated 30 s capture, 478 frames,
+3840x2054/16 chunks, focused, FG off, no reported sample loss. Product code and the detailed
+profiler core SHA-256 `3A09E358A5BE8C7636469D29ECAC17748A7B6612469A31CAE7046DC3F5D69025` are unchanged;
+the installed and loaded module identity matched. No build/tests were rerun for this analysis.
+
+Host PT preparation averaged 18.184 ms inclusive. Its chunk metadata self duration was 10.441 ms,
+BLAS command preparation 2.935 ms and entity metadata 1.739 ms. Native conversion/copy/enqueue was
+4.831 ms. Entity batch construction was 5.866 ms inclusive, including vertex packing 3.172 ms.
+Frame-fence waits averaged 0.0017 ms; no background section worker work was recorded. Main-queue
+GPU completion averaged 20.004 ms while frame-start intervals averaged 62.761 ms. These nested/
+overlapping observations support a host bottleneck in this sample, not an all-world conclusion.
+
+Correction: vertex packing executes through `Entities::build` at Java world-render tail, not
+through the geometry-marshaling `Entities::queueBuild` call. Do not double-count it or attribute
+the residual Java/JNI duration to pure transforms. `shaderMaterialFlags` repeatedly evaluates
+`faces::uniform(model)` per geometry; the source shows avoidable repeated computation for uniform
+models, but no measured attribution or optimization result yet. Scene metadata caching and GPU
+packing candidates need bounded tests preserving material rules, history and in-flight ownership.
+
+See the [paired profile and limitations](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-24-sixteen-chunk-stationary-profile-identifies-recurring-host-scene-work).
+Raw evidence and hashes: sibling Radiance `run/frame-profile-detail-20260924/evidence/prism-static-16/`.
+This higher-resolution scene is not a controlled comparison against the prior eight-chunk capture.
+The first 25 frames had no screen, the remaining 453 had chat open; no user visual acceptance or
+GPU migration is implied. Existing fault/licensing boundaries remain. No Git actions.
+
+## 2026-09-24: Model face traversal and host allocation optimization
+
+Status: implemented; build-verified; automated-verified; bounded runtime-observed.
+Evidence: current worktree above `ead8d47d80ad2bc9cf81740c29f0ec230b61f92f`, production-helper
+tests, Vulkan face fixture and isolated A/B/A. Existing diagnostic changes remain included.
+
+`faces::ModelRules` scans material flags once per model traversal. Chunk/entity BLAS construction
+and WorldPrepare's chunk/entity/Flywheel paths reuse its opaque/TLAS/shader decisions; no cached
+decision survives a traversal or material replacement. WorldPrepare predicts vector capacity from
+published geometry counts, reuses its one prepared Flywheel list, and directly copies hit-group
+strings. Entity queue conversion reserves known geometry and vertex counts. No geometry selection,
+shader/JNI, temporal history, GPU synchronization or retention policy changed; GPU offload remains
+unimplemented. Product changes are confined to `material_faces.hpp`, `chunks.cpp`, `entities.cpp`
+and `world_prepare.cpp`; the existing material-face test gains behavior cases and an optional bench.
+
+RelWithDebInfo INSTALL, paired package verification and **7/7 targeted CTests** passed (contract,
+frame-profile, entity-vertex-packing, instancing-contract, world-mesh-contract, material-faces and
+material-faces-gpu). The production model helper passes 512 mixed face combinations, mirror/zero
+transforms, preservation of other bits, and material changes at stable storage. The synthetic
+old/new traversal benchmark checks identical results without a timing-based pass threshold.
+
+Three independent clients start from the same isolated world/settings, 1280x720/16 chunks, focused,
+no screen, FG off: 30 s settling then 30 s capture, no concurrent build/game. Old/new/old real frame
+intervals averaged **31.482 / 28.003 / 31.326 ms**, chunk metadata **9.205 / 6.447 / 9.137 ms**,
+and total WorldPrepare **11.384 / 8.655 / 11.315 ms**. Capacity prediction adds about 0.23 ms in
+metadata-init; it is included in total cost. No sample loss, failed frame or worker section compile
+was recorded; all dimensions saved and all three processes exited 0. This supports a bounded host
+improvement, not per-change attribution, deterministic animation equivalence or a 4K performance
+claim. Marshaling did not clearly improve; GPU timing varied, and peak VRAM/upload bytes were not
+measured. Java wrapper timing gaps below 0.001 ms mean are preserved rather than normalized.
+
+Final DLL SHA-256 `5C1CD35F6EABA6C5EDFB45BC49518064AF2FCA3E80EC9B8B627C7FA75FF908C6` matches build,
+embedded, extracted and loaded PID 101248. Source snapshots, PDB, candidate diff, dependency inputs,
+test logs and A/B/A analysis reside in sibling Radiance `run/host-preparation-opt-20260924/evidence/`.
+See [paired timings and Prism handoff](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-24-first-host-preparation-optimization-and-bounded-aba-measurement).
+Representative Prism comparison and moving/update/visual acceptance remain pending. No Git actions.
+
+## 2026-09-24: Prism measurement after host preparation changes
+
+Status: runtime-observed; end-to-end attribution remains limited by a changed view/workload.
+Evidence: two 30 s profiles from PID 72800, actually loaded DLL SHA-256
+`5C1CD35F6EABA6C5EDFB45BC49518064AF2FCA3E80EC9B8B627C7FA75FF908C6`; unchanged product source.
+See [paired measurements, identities and limits](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-24-prism-follow-up-of-the-host-preparation-optimization).
+
+Both samples use 3840x2054/16 chunks and matching saved renderer options/pipeline. First capture
+includes 848 background section compilations; second has none. Compare the settled 485-frame
+sample with the prior 478-frame capture: real interval 62.761 to 61.913 ms; native chunk metadata
+10.441 to 7.977 ms, metadata init 0.239 to 0.578 ms. Entity batch CPU time is 5.866 to 6.514 ms,
+including vertex packing 3.172 to 3.439 ms, while packing calls rise 856.62 to 1040.82 per frame.
+Main-queue GPU duration is 20.004 to 21.411 ms. These nested/overlapping timings are not additive.
+
+The intended host-stage reduction remains observable, but the roughly 1.4% total interval change
+is not a controlled overall gain. The user reported a small view change; the higher call count
+confirms changed work without proving its full cause. Do not label the cost increases a regression
+or claim the isolated 11% improvement applies to Prism. No new tests/build/product changes were
+needed for this analysis. Raw evidence and hashing are retained in sibling Radiance
+`run/host-preparation-opt-20260924/evidence/prism-followup/`. Moving/visual and memory/transfer
+measurements remain open. No new device-loss evidence, final shutdown acceptance or Git actions.
+
+## 2026-09-24: Avoid redundant sampler publication during entity submission
+
+Status: implemented; build-verified; automated-verified; bounded runtime-observed.
+Evidence: production-helper tests, RelWithDebInfo package and isolated real-client A/B/A.
+Applies to: worktree over `ead8d47d80ad2bc9cf81740c29f0ec230b61f92f`, retaining earlier dirty work.
+Supersedes: none; this is a second CPU-only batch, not GPU vertex conversion.
+
+`textures.cpp` uses `sampler_update.hpp` to skip unchanged ordinary-texture sampler settings and
+their redundant descriptor/fallback-alias republishing. Filter comparison includes mipmap mode;
+the previous ordinary-texture path missed a mipmap-only change. Changed settings create the new
+sampler first, retain old owners under the existing frame/reload policy, then replace and publish.
+Texture/recreation locks remain in place. Frame aliases are deliberately unchanged: identical
+sampler state does not imply their frame image is unchanged. Initialization, bind-all and reload/
+pipeline publication still perform their required updates. No face, vertex, JNI or shader semantic
+change, global idle or new persistent cache was introduced.
+
+RelWithDebInfo INSTALL passed. Eight targeted CTests passed: contract, texture-upload-region,
+entity-vertex-packing, texture-lifecycle-contract, texture-name-pool, texture-binding-snapshots,
+sampler-update and material-faces. The new production helper is exercised with 10,000 repeated
+settings, mipmap-only replacement, injected allocation failure, in-flight ownership, reload and
+slot reuse. The exception assertion was tightened and that executable rebuilt/retested successfully.
+The lifecycle source scan is supplementary, not GPU behavior proof. No new GPU fixture is claimed.
+
+Paired Radiance also interns group/content UTF-8 strings within each synchronous entity submission.
+Fresh copies of the same saved Prism scene, 3840x2054/16 chunks, focused, FG off, equal pose/settings,
+45 s settling then 30 s capture yield old/new/old mean real intervals **64.530/60.434/64.641 ms**.
+p95 is **69.847/65.122/70.426 ms**. Java marshaling moves **15.545/13.145/15.545 ms** and auxiliary
+texture work **2.266/0.638/2.325 ms**. The combined reduction is about 6.4%; individual contributions
+are not independently measured. Native vertex packing **4.182/4.239/4.170 ms** and GPU duration
+**25.414/26.257/25.362 ms** do not show an improvement. CPU/GPU/nested timers are not additive.
+No measured frame failed or was dropped; all three processes saved all dimensions and exited 0.
+Live animation, a few background compiles, memory/upload peaks and longer/moving tests limit scope.
+
+The subsequent scripted client regression first exposed an external Audit Mixin gate bug, then
+passed with the corrected Audit: block-entity index/add/remove, F3+T, F3+A and cloud restore, followed
+by all-dimension saves and exit 0. No new core build was needed for that Java diagnostic correction.
+This is bounded functional runtime evidence, not visual or historical device-loss-root-cause closure.
+
+Core SHA-256 `D3A5A20087ED99C683698CD9A5FDF2BF5CAC650D85FD1313DCCF3B13B3F355CF` matches build,
+embedded package and actually loaded clients. Sibling Radiance
+`run/entity-preparation-opt-20260924/evidence/` retains complete source/build identities, PDB,
+tests and raw comparison; its paired ledger records JAR hashes, failed/retested processes and Prism
+deployment. See [paired implementation and evidence](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-24-submission-local-strings-and-unchanged-sampler-fast-path).
+Original Prism world is unchanged. GPU offload, broader visual/moving coverage, memory/transfer
+measurement and public DLL licensing remain open. No staging, commit, amend or push.
+
+## 2026-09-25: Direct entity packing into transient upload storage
+
+Status: implemented; build-verified; automated-verified; bounded runtime-observed.
+Evidence: production packing tests, matched native builds and real-client B/A/B profiles.
+Applies to: worktree over `ead8d47d80ad2bc9cf81740c29f0ec230b61f92f`; existing dirty changes retained.
+Supersedes: none. GPU conversion/offload remains unimplemented.
+
+`EntityBuildDataBatch::build` removes three temporary packed vectors and their subsequent memcpy
+into staging buffers. `Vertex::writePackedVertices` writes exact-sized position/material spans with
+the original field/flag converters; indices retain their values and offsets. Source PBR geometry
+remains available for overlay/topology/material processing. `DeviceLocalBuffer` shares its staging
+preparation between legacy copy uploads and the new synchronous whole-buffer writer. The writer
+flushes before publication and propagates failure through the existing fatal boundary; callbacks
+cannot retain pointers or submit GPU work. Existing staging retainers, frame retirement, upload
+queue and BLAS barriers are unchanged. No new cache, global idle, JNI or shader/vertex-layout change.
+
+Optional profiling aggregates repeated format/topology/material phases before observer emission.
+Batch packing, staging and preparation scopes retain parent/child self-time. The final
+`entity.blas-allocate` scope also includes batch-local destruction, so its reduction is not evidence
+of faster GPU BLAS construction or isolated Vulkan allocation. The original PBR intermediate cannot
+simply be bypassed for all geometry because semantic consumers precede final packing.
+
+RelWithDebInfo INSTALL and paired package verification passed. Ten distinct CTests passed: contract,
+frame-profile, entity-vertex-packing, instancing-contract, world-mesh-contract, upload-staging-budget,
+material-faces, material-faces-gpu, failure-state-contract and pending-uploads. Packing tests compare
+every output field/byte across layers, guards, empty input and destination failure; profiler tests
+check summed phases/nesting and epoch invalidation. The face GPU fixture is a related regression,
+not a direct test of DeviceLocalBuffer. The actual client exercises the integrated new upload path.
+
+Identical fresh world copies, 3840x2054/16 chunks, focused, FG off, 45 s settling plus 30 s capture:
+new/reference/new real intervals **53.937/57.880/54.243 ms**, p95 **57.600/60.780/58.367 ms**.
+Host packing plus staging preparation/copy is **2.053/5.090/2.070 ms**; entity-build dispatch is
+**3.583/7.627/3.648 ms**. Final mean interval improves about 6.3% against reference. Conversion still
+costs **4.988/4.976/5.078 ms**, including format **2.350/2.364/2.386 ms** and topology
+**1.787/1.746/1.811 ms**. No GPU speedup follows from **24.847/25.012/24.949 ms** GPU completion.
+WDDM sampled dedicated usage stays about 8969-8970 MiB; private memory varies, so no memory reduction
+is claimed. Upload byte volume, moving performance and long-duration stability remain unmeasured.
+All compared clients saved every dimension, exited 0 and reported no sample drops/failed frames.
+
+An earlier attempted baseline is excluded: an encoding repair overlapped compilation, and the
+binary lacked the new phase labels. Its source snapshot is explicitly not an exact build proof.
+The subsequent reference differs only in this batch's entities.cpp packing path; the candidate
+source was restored and rebuilt. Candidate/final sources match exactly, but DLL hashes differ after
+relinking and their runtime records are separate. See the
+[paired ledger and failure correction](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-25-entity-packing-writes-directly-into-owned-upload-storage).
+
+Final DLL `30CFAB078EDFA85D899E0F1730D52B3F56ECB58C1D7F66DA7C181CD87D6C7AEB` matches build,
+embedded JAR, extraction and the B2 process module. Matching PDB, full source/build manifests,
+tests and raw evidence are in sibling Radiance `run/vertex-packing-opt-20260925/evidence/`.
+The final functional regression PID 39668 passed index/full-scan comparisons, chest add/remove,
+F3+T, F3+A and cloud restore, then saved all dimensions and exited 0 after 143.26 s total. Its loaded
+DLL matches the final identity above. No visual/long-duration/device-loss-root-cause acceptance is
+inferred. Final Prism JAR deployment and post-build documentation hashes are indexed by the paired
+ledger. No staging or Git operations; public binary licensing remains independent.
+
+
+## 2026-09-25: GPU PBR conversion before entity BLAS construction
+
+Status: implemented; build-verified; automated-verified; runtime-observed in bounded cases.
+Evidence: static, build, real Vulkan, isolated Minecraft measurements; no new visual acceptance.
+Applies to: uncommitted worktree over `ead8d47d80ad2bc9cf81740c29f0ec230b61f92f`, paired with
+Radiance worktree over `6e9b97a53049fad833e673da647ac517efde5fe3`.
+Supersedes: none; preserves the CPU owned-staging path as a diagnostic reference.
+
+### Implementation and ownership
+
+`Entities::queueBuild` can capture owned raw PBR triangles/quads. `EntityGpuConversion` creates
+per-batch immutable input, tile jobs, descriptors and final streams; `entity_convert.comp` performs
+coordinate/normal-offset/emission processing, topology and packed material/position output. The
+actual workload census selects PBR, not a hypothetical compact vertex format. No Java pose/model
+work is claimed to have moved. Existing CPU consumers retain their path: whole eye-layer models,
+lines, post/external captures, explicit indices, cached clouds and prebuilt geometry do not defer
+semantic processing. Processed PBR in a normal batch can still be packed on the GPU. Archived scene
+recording retains CPU execution. BLAS/TLAS rules, geometry order and visibility flags are unchanged.
+
+`EntityConvertJob` is a shared 64-byte CPU/GLSL contract. Tiles cover 64 work items and dispatches
+split at the physical limit. Input/address/storage ranges are checked. The pipeline is shared,
+while each recorded batch and its descriptors/buffers join the existing frame resource retainer.
+Upload staging, input and output lifetimes remain separate; there is no readback or GPU idle in
+normal conversion. `WorldPrepare` records conversion before entity BLAS build. The shared command
+recorder uses compute-write -> shader-read visibility at AS-build/ray-tracing stages. AS vertex/index
+input reads are shader reads, as specified by the
+[Khronos AS build input contract](https://docs.vulkan.org/spec/latest/chapters/accelstructures.html).
+No per-batch descriptor is rewritten after recording, including multiple passes/in-flight frames.
+
+Enabled by default; `MCVR_ENTITY_GPU_CONVERSION=0` before launch retains the CPU reference for
+same-artifact comparisons. This does not disable other rendering features. Optional native
+format/deferred/upload/output counters use profile ABI domain 5 and are reported as work volumes
+by external Audit, never as nanosecond durations. The ordinary product does not write capture files.
+
+### Verification and bounded result
+
+RelWithDebInfo INSTALL and shader/package verification passed. Twelve targeted CTests were run,
+including the new GPU conversion behavior test, existing CPU packing/material/instancing/world mesh,
+profile/upload lifetime tests and supplementary JNI/shader checks. The new test uses the production
+shader and recorder: processed/deferred PBR, quads/triangles, overlays/flags, two separate descriptor
+batches, split dispatch, output guards, CPU field/index comparison and direct compute-to-BLAS use.
+Material/index bytes match; positions allow 2e-6 float tolerance. It also passes installed core and
+synchronization validation with a callback that fails on validation errors. This is an independent
+fixture, not evidence that full Minecraft ran under validation or that every image is identical.
+The first manual invocation used a nonexistent shader path and failed before dispatch; corrected
+CTest evidence is retained, not relabeled as the original run passing.
+
+Same-artifact stationary GPU/CPU/GPU means are 49.594/54.249/50.466 ms at 3840x2054, 16 render
+chunks, four bounces and balanced RR, FG off. Native conversion drops about 5.218 -> 2.93-2.98 ms;
+batch dispatch about 3.693 -> 3.00 ms. GPU conversion itself is about 0.046 ms. This includes avoided
+CPU housekeeping and allocation, not pure arithmetic migration. GPU main-queue completion does
+not improve, and logical upload payload rises roughly 15.32 -> 19.49 MB/frame. The reference payload
+is layout-derived; GPU input/output are directly counted, neither is PCIe telemetry. No memory
+reduction or universal speedup is claimed. Detailed distributions, moving/update results, conditions
+and deployment identity live in the
+[Radiance paired entry](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-25-gpu-conversion-of-recurring-native-pbr-entity-batches).
+
+Local evidence: `Radiance/run/gpu-vertex-opt-20260925/evidence/candidate/MANIFEST.json`, complete
+source ZIPs including new/untracked headers/shader/test, build/test logs and matching PDB. The DLL
+is `930910337A6CBD189220D999BC290AAA0CB53F7CC56D6DC205541553B9757006`; its paired JAR is
+`22D6B9788151AB3E90AEA384AF59716595CC1FC30011F331A5D97EB2E828BC63`. Loaded module identities
+are recorded per case. No source commit/push/public binary distribution occurred. Long-duration
+stability, other GPU architectures, complete visual equivalence and historical device-loss root
+cause remain outside this bounded result; existing licensing and deferred product issues stay open.
+
+
+The paired final update regression also passed all seven stages (chest add/remove, F3+T, F3+A,
+cloud restoration and index checks), saved all dimensions and exited 0 in 142.69 s. The 40-second
+camera route has zero skipped targets in both CPU/GPU cases; means are 56.534/52.813 ms. Six final
+client cases retain separate identities/results; none reported device loss. They do not establish
+final image parity or long-term stability. Final source/metadata addenda are in
+`Radiance/run/gpu-vertex-opt-20260925/evidence/final/MANIFEST.json`; product sources and artifacts
+are unchanged from candidate. The same JAR/native pair and matching Audit were deployed to the
+user-authorized Prism mods directory only. Full hashes and deployment evidence are in the paired
+Radiance entry. No Git staging/commit/push or unrelated source changes were performed by this batch.
+
+
+## 2026-09-25 — Cache published chunk scene metadata, preserve per-frame transforms
+
+Status: implemented, build-verified, automated-verified and bounded runtime-observed. No new visual
+acceptance, broad GPU stability conclusion or public redistribution approval.
+
+`chunk_scene_metadata.hpp`, `chunks.hpp/.cpp` and `WorldPrepare` now reuse one immutable published
+CPU metadata snapshot per valid chunk. The snapshot owns the resource set and references its stable
+address arrays; it precomputes hit groups, versioned material-face rules and identity appearances.
+Its key includes publication version, geometry count and eleven owner identities. Accepted geometry
+publication, invalidation and emission-resource release invalidate it; failed cache construction
+cannot publish a partial entry. Per-frame retention owns the immutable snapshot independently of
+mutable/reused Chunk1 slots. Already submitted frames keep their original buffers alive.
+
+Static primary world chunks no longer allocate unused transform-history map entries. Every external
+slot still does, including before receiving its first custom transform; this boundary was identified
+and fixed during review of the initial candidate. Double-precision camera-relative transforms,
+mirrored winding, instance order, last geometry addresses, per-view history and TLAS building remain
+per-frame. No resource wait, camera culling, shader change, new ABI or priority change is introduced.
+Flat GPU metadata tables still upload each frame: this is a CPU preparation optimization only.
+
+`MCVR_CHUNK_SCENE_CACHE=0` is the restart-only reference assembly. Default-off
+`MCVR_CHUNK_SCENE_VERIFY=1` compares the actual appended metadata and transformed face flags against
+current published sources. Aggregated `chunk.scene.*` counters are work volumes, not durations.
+The cache reference path and verifier are not used as a normal fallback that can hide a mismatch.
+
+RelWithDebInfo INSTALL and paired distribution verification pass. Thirteen targeted CTests pass,
+including the new behavioral snapshot test (append ordering/materials, ownership retirement,
+replacement, allocation failure, mirrors, large coordinates, external first-transform and per-view
+history), existing GPU conversion/BLAS and material-face GPU tests. The final extended isolated
+update test passes chest edits, mixed Sable delivery and both resource/section reloads; the verifier
+reports at least 9,540,582 matching chunk comparisons before normal save/exit.
+
+On the same artifact/scene/settings, chunk preparation is 4.47-4.78 vs 7.85-7.99 ms/frame. The
+controlled moving route improves 51.614 -> 48.955 ms real interval (5.2%). Static totals vary:
+cache 45.313/48.809 vs reference 60.721/49.357 ms; the first reference has extra frame-start cost.
+Do not present that entire static spread as the cache's gain. Approximately 8,199 cached chunks
+reuse their snapshot per frame; occasional live updates rebuild only changed entries. GPU duration
+and WDDM dedicated memory stay similar, and no process-private-memory improvement is established.
+
+Native DLL SHA-256: `B7BBB90BBCAC5906F25EFBB684E898CD9FE64B4E919CA8711EB275767502F6F4`;
+matching PDB: `125B492BA193CD8750C7A5E408AE113EA9EC618A8ABD4501C1EF0411BA9FF833`.
+The paired source/JAR/Audit identity and full runtime/performance boundaries are in the
+[Radiance ledger](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-25--incremental-published-chunk-scene-metadata-and-rendering-parity).
+Ignored evidence lives at Radiance `run/chunk-scene-opt-20260925/`; retain it as acceptance evidence.
+No staging/commit/amend/push/public release; preexisting dirty work remains intact.
+
+
+The final reference reload control also passes (PID 100060, 110.14 world seconds), with the same
+Sable delivery, edit/reload stages and normal save/exit. Eight final-artifact processes are retained
+separately from the first pre-safeguard candidate. The exact compiled source snapshot is `validated`;
+the final maintenance snapshot differs only by documentation and whitespace removed from one empty
+C++ line, explicitly recorded in `FINAL_CHECK.json`. Tested binary hashes did not change.
+
+## 2026-09-25 — Avoid recording transient raster state outside a raster pass
+
+Status: implemented, build-verified, automated-verified and bounded runtime-observed. Existing
+uncommitted changes are preserved; no new user visual acceptance or GPU-stability claim.
+
+The paired Java submission census finds roughly 6.8 ms/frame in actual RenderType face capture,
+including 3.2 ms restoring state, versus only about 0.05 ms for argument allocation/free. The latter
+is not optimized. `ui_module.hpp/.cpp` now retain immediately observable shadow state while deferring
+Vulkan dynamic-state commands only when `overlayMode == NONE`. Existing main/FBO/diagram entry
+synchronization is retained and NONE-to-POST emits complete state. Active-pass setters still record
+immediately. Actual callbacks, including callback-internal draws, JNI guards and exception restore
+remain intact; no shader, ABI, face semantics, camera culling, resource lifetime or queue changes.
+Restart-only `MCVR_IDLE_UI_STATE=0` retains eager recording as the same-artifact reference.
+
+RelWithDebInfo INSTALL and paired distribution verification pass. Seven targeted CTests pass
+(framebuffer contract/GPU, JNI coverage, FG UI GPU, material-faces CPU/GPU, diagram-surface GPU).
+The external Audit's real Minecraft framebuffer probe additionally exercises production UIModule
+state, callback drawing, captured face flags, exception restoration, fractional blend, depth,
+scissor and color-mask behavior across resource reload. The isolated edit/Sable/reload case also
+passes with chunk-source verification and normal save/exit; no general pixel-parity claim follows.
+
+At 3840x2054/16 chunks on the same artifact, static optimized/reference/optimized real intervals
+are 47.046/49.789/46.076 ms; moving optimized/reference are 48.462/51.299 ms (5.5% reduction).
+Face capture is 5.53-5.60 vs 7.11 ms static. Geometry volume stays similar and static GPU duration
+remains 27.2-27.6 ms; no memory or universal-performance improvement is claimed. See the paired
+[Radiance ledger](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-25--defer-idle-raster-commands-during-real-material-state-capture)
+for distributions, scene conditions, source snapshots, reference pixels and deployment boundaries.
+
+Compiled source/headers, build inputs, matching PDB and machine evidence are retained under the
+non-portable Radiance `run/submission-opt-20260925/evidence/candidate/`. Native DLL SHA-256 is
+`FB2760E8D299C65A7F553837DAA1D133E2B56277AEF001342D2E94EFA443A7E6`; the JAR is
+`AB94FD035B83E454B35C1FAD189DFED0C7C49E9A637F044FA0E0DB25AFDCC672`. Later documentation-only
+updates do not change binary identity. No staging/commit/amend/push/public release. Historical
+GPU-loss and public-redistribution gates remain open; renderer correctness is only established
+for the explicitly exercised paths, not every third-party callback or PT configuration.
+
+The eager production-state reference also passes the full isolated update case. Its three FBO
+readbacks are byte-identical to all three optimized outputs, including after resource reload.
+Create configuration and Ponder raster forward/back switching with background blur survive the
+bounded GUI check and normal exit. Nine final-artifact processes retain individual evidence; this
+is not complete image equivalence or long-term stability. The matched Radiance/Audit artifacts are
+deployed to the authorized Prism mods directory only; no automatic Prism run, settings/world
+changes or Git operations. Final source changes after the compiled snapshot are documentation only.
+
+## 2026-09-25 Persistent rigid baked-model resources and instance submission
+
+Status: implemented, build-verified, automated-verified and bounded runtime-observed; prototype
+disabled by default in Java. Evidence: source, behavioral CPU/GPU tests and isolated city runs.
+Applies to the worktree above `ead8d47d80ad2bc9cf81740c29f0ec230b61f92f`; incoming dirty work is
+preserved. The [paired Radiance entry](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-25-persistent-rigid-baked-model-prototype-and-producer-attribution)
+owns producer selection, Java contracts, paired artifacts, measurements and manual observation limits.
+
+The actual city census selected ordinary rigid baked-model bulk quads. `Entities::queueRigidModel`
+now retains local model buffers and BLAS under resource/world generations; per-frame instances hold
+their own transform, world origin, masks and history while sharing immutable geometry. The JNI
+entry uses the existing failure boundary and world guard. No scene visibility removal or AS refit
+for arbitrary geometry is introduced. This is a narrow resource path, not a global persistent SBT,
+scene table, render-origin or allocator migration.
+
+The production `RigidBuildLifecycle` separates pending, recorded and submitted builds: failed or
+abandoned recording does not become a usable submitted BLAS. Both normal and readback submission
+paths commit only after queue submission succeeds. Cache eviction/invalidation preserves actual
+in-flight references through existing frame retirement and shared build resources; it does not wait
+for global GPU idle. Native face variants are bounded to 1,024 cached entries, with explicit fallback.
+History uses the Java owner/draw-count/ordinal identity and matching local model identity; arbitrary
+same-count semantic draw reordering remains outside the proven correspondence contract.
+
+Moving scale into instances exposed a direct LOD mismatch. The shared ray-cone helper now transforms
+triangle edges into the cone's world coordinate space, used by the directly related default,
+no-height, no-reflect and text paths in both PT pipelines. Source tests alone are not the evidence:
+a Vulkan compute test exercises 263,168 scale/mirror/rotation/nonuniform/degenerate-UV cases.
+This correction affects other transformed users of the helper and is present in both timing variants.
+It is not credited as a persistence speedup or complete image-equivalence proof.
+
+RelWithDebInfo build/INSTALL, shader compilation and paired JNI/package checks pass. The native
+suite first passed 61/63; two supplemental source checks needed the new LOD helper spelling. Their
+targeted 2/2 retest passed, with GPU tests already successful. The new build-lifecycle behavior test
+covers failed record, abandonment, successful submit and repeat frames. Nonblocking GPU timestamps
+for entity BLAS and TLAS use retired frame queries; no per-frame readback wait was introduced.
+
+Compiled/final product evidence: Radiance `run/model-persistence-20260925/evidence/prototype-6/`
+(non-portable local location), containing both source archives, raw/normalized file hashes, dependency
+identities, embedded shader hashes and matching symbols. DLL SHA-256:
+`B015D09C3E8306038BC126EC50A3A412C1B6C3AD882F3311D04110333BBAD5A6`;
+PDB: `2738513119D22A58F685FB68A7529E9196A7BEC19EB8255AA471CBE5542FC8B9`.
+The final Java/Audit lifecycle case PID 96068 passes eight actual client-delivery/reload stages in
+133.49 seconds, saves every dimension and exits normally. CPU mesh reconstruction agrees with the
+reference, but reflection/shadow/motion output, live cross-dimension change, all third-party models,
+other GPUs and long-duration behavior are not thereby accepted. Historical GPU-loss root cause
+and public runtime redistribution remain open. No staging, commit, amend, push or public release.
+
+The user subsequently reports no apparent issue in the deployed Prism prototype. The
+[bounded feedback record](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-25-bounded-prism-visual-feedback-for-persistent-models)
+retains PID 44340, matching extracted DLL, resource reload, saved dimensions and client/Audit
+shutdown observations. It does not independently certify every GPU output, native close internals,
+long-duration stability or the historical device-loss root cause. Native source and artifact are
+unchanged; no Git operation or rebuild accompanies this feedback.
+
+## 2026-09-25 Screen-effect audit and unresolved Veil underwater output
+
+Superseded symptom report: see the [user retest correction below](#2026-09-25-veil-underwater-retest-correction-and-deferred-work).
+
+Status: investigating. Evidence: source inspection and user-reported visual failure, not a new
+native/GPU test or reproduced failure. Applies to the dirty worktree above
+`ead8d47d80ad2bc9cf81740c29f0ec230b61f92f`; no native source or artifact changes in this step.
+
+The [paired Radiance record](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-25-screen-effect-static-audit-and-missed-veil-underwater-overlay)
+owns the findings and correction: the user sees Veil's underwater texture missing, which the static
+audit missed despite finding the Java/native capture path. Successful recording does not prove the
+same frame's texture, descriptors, uniforms and HDR/final composition produce a visible overlay.
+Root cause, process identity and affected configurations remain unconfirmed. Existing bounded
+persistent-model visual feedback does not close this defect.
+
+The same audit found unused PT lightmap-effect strengths and incomplete air/status-effect fog
+selection in both PT shaders; declared fields and preserved Java producers are not end-to-end
+support. Veil first-person post cancellation and generic shader-adapter restrictions are separate
+compatibility boundaries, not established causes of the underwater symptom. Preserve historical
+observations and use final-frame evidence for future closure. No tests, build, deployment, staging,
+commit, amend or push were performed while recording this correction.
+
+## 2026-09-25 Veil underwater retest correction and deferred work
+
+Status: superseded for the missing-texture report; deferred for future visual work. Evidence:
+user visual retest and bounded source inspection; no new native/GPU run or product modification.
+The dirty native worktree above `ead8d47d80ad2bc9cf81740c29f0ec230b61f92f` is preserved.
+
+The user confirms the underwater texture exists and is merely very faint in some scenes. No
+disappearance defect or native fix was established; do not increase opacity from this report or
+claim measured alpha/HDR parity. The
+[paired correction](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-25-veil-underwater-report-retracted-and-two-deferred-visual-tasks)
+retains the earlier mistaken report, directed inspection and remaining evidence boundary.
+
+The user also requests deferred labPBR grazing-angle black correction with Sundial as a reference,
+and a vanilla-cloud rewrite. Radiance's existing roadmap/research own these cross-repository items;
+neither is implemented here and the cloud work is not limited to the previous fog proposal.
+No native source, shader, test, artifact or deployment changed; no build, staging, commit, amend
+or push accompanied this documentation update.
+
+## 2026-09-25 ModelPart producer experiment with unchanged native backend
+
+Status: bounded automated/GPU/runtime evidence; no newly proven net speedup or visual acceptance.
+The existing dirty native source above `ead8d47d80ad2bc9cf81740c29f0ec230b61f92f` is unchanged by this
+batch. Radiance adds an opt-in local ModelPart producer and reuses the existing rigid-model queue,
+model identity, transform, face rules, shared BLAS and frame-retirement interfaces. No native API,
+shader, scene-table, scheduling, PTLAS or SER work was added. Its current part cache and prior baked
+cache each have independent CPU bounds; both feed the shared native 1,024-variant bound.
+
+See the [paired implementation and evidence](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-25-bounded-modelpart-persistence-experiment).
+The native CTest subset actually executed this round is 5/5: entity-conversion GPU, material-faces
+CPU/GPU, rigid-model GPU math and rigid-build-lifecycle. This is not another complete native-suite
+run or proof of complete PT temporal/visual parity. Matching core.dll remains
+`B015D09C3E8306038BC126EC50A3A412C1B6C3AD882F3311D04110333BBAD5A6`, RelWithDebInfo, with PDB
+`2738513119D22A58F685FB68A7529E9196A7BEC19EB8255AA471CBE5542FC8B9`; packaged and loaded hashes match.
+
+Two static and two route processes per side show no useful net gain: mean 44.47 to 44.77 ms static,
+46.94 to 47.58 ms route. Static dynamic vertices roughly halve, but rigid instances rise 490 to 2,278,
+TLAS instances 9,499 to 11,163; entity BLAS GPU improves 1.107 to 0.928 ms while native entity metadata
+rises 1.648 to 2.347 ms and rigid queue 0.182 to 0.720 ms. Main-queue timing excludes other queues/SDK
+work and cannot be added to CPU scopes. Steady rigid models build zero new BLAS in complete captures,
+yet this does not eliminate per-instance organization. Do not promote or broaden the part prototype
+from vertex-count reduction alone. Preserve the prior baked-model prototype's separate evidence.
+
+The Java-only follow-up releases recipes on disconnect/close and bounds per-part layer identities.
+It never replaces native GPU retirement with early CPU destruction. The first lifecycle probe had a
+diagnostic disconnect-sequence/reentrancy failure (forced end of a disposable process, not a GPU-loss
+finding); the corrected probe is separately retested and documented. Its final runtime, old timed
+artifact and earlier visual feedback remain distinct. Historical GPU-loss and licensing are open.
+No staging, commit, amend, push, Prism modification or public binary distribution occurred.
+
+The paired final Java package also makes the new part-only provider maps lazy, so retaining a
+normally disabled experiment does not allocate those maps for unrelated providers. This does not
+change the native binary or turn the earlier negative timed result into a performance success;
+final Java artifact/runtime identities are recorded in the Radiance ledger.
+
+## 2026-09-25: Split the non-performance source checkpoint
+
+Status: source separation verified; paired build/automated gates passed within the limits below.
+Evidence: candidate trees, complete file hashes, isolated Java/Audit build and test output.
+Applies to the split above native `ead8d47d80ad2bc9cf81740c29f0ec230b61f92f` and Radiance
+`6e9b97a53049fad833e673da647ac517efde5fe3`; historical run dates/artifacts are unchanged.
+
+The user authorizes amending only the diagram/visual investigation records into native
+`Initial port`. All 61 modified/new native source, shader, test and diagnostic files, together
+with their performance ledger entries, remain uncommitted for the separately authorized later
+`Performance Optimization Test V1` checkpoint. No native product, dependency or build input is
+changed in this amendment. The original author/committer identity, both dates/time zones,
+message and upstream parent are retained, with a fresh SSH signature.
+
+The isolated paired source is checked against the archived diagram handoff. Its Java gates
+report GAME 196 passed / 1 GPU-harness case skipped, bootstrap 10 passed / 2 GPU cases skipped,
+Audit 9 passed, and the separately built original Audit native collector 1/1 passed.
+Distribution contents and the distinct Maven development artifact are verified; the public binary
+gate rejects redistribution as expected. Native MCVR is not rebuilt or retested in this
+source-unchanged step. Reused DLL identity is the original diagram `ABDA7889AF78F8C6F7FF7B3B897D53619580C1D1FABFE395C36D4246BBD17FB6`.
+
+Non-portable operation evidence: `D:/Workspaces/Artifacts/RadianceCommitSplit/20260925/`, including
+candidate diffs, raw working-file hashes, normalized initial-product manifests and test XML/logs.
+The first isolated packaging check ran before runtime copying completed and reported a missing
+DLSS DLL; after complete hash-verified extraction, package/Maven checks pass. No product bypass
+was added. No client is run or deployment changed. Prior GPU loss, diagram visual limits and
+vendor redistribution conditions remain open. The paired Radiance ledger owns the one-way
+native commit reference; there is no reciprocal new Radiance SHA backfill.
+
+## 2026-09-25: Performance Optimization Test V1 source checkpoint
+
+Status: user-authorized additional performance commit; existing verification evidence retained.
+Applies above native Initial port `3e19fa36ea2f0053b0a0404df1cfc05ce034b361`.
+This completes the performance side of the preceding subject split without rewriting Initial port.
+The checkpoint includes host preparation, sampler publication, owned staging, GPU conversion,
+published-chunk metadata, deferred raster commands, persistent model resources, profiling and
+their correctness regressions. The paired ModelPart experiment remains default-off with its
+negative timing result; this checkpoint does not promote it or claim an additional speedup.
+
+All source, shader, test and build inputs match the normalized candidate-4 source manifest at
+`Radiance/run/model-parts-20260925/evidence/candidate-4/MANIFEST.json`; only subsequent maintenance
+records differ. Its DLL remains `B015D09C3E8306038BC126EC50A3A412C1B6C3AD882F3311D04110333BBAD5A6`.
+The previously executed native 5/5 subset and paired Java/runtime records above retain their actual
+scope and dates. No native build, GPU test or client run is repeated for this source-only checkpoint.
+Candidate file lists, snapshot/artifact checks and complete staged diffs are recorded outside Git at
+`D:/Workspaces/Artifacts/RadiancePerformanceV1/20260925/`. No generated artifacts enter the commit.
+GPU-loss cause, wider temporal/visual acceptance and public binary licensing remain open. The
+paired Radiance ledger records the new native commit in one direction only; no push is authorized
+in this checkpoint operation.
+
+## 2026-09-25: Full-scene PT optimization impact assessment
+
+Status: proposed; static inspection only, no native source/build/runtime change. Snapshot
+`265d822e315cd10b864beb49ac5e89dfa0acca20` paired with Radiance
+`ebd5038c1e55e06041946f6b5215f589bd496447`. The user requires complete scene geometry and existing
+physical rendering semantics without post-raster world substitution. See the
+[canonical impact and implementation plan](../../Radiance/docs/research/RENDER_CALL_INVENTORY_AND_BENCHMARKS.md#2026-09-25-full-scene-pt-optimization-impact-and-implementation-plan).
+
+Confirmed local seams: `Entities::queueBuild` copies eligible PBR input into owned words, then
+`EntityGpuConversion` copies it into staging; ownership cannot simply be borrowed because Java
+closes its source on return. The 128-byte ABI is asserted and used by CPU/GPU conversion. Current
+device creation does not enable indirect trace dispatch, and Advanced uses launch coordinates for
+pixel identity and initialization. Proposed batches preserve input precision, original shader
+semantics, in-flight retirement and sticky-fatal cleanup. No copying, dispatch, ABI or feature code
+was changed. No new tests, performance benefit or visual equivalence are claimed by this entry.
+
+## 2026-09-25: Direct staging input and compact PBR source experiment
+
+Status: implemented, build/automated/GPU verified, bounded runtime-observed; no broad visual or
+long-duration acceptance. Worktree baseline is `265d822e315cd10b864beb49ac5e89dfa0acca20`, paired
+with Radiance `ebd5038c1e55e06041946f6b5215f589bd496447`. The Java side selects direct input by
+default after measurement; the compact producer remains opt-in. See the
+[canonical implementation, artifacts and measurements](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-25-direct-native-input-and-lossless-source-format-experiment).
+
+`queueBuildSourcesV1` validates version and exact signed byte lengths/strides before consumption.
+`Entities::queueBuild` captures eligible input directly into a native-owned staging buffer before
+return, then atomically appends prepared data. Existing copy fallback remains when the global
+64 MiB direct-payload reservation or storage limits cannot admit a submission. Prepared data never
+retains caller spans after return. Input owners are noncopyable shared resources; conversion groups
+retain their reservation, input, jobs and immutable descriptor tables through the frame retainer.
+The order of global output/geometry offsets is computed before grouping; each unique group uploads
+once. No Java lease registry, worker callback, forced GPU idle or world-raster substitution was added.
+
+Format 13 is a versioned 100-byte source with all floating-point/integer payloads unchanged and only
+discrete modes combined. Mixed input jobs retain their own 25/32-word stride/version. CPU fallback
+decodes compact input into canonical PBR; the final position/material/index ABI is unchanged.
+The private GPU source contract trusts the paired Java producer's zero reserved flag bits; it is
+not a general untrusted binary-input API. Full geometry/material/face/history semantics remain.
+
+RelWithDebInfo INSTALL, complete CTest 65/65 and paired distribution checks passed. Follow-up
+tests-only changes reran the affected fixtures. The GPU fixture uses mixed formats and source groups
+with reordered dispatch and preserved output offsets, output guards and AS construction; it also
+accepted the six actual Java producer records as a separate invocation. Full source/payload bit
+comparison is not final visual acceptance. The initial new fixture's wrong tile-count expectation
+and missing include path were corrected, with failed logs retained; no client device loss occurred.
+
+Core SHA-256 remains `350B5D3E18ABB25EB3C57BF7E9672F10B635AB274A52D46FC58525A5CE6D13B1`.
+Matching PDB is `5D23797CA6E063A0ECBC06AD6E3DBE13BB184D049FCA6068769D524D57035E36`.
+Fifteen same-artifact formal samples observed direct frame-time reductions of 4.77% in model city
+and 6.31% in the Create/Sable factory. Adding compact input reduced source bytes 21.875% in the
+instrumented model case but was slower than direct alone; it is not adopted by default. GPU copy,
+Java generation and descriptor costs are not inferred from byte counts alone. Third-batch ray
+queues remain assessment-only pending per-pass/active-work/CPU-wait evidence. Historical GPU-loss
+root cause, broader runtime/visual coverage and public runtime licensing remain open.
+
+Non-portable evidence root:
+`D:/Workspaces/Repositories/GitHub/RecRivenVI/Radiance/run/fullscene-input-20260925/`.
+No staging, commit, amendment, push, tag or public binary release was performed.
+
+## 2026-09-26: Performance Optimization Test V2 source checkpoint
+
+Status: candidate organized; source and retained verification identities checked, without new
+native changes/builds/runtime tests. All files matched the paired final manifest under Radiance
+`run/fullscene-input-20260925/` before this documentation entry. The native candidate includes
+SourcesV1 bounds validation, native-owned direct staging and immutable grouped conversion, the
+100-byte experimental source decoder/shader path, regression fixtures and their evidence records.
+The existing default-direct/default-off-compact selection and acceptance limits are unchanged.
+
+User authorized a new SSH-signed `Performance Optimization Test V2` checkpoint above
+`265d822e315cd10b864beb49ac5e89dfa0acca20`, preserving both V1 and original upstream/port history.
+Use configured identity and actual commit time. Radiance records the new native SHA in one
+direction after native creation. Generated/runtime binaries, PDBs, build caches and evidence
+remain excluded; no push, tag, binary publication, history rewrite or redundant backup is needed.
+Signature/candidate evidence is retained at
+`D:/Workspaces/Artifacts/RadiancePerformanceV2/20260926/` (non-portable).
+
+## 2026-09-27: Spring visual boundary and V2 artifact research index
+
+Status: static-reviewed plus bounded GPU/runtime failure observation; no native source, shader,
+ABI or build change in this worktree. Evidence: Simulated 1.3.2 source/material inspection,
+MCVR V2 source tracing and isolated spring diagram client logs/FBOs. Applies to MCVR
+`91301b6eecd5ccf1932de08d38df3673bb2a3664` paired with the Radiance worktree above
+`a39db18f68b95ddea7d67e5c25e48aa2d0c3e3d5`.
+
+The 2026-09-27 spring diagram sampler repair is Java-side Veil raster translation in Radiance;
+MCVR's world-PT spring path instead receives PBR vertices with the original 0.1 texture-cutout
+mode, stress as a separate surface-color mix, and the captured render-layer face flags. A twisted
+spring's dark/interior appearance has no diagnosed native cause or matched GL/PT image yet. The
+[Radiance spring investigation](../../Radiance/docs/research/RASTER_PARITY_AND_PONDER_RETIREMENT.md#2026-09-27-spring-material-provenance-and-s2-sampler-translation)
+owns the producer/view matrix and bounded runtime gates; this entry does not mark S1 or S2
+visually resolved. In the matched diagnostic run, the loaded `core.dll` SHA-256 was
+`350B5D3E18ABB25EB3C57BF7E9672F10B635AB274A52D46FC58525A5CE6D13B1` with retained
+PDB `5D23797CA6E063A0ECBC06AD6E3DBE13BB184D049FCA6068769D524D57035E36`.
+The first explicit client error was `vkWaitForFences(frame)` returning Vulkan `-4` on acquisition
+after resource reload; shutdown retained `VK_ERROR_DEVICE_LOST`. The missing spring in an earlier
+FBO, Java sampler IDs and draw API return do not identify the native fault or prove GPU draw
+completion. Windows driver Event 153 timing is correlation only. No further GPU test was run
+after this loss; the Radiance ledger retains exact run identities and exit boundaries.
+
+The three read-only upstream-performance scouts compared the V2 native/Java artifact boundaries
+without new timing or implementation. Their [canonical research index](../../Radiance/docs/research/RENDER_CALL_INVENTORY_AND_BENCHMARKS.md#2026-09-27-three-scout-v2-artifact-comparison)
+records observations and conditional measurement gates. No native optimization, CTest result,
+GPU result or cross-path visual acceptance is inferred from the static comparison.
+
+## 2026-09-27: Read-only diagnosis of the latest Prism diagram device loss
+
+Status: runtime failure observed, native root cause unconfirmed; no native source/build/test change.
+The user reports opening or operating a structure diagram before the 15:26:40 Prism crash report.
+Radiance's [incident record](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-27-prism-diagram-device-loss-at-1526)
+owns the full package/configuration/timeline evidence. The deployed JAR embeds the existing V2
+core `350B5D3E18ABB25EB3C57BF7E9672F10B635AB274A52D46FC58525A5CE6D13B1`; actual loaded-module
+path/hash is not captured for this process.
+
+The first saved native origin is `vkQueueSubmit(CommandBuffer::individual)` returning `-4`.
+JNI later exposes it as sticky fatal during `Submit frame`. This differs from the earlier isolated
+spring process's frame-fence detection, without establishing different or identical GPU causes.
+The user action and first DiagramScreen class loading shortly before Windows Event 153 narrow the
+context. Diagram coverage FBO readback reaches the matching helper, but all seven direct callers
+share its label, including queued texture upload at normal frame submission. The existing logs
+cannot identify the caller or earlier offending GPU workload.
+
+The targeted readback review checked source/output format strides, four-byte RGBA conversion,
+region validation, UI/command-buffer flush, same-main-queue ordering, fence wait/invalidation,
+layout barriers and local resource ownership. No definite static violation was found in that
+bounded chain. Global queue-host synchronization and the real invocation remain unproven.
+Server all-dimension saving and the native-close call's returned retained-loss status are recorded;
+they do not prove clean GPU completion. No new reproduction, CTest/GPU test, fault injection,
+product modification or deployment followed this read-only investigation.
+
+## 2026-09-27: Spring source-normal PT lowering and transient overlay usage repair
+
+Status: native implementation and bounded tests passed; paired Radiance owns the flexible-spring
+producer, generic shader-layout correction and menu/diagram/world gate. No MCVR optimization
+or unrelated ray-integrator rewrite was added. Earlier Prism and isolated device-loss diagnoses
+remain unresolved; the new successful short runs do not prove a fix for those failures.
+
+The source-grounded spring world policy sets legacy `useNorm==2` and a previously unused packed
+material bit 7 without changing 100/128-byte source or native material-vertex ABIs. CPU and
+GPU conversion preserve the original source normal after the required inverse-transpose,
+finite/zero fallback and geometric-normal hemisphere orientation as the BRDF base. The triangle
+cross normal remains authoritative for culling, hit/shadow side, ray offset and medium boundary.
+PBR normal maps still apply once. Advanced direct-light cache stores the already-oriented
+pre-normal-map BRDF base in its tagged cache6/7 spare lanes while preserving cache3 geometric
+normal and all ordinary untagged material bytes. `useNorm==2` with compact or glint/overlay
+source is rejected by its current Java/CPU producer contract; the GPU converter trusts that
+validated producer and is not an arbitrary malformed-buffer validator.
+
+The independent transient overlay buffer defect is in `Buffers::initializeBuffer`: numeric IDs
+restart each frame, but same-capacity reuse previously ignored requested Vulkan usage.
+`DeviceLocalBuffer` does not add VERTEX/INDEX automatically. A slot switching from vertex to
+index could therefore be rebound illegally even with sufficient capacity. The new local
+`ensureOverlayBuffer` policy recreates when usage is missing, unions existing/requested flags
+to prevent role-alternation thrash and sends the previous buffer to the existing in-flight
+frame retainer. Its CPU behavior test covers same-capacity role switch, subsequent reuse,
+growth and old-buffer lifetime; it does not identify the earlier S2 or device-loss cause.
+
+Evidence: the paired [Radiance research record](../../Radiance/docs/research/RASTER_PARITY_AND_PONDER_RETIREMENT.md#2026-09-27-spring-retranslation--uniform-layout-cause-and-bounded-runtime-gates)
+and non-portable `Radiance/run/spring-retranslation-20260927/`. Actual package main
+`29EC184B8D83378B430B315A7C8DF122DA3959BB5A904A62AB6A3B570B804A1C` embeds
+Release core `7EA31C6151C3ECF82C371CA33A19C185484998827A6E8D16979383EA31DD9E46`.
+There is no matching Release PDB; old RelWithDebInfo symbols must not be associated with it.
+The JAR/runtime default vanilla pack zip is
+`59E7CEA5ED6FFBCD081C8083F17A56B83DC850BD49AA61F1EC63D38BE4A773D1`;
+Advanced is `E7AABB84B89BE9463AE28E9251B4FE84404DC48A67D8F2EC43EC97855641C3CE`.
+Older standalone ZIP containers in superseded candidates have different hashes but identical
+110/145 member payloads.
+
+Validation includes CPU entity packing, material faces, world-mesh and overlay-buffer-reuse
+contracts; 11 compiled vanilla/advanced entry shaders; bounded GPU direct/deferred entity
+conversion and source-normal/cache helper cases. The latter synthetic normal-map formula is
+not a full production `surface_eval` proof. Radiance's actual ordinary-world run then counted
+589 completed spring PBR batches / 113,088 vertices, all with source-normal mode 2, low cutout
+and stress surface mix, and captured a visible spring in the active default vanilla PT pack.
+That static original-BE fixture does not validate a player-created dynamic Sable connection,
+arbitrary twist/stress, torsion's separate baked model, or long-term native stability.
+No Git staging/commit/push/tag, Prism deployment or public binary publication was performed.
+
+## 2026-09-27: Paired Prism file handoff after the bounded spring gates
+
+Root subsequently deployed Radiance main
+`29EC184B8D83378B430B315A7C8DF122DA3959BB5A904A62AB6A3B570B804A1C` and Audit
+`746CCD5941CC27DDD3D7ABEC11CB01E0BE74B56EE97B26FCCF0845B998B568FB` to the existing
+Prism instance and verified destination hashes. The main JAR embeds this worktree's Release
+core `7EA31C6151C3ECF82C371CA33A19C185484998827A6E8D16979383EA31DD9E46`; the instance
+was not launched, so no Prism actual-loaded native-module or new gameplay result exists. The
+older paired JARs were already preserved and verified; no new backup or native rebuild was
+performed. See the [Radiance deployment record](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-27-prism-file-deployment-of-the-spring-retranslation-pair)
+and non-portable `Radiance/run/spring-retranslation-20260927/final/PRISM_DEPLOYMENT.json`.
+The tested 79-file source snapshot precedes this documentation-only deployment entry.
+Historical device loss, dynamic physics/torsion visual judgment and long stability remain open.
+
+### Post-deployment headless spring raster fixture source check
+
+The current `tests/spring_raster_gpu_test.cpp` (including the positive-control draw) compiled
+with its RenderDoc option explicitly OFF and empty include path. One bounded run using the
+previously saved corrected spring shader/mesh/texture/uniform inputs completed Vulkan submit,
+fence and color/depth readback: 210 positive-control pixels and spring ROI 552/550/550.
+The 1,724 spring pixels matched the earlier corrected executable in RGBA and depth exactly,
+and the original GL spring pixels in RGBA exactly. Evidence is retained under
+`Radiance/run/spring-retranslation-20260927/validation/spring-raster-gpu-current-1/` with an
+input/executable identity manifest. This closes the current **test-source** coverage gap only;
+the two already deployed JAR hashes and native core were not rebuilt or replaced.
+
+## 2026-09-27: Paired user diagram acceptance and open spring twisting failure
+
+Status: user visual acceptance for spring cutout and stress coloration in the structure
+diagram only; twisting/black-through appearance failed visual acceptance. The unchanged paired
+main JAR embeds core `7EA31C6151C3ECF82C371CA33A19C185484998827A6E8D16979383EA31DD9E46`.
+See the authoritative [Radiance feedback record](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-27-user-spring-diagram-acceptance-and-failed-twisting-appearance)
+for deployed identities and evidence limits. No new native build, GPU run or runtime-module
+fingerprint was collected in this recording step. The earlier bounded source-normal/cache and
+static-world results remain valid for their tested cases, but do not establish correctness of
+the rejected twisted pose. No new geometric, culling or lighting cause has been established;
+do not conflate this report with torsion's authored dark texture or close historical device loss.
+
+## 2026-09-27: Material tint standard and one-sided PT reassessment
+
+Status: source/specification review; bounded automated and GPU verification. Applies to MCVR
+`91301b6eecd5ccf1932de08d38df3673bb2a3664` plus the retained spring-retranslation worktree,
+paired with Radiance `a39db18f68b95ddea7d67e5c25e48aa2d0c3e3d5` plus its retained worktree.
+The [Radiance decision](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-27-standard-material-tint-and-global-face-policy-reassessment)
+defines material-input recoloring as the common standard without changing source strength,
+animation, opacity or genuine emission. Diagram user acceptance remains scoped; spring twisting
+black/inside-through is a failed global geometry/material/PT investigation, not a spring-only
+exception and not a proven device/culling cause.
+
+Root rebuilt the existing Release `mcvr_material_faces_test` and `mcvr_material_faces_gpu_test`
+targets this turn. CTest passed 2/2: 512 CPU material combinations and 40 actual Vulkan ray-query
+cases covering mixed opaque/double-sided geometry, uniform hardware culling, front/back/both
+rejection, clockwise winding and mirrored instances. This tests the real native face helper and
+GLSL predicate with GPU traversal, not every production SBT path or the user's rejected pose.
+Non-portable evidence:
+`D:/Workspaces/Artifacts/RadianceSpringRetranslation/20260927/surface-tint/face-policy-ctest.log`.
+No face-policy rewrite or new client run accompanied this verification; the
+[assessment](../../Radiance/docs/research/PT_VISUAL_AND_PERFORMANCE_INVESTIGATIONS.md#2026-09-27-global-one-sided-surface-and-warped-quad-reassessment)
+separates legal per-ray sidedness, full-scene residency and physical mesh limitations.
+
+### UV1 recoloring in the translucent emissive hit group
+
+Confirmed source defect: the original `entity_translucent_emissive` RenderType enables OVERLAY
+and its shaders apply UV1 recoloring, but both PT `transparent_only.rchit` implementations
+ignored it. The two shaders now conditionally read the existing WorldUBO overlay texture
+(set 2/binding 0) and use `surface_overlay.glsl::applySurfaceMaterialColor`: ordinary vertex
+multiply or stress mix first, then UV1 inverse-alpha mix. Opacity, existing emission factors,
+temporal outputs and face rules are preserved. No normal/culling workaround was introduced.
+
+This turn: two actual closest-hit files compiled for Vulkan 1.4 and passed SPIR-V validation;
+their conditional overlay binding/fetch was inspected. The shared production color function
+ran in `mcvr.spring-material-gpu` (1/1 pass, actual submit/fence/readback), with hurt, white,
+no-overlay and color-operation-order cases. Radiance's four targeted classes passed 24 tests.
+See `Radiance/run/surface-tint-20260927/EVIDENCE.md` (local, ignored) and the
+[paired source audit](../../Radiance/docs/research/RASTER_PARITY_AND_PONDER_RETIREMENT.md#2026-09-27-material-recoloring-standard-and-focused-source-recheck).
+The complete closest-hit resource/descriptor path and world animation were not GPU/client-tested
+this turn; no core/JAR rebuild or Prism deployment occurred. Prior artifacts do not contain this
+source correction. The generic Flywheel cutoff/filtering discrepancies found in the fan audit
+remain a separate recorded follow-up, not a fan-specific implementation or a face-policy repair.
+
+## 2026-09-27: Physical-direction contract audit of one-sided transport
+
+Status: static audit and bounded CPU failure demonstration; no source repair, native product
+rebuild or new GPU/runtime acceptance. The user's physical-light-incidence rule supersedes the
+inference that query-facing consistency alone establishes correct single-sided light transport.
+See the [paired audit](../../Radiance/docs/research/PT_VISUAL_AND_PERFORMANCE_INVESTIGATIONS.md#2026-09-27-audit-against-the-absolute-physical-light-direction-contract).
+
+Root inventoried 20 production trace callsites in 15 shader files and 20 face-checking any-hit
+files; no production ray query was found. Reverse visibility toward celestial/area lights and
+from volumetric/cloud receivers uses the same query-front acceptance as camera candidates.
+The new standalone Release executable calls the current `material_faces.hpp` predicate and
+demonstrates 8/12 disagreements against the same physical segment's forward semantics; all
+single-sided combinations disagree, while symmetric controls agree. The prior 40 GPU rays
+validated query-facing behavior, not this physical-direction contract.
+
+Additional source findings: `ModelRules::shaderFlags` removes uniform face metadata after TLAS
+lowering, sampled emission records omit source-sidedness, and ordinary closest-hit/opaque-BSDF
+continuation has no distinct one-way null-transmission contract. The legacy entity TRIANGLE_STRIP
+fallback changes diagonal/attributes and has an odd-count out-of-range read; explicit-index
+WorldMeshSink triangulation is separate and correct for this case. No unsafe input was submitted
+to a real renderer. Spring QUADS are not that strip branch, and no spring/GPU-loss causality is
+claimed.
+
+Local evidence: `D:/Workspaces/Artifacts/RadianceSingleSidedAudit/20260927/` (non-portable), with
+the audit source/executable, exact production-header hash, callsite inventory and scope manifest.
+Required repair scope and exclusions are in the paired audit/roadmap. No buffers, descriptors,
+pipelines, ray flags, integrators or deployed binaries were modified in this review; no Git
+staging/commit/push occurred.
+
+## 2026-09-27: Native visual checkpoint and deferred physical-sided redesign
+
+The user authorized placing accumulated uncommitted native visual/diagnostic/test work into
+`Initial port` while retaining and replaying the existing V1/V2 checkpoints. Metadata and SSH
+signatures must follow the paired maintenance policy; the final reviewed source content must
+survive the rewrite. The full one-sided physical-direction correction is recorded but deferred,
+including the discovered strip topology/bounds issue. Existing tint shader/helper checks do
+not constitute full runtime acceptance, and spring twisting/GPU-loss findings remain open.
+The next authorized investigation is shared high-distance scene work and chunk publication
+latency, not the deferred transport redesign. No public binary permission is implied.
+
+## 2026-09-28: Persistent write batches remove the measured empty-world CPU sweep
+
+Status: implemented, automated-verified and bounded runtime-measured; final overlap validation
+continues. This is later performance work, outside the previously frozen visual Git candidate.
+See [Radiance's measurement record](../../Radiance/docs/research/RENDER_CALL_INVENTORY_AND_BENCHMARKS.md#2026-09-28-measured-high-distance-fixed-cost-in-persistent-buffer-bookkeeping).
+
+Profiling attributed about19.2ms at r32 to resetting every persistent buffer record each
+`performQueuedUpload`, with1,419,613 records but little upload work. The production
+`PersistentWriteBatch` ticket and shared range-staging helper replace normal closure with O(1)
+invalidation. Rollover explicitly clears stale tickets. The buffer owner, copied prior bytes,
+frame retainer and barrier/submission order stay intact; a framework owner is held across
+replacement allocation and retirement. Native68/68 tests passed before follow-up diagnostics.
+
+The matched r32 A/B/B/A means are25.2702/7.8038/7.8117/25.6107ms on the documented all-air
+scene. These are real rendered intervals, not FG rates or a universal speed multiplier.
+Follow-up diagnostics suppress never-present empty trace noise and avoid snapshot allocation
+in the ready-count query. A default-off `RADIANCE_AUDIT_REFERENCE_BUFFER_SWEEP=1` repeats the
+old linear bookkeeping on the same new binary for controlled comparisons; it changes neither
+quality nor GPU lifetime. Its activation is logged and restricted by the isolated launcher.
+Final follow-up results/identity remain separate from the earlier formal JAR pair.
+
+No culling, single-sided transport, scheduler fairness, generation or resource-retirement
+contract was weakened. No public binary release or Prism deployment occurred. Existing visual
+failures, old GPU-loss causes and publication-license conditions remain open.
+
+### Final bounded validation and artifact identity
+
+After the diagnostic follow-up, native CTest again passed 68/68. The final normal r32 run
+averaged 7.807 ms over 3200 frames and saved/exited. The same-binary reference/normal overlap
+pair completed 24 client/server actions per side with zero dropped trace events; five matching
+surviving busy-window updates had medians 96.58/44.13 ms to a GPU-completed referencing frame.
+Coalesced initial and superseded intermediate revisions remain explicit. F3+A returned to
+80 ready sections in about 1207/899 ms; no pure GPU-build or final displayed-pixel latency is
+inferred from fence observation/polling. See the paired research for the separately pinned
+old-artifact formal matrix and full-process NVML observations.
+
+Final core SHA-256 `627666CCE7DE7B5AB02D32E59AE3D544FE7AA70B11AA5A2FBA2511D636877C5F`
+matches build, main-JAR embedding and actual isolated loaded path. Paired main JAR:
+`8742F6B2C3C3DAE8A0548EB486C0BFD0606CE623FF18967060F50C67376DD9BC`.
+The source delta/manifest and exact artifacts remain in the recorded local evidence directory;
+documentation-only updates after the source snapshot are distinguished. No source checkpoint
+was amended or pushed: the older maintenance index remains frozen pending clarification, and
+new performance files/hunks remain unstaged. No recovery bundle or unique evidence was removed.
+
+
+## 2026-09-28: Unchanged native artifact in three-product 32-distance pressure retest
+
+Status: bounded runtime-observed; no new native source change in this retest.
+Evidence: embedded/loaded hashes, real-frame samples, saved world and process/NVML records.
+Applies to dirty MCVR91301b6 worktree plus the prior recorded performance delta; core SHA-256
+627666CCE7DE7B5AB02D32E59AE3D544FE7AA70B11AA5A2FBA2511D636877C5F remains unchanged.
+Radiance fixed an absent-Veil Java facade linkage found by the pure-vanilla setup and rebuilt only
+its main package, now7B7FBDAE9440F1E8DB8474B6C0C47AF6E368ECBE536DC3F634DDB59445BA6A08.
+
+The paired fork completed two matched tier2/32-distance Advanced/RR Balanced runs at72.246 and
+72.283ms mean; Fabric upstream averaged68.476ms over two runs. NeoForge upstream completed one
+52.177ms sample including a4.4s pause, then crashed in the second warmup with an uncaught C++
+exception at EntityProxy.buildNative. Its private commit reached62.34GiB and the JVM report showed
+only4MiB remaining system commit; this is not yet a precise allocation cause or confirmed GPU
+loss. The series stopped without retry. Fork valid-process private commit peak12.77GiB and
+whole-device VRAM peak12715MiB have distinct scopes; neither is SDK-exclusive memory.
+
+See the [paired canonical result](../../Radiance/docs/research/RENDER_CALL_INVENTORY_AND_BENCHMARKS.md#2026-09-28-32-distance-tier-2-three-product-pressure-retest)
+and local Radiance/run/upstream-pressure32-20260928 for raw evidence. Native68/68 remains prior
+evidence, not rerun here. No full-geometry/culling/shader policy was altered, and this product
+comparison is not a causal before/after optimization measurement or visual acceptance.
+No staged candidate/ref, Prism data, recovery backup or public binary distribution changed.
+
+
+## 2026-09-28: Dependency-aware maintenance amendments and V3 source checkpoint
+
+Status: local history allocation reviewed; source and bounded validation evidence preserved.
+User approved retaining Initial port/V1/V2 and assigning fixes to their earliest required interface,
+then recording the high-distance work as Performance Optimization Test V3. This supersedes the
+previous pending dependency-placement question; historical test dates and failed runs remain intact.
+
+Initial port receives general transient-buffer usage/lifetime repair, draw/sampler diagnostics,
+material tint and BRDF-normal/cache helpers plus CPU packing contracts. V1 receives the GPU
+converter's corresponding normal flag, conversion regression, and cached ModelRules face test;
+its legacy 128-byte implementation is preserved before V2 introduces direct/compact inputs.
+V2 retains its original optimization and the corrected integration with those inputs. V3 owns
+batch-ticket persistent-write bookkeeping, retained replacement framework ownership, ready-count
+allocation removal, never-present empty trace filtering, opt-in timing/reference diagnostics and
+new behavioral tests. Sparse-scene redesign, lock/batch architecture candidates and strict one-sided
+light-incidence correction are still deferred, not silently implemented by this checkpoint.
+
+New intermediate validation: five affected native compilation units per Initial/V1 passed syntax
+checks; Initial ran two CPU behavior tests, V1 ran three, with converter/material shaders compiled.
+Both intermediate packs compiled76 stages with SHARC enabled, package defaults and loader-shaped
+execution-variable declarations. This is offline compilation, not a new GPU runtime/descriptor ABI
+or full DLL relink. Early standalone harness attempts lacked required pack/SHARC/execution defines;
+the corrected harness and failures are retained. A duplicate standard include caused by replay was
+removed before signing and CPU validation repeated. V2/V3 product blobs otherwise exactly match
+the frozen maintenance and final tested worktree; no new native behavior or binary was built here.
+Prior CTest68/68 and all real-client evidence remain tied to their original source/artifacts.
+
+Non-portable maintenance evidence: D:/Workspaces/Artifacts/RadianceCommitMaintenance/20260928-v3
+(tree allocation, full diffs, metadata originals, validation logs, working-candidate ZIPs and final
+commit mapping). Existing verified pre-rewrite bundles are reused; they remain needed for remote
+synchronization recovery. No remote push, tag, release, gameplay run or Prism change is authorized
+by this local history operation. All previously unresolved visual/runtime/licensing boundaries remain.
+
+
+## 2026-09-29: Persistent input and pose/AS granularity research
+
+Status: static architecture proposal, no native implementation or new runtime validation.
+Applies to MCVRe6e8153e and Radiance8ad46a09. The paired
+[draw-intent study](../../Radiance/docs/research/2026-09-29-draw-intent-and-persistent-scene.md)
+traces shared Flywheel/rigid geometry through prepared instances, per-frame metadata and BLAS
+ownership. Existing AS update entry points do not establish legality for every pose/topology change.
+The proposal separates rigid BLAS reuse, actor-level compute posing, particle batch alternatives
+and transient fallback, retaining in-flight/history lifetimes and the existing fatal boundary.
+No new scene table, shader, ABI, PTLAS/SER implementation, benchmark, build or deployment was made.
+Historical ModelPart costs and negative net performance remain distinct from these proposals.
+
+
+## 2026-09-29: Batched rigid-model submission and lightweight rigid scene assembly
+
+Status: implemented; build-verified; automated-verified; runtime-observed in isolated clients; not
+committed, deployed or visually accepted. Applies to MCVR `e6e8153e` plus the uncommitted candidate
+(`entities.hpp/.cpp`, the EntityProxy JNI source, `world_prepare.hpp/.cpp`, new
+`rigid_instances.hpp`, `tests/rigid_instances_test.cpp`). The paired
+[Radiance entry](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-29-draw-intent-slice-1---shared-face-capture-and-batched-rigid-submission)
+owns the Java change, measurements and evidence paths.
+
+`queueRigidModel` (one JNI call and one deep-copied `Entity` per draw) is replaced by
+`queueRigidModels`: a batch of 136-byte `mcvr::rigid::SubmissionRecord`s plus a group-name table.
+The whole batch is validated before use (namespace bit, quad count, group index, reserved field,
+finite transform/origin). Model residency, conversion, BLAS lifecycle, the 1,024-variant bound,
+generation/world checks and frame retirement are unchanged; a miss still reads the local vertices.
+Each resident `RigidModelResource` now precomputes its BLAS, group, `ModelRules`, material flags,
+addresses and counts. Instances are published as a `RigidInstanceBatch` that owns the frame's
+models; `WorldPrepare` emits them in a dedicated loop and records per-view history in a sorted
+`HistoryFrame` retained with its batch (imageCount + 1 frames, one record per frame even when
+empty). Previous transform and previous-geometry rules equal the old entity-map behavior. The
+`Entity::rigidModel/rigidInstance` fields are gone; ordinary entity history is unchanged.
+
+Release build without warnings, core SHA-256
+`937E773CA75FDFCABF0DD70044976D5A2B5B370ED8D215F194BF397E2D7390B0`; CTest 69/69 including the new
+`mcvr.rigid-instances`. With the paired Java change, the model-city A/B/B/A default configuration fell
+33.97->27.28 ms and `rigidParts=true` 36.71->24.20 ms; native rigid queueing with 5,634 part
+instances fell 1.06->0.19 ms and entity plus rigid metadata 3.77->1.56 ms. SBT group lookup (1.06 ms
+with parts) is the next measured per-instance cost. No shader, TLAS policy, culling, AS update mode
+or GPU synchronization changed; GPU root-cause and licensing limits remain open.
+
+
+## 2026-09-29: Interned hit-group ids in scene assembly and SBT setup
+
+Status: implemented; build-verified; automated-verified; runtime-observed in isolated clients; not
+committed, deployed or visually accepted. Applies on top of the preceding rigid batching candidate.
+Radiance's [slice 2 entry](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-29-draw-intent-slice-2---interned-sbt-hit-groups)
+owns measurements and evidence paths.
+
+New `core/render/hit_groups.hpp`: an append-only, mutex-protected registry bounded at 65,536 names
+(exceeding it throws into the existing failure boundary), `shadow` = id 0.
+`WorldPrepareContext::hitGroupNames` became `hitGroups` (ids). `ChunkSceneMetadata` stores ids
+resolved at snapshot creation, `RigidModelResource` a `groupId`, `InstancingModel` per-mesh
+`groupIds`; ordinary entities intern per geometry. `setupHitGroupSbt` builds one table per call
+(`Registry::resolve`) and indexes it per entry; the per-name rule is unchanged, and a new pipeline
+map simply yields a new table. Release build without warnings; CTest 70/70 with new
+`mcvr.hit-groups` and the updated chunk-metadata test. Core SHA-256
+`01267A031D90B3EC89FB23FB932A7975BE67F29109197D9CC164687EB6E2659A`. SBT lookup fell 0.275->0.051 ms
+(default) and 1.071->0.114 ms (5,634 part instances); frame time with parts 24.24->22.42 ms, while
+the default-path frame difference is within run spread. No SBT layout, shader or record-size change.
+
+
+## 2026-09-29: Instancing clock, per-section chunk storage, Flywheel model deletion and frame retention
+
+Status: implemented; build-verified; automated-verified; runtime-observed in isolated clients.
+Evidence: static, build, automated, runtime.
+Applies to: MCVR worktree on `e6e8153`; paired Radiance worktree on `8ad46a0`.
+Supersedes: none.
+Remaining acceptance: runtime and visual in the user's world.
+
+Radiance's ledger entries of the same date own the measurements and evidence paths: Flywheel
+animation clock precision, chunk memory retained after moving, Flywheel models released when no
+instancer uses them, benchmark machine-load check, and chunk snapshots pinned by a swapchain image.
+
+### Problem or requested behavior
+
+Flywheel motion looked rate-limited in a world at 7,680,653 ticks, and VRAM kept growing while the
+player moved at render distance 32.
+
+### Final design and rejected alternatives
+
+- Instancing clock (`instancing_contract.hpp`, `instancing.cpp`): `rotationDegrees` reduces
+  `ticks / 20 * speed` with `fmod` in double and `scrollPhase` takes the fractional part in double
+  before narrowing to `float`. The Java side now passes Flywheel's small per-level clock.
+- Per-section chunk storage (`chunks.cpp`, `chunk_geometry_layout.hpp`, `as.hpp/.cpp`): a chunk build
+  batch still packs one transient host staging buffer and records one command buffer, but each
+  section owns device-local position, material and index buffers and, through
+  `BLASBatchBuilder::Storage::separate`, its own BLAS storage; scratch stays shared. Previously one
+  buffer per stream and one AS storage buffer served the whole batch, so a section freed nothing
+  while any sibling lived. One global transfer barrier replaces three whole-batch buffer barriers.
+  Entity batches keep shared storage because they are released together.
+- Flywheel models (`instancing.cpp`, JNI): `deleteModel` refuses a model still referenced by an
+  instance and retires it through the frame retainer; `residentModelCount` and the profile counters
+  `flywheel.instances` / `flywheel.resident-models` report residency.
+- Frame retention (`render_framework.*`, `frame_retention.hpp`): `FrameResourceRetainer` kept one
+  list per swapchain image and cleared it only when that image was acquired again; when the
+  presentation engine stopped returning an image, the list it last used stayed pinned, holding the
+  chunk scene snapshots of that frame and their buffers. Retention is now grouped per frame serial
+  and a group is released once a later frame's main-queue fence has signaled and at least the
+  swapchain image count of newer frames have begun. Contexts record the serial they submitted.
+  Rejected: a fixed-age release without a fence check.
+- Diagnostics: chunk batch and immediate builds allocate under their own tags (`Chunk batch build`,
+  `Chunk immediate build`) instead of `Submit frame`; `RADIANCE_CHUNK_CENSUS=1` logs a
+  `ChunkResidency` line about every 60 frames (published slots with unique device bytes, queued
+  builds, in-flight batches, tracked chunk buffers alive outside both, frame retainer groups), also
+  emitted as profile counters `chunk.resident.*` every 30 profiled frames.
+
+### Validation and evidence boundary
+
+Release build without new warnings; CTest 72/72 including the new `mcvr.chunk-geometry-layout` and
+`mcvr.frame-retention` and the extended `mcvr.instancing-contract`. Candidate H core SHA-256
+`A5EB0C0CD415855DBC64C514FD40A2F75278030C2A4113786A2CB0021BD2BC82`.
+
+
+## 2026-09-30: World-unload completion, scene descriptor reset and DLSS viewport retirement
+
+Status: implemented; build-verified; automated-verified; isolated runtime attribution pending.
+Evidence: static, build, automated; user runtime observation applies to earlier candidate I only.
+Applies to V3 `e6e8153` plus the preserved worktree. Canonical cross-repository evidence:
+[Radiance lifecycle entry](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-30-complete-scene-descriptor-and-reconstruction-resource-release-on-world-unload).
+
+I introduced Chunks/Entities/WorldPrepare scene release but left descriptor-held TLAS/metadata and
+reconstruction SDK viewports alive. The native boundary now flushes recorded-but-unsubmitted work,
+checks idle results through the existing fatal/JNI path, frees/replaces owned scene set 1 without
+changing layouts, and explicitly releases evaluated SDK resources. Lazy viewport re-entry resets
+history. SHARC content resets while storage remains; idle frame-retention clearing reopens the
+current serial to protect later GUI resources. Marker-gated attribution controls default to release
+in every ordinary client. Pipeline-layout keepalive and all existing V4 work remain intact.
+
+Release INSTALL and CTest 73/73 passed. New `mcvr.scene-resource-release` exercises the production
+helpers' actual ownership/callback ordering, error propagation, retries, repeat release and
+active-frame retention. Full real SDK/Vulkan scene execution is reserved for the named isolated
+runs, not inferred from helper tests. J core SHA-256:
+`C9B3E46F428141067BE607A07C4CDBAA31A18AC92135CF3371E3B041F24EFD2E`.
+Evidence and full raw-byte snapshots are under Radiance `run/menu-memory-release-20260930/`.
+No staging, commit, push, Prism deployment or public binary release was performed in this fix batch.
+
+
+## 2026-09-30: Retained runtime set 5 and empty-world buffer sizing
+
+Status: implemented; build-verified; automated-verified; L runtime pending. Evidence: static,
+retained K runtime allocator maps, build and automated regression.
+See [canonical attribution](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-30-menu-memory-attribution-and-obsolete-runtime-neighborhood-buffers).
+
+Detailed VMA maps identify 76.8 MiB of obsolete/current Advanced neighborhood buffers after unload,
+including an old r32 generation retained by an inactive context's runtime descriptor set. No empty
+device blocks appear. RayTracingModule now resets runtime set 5 at the same GPU-idle boundary as
+scene set 1, then updates expressions and calls ShaderPack's existing exact-size resize with zero
+chunks. No name-based shader exception, global idle in ordinary frames or world-quality reduction
+is introduced. Fixed images, imported textures, SHARC storage and compiled pipelines remain reusable.
+
+The existing behavior regression now tests set 5 retaining/releasing an obsolete generation while
+asset owners survive. L core: `323440F7692E98AAC9EA2FE4BE7F25D570433A3C9F58968C58C145EDA4E7E486`.
+Native/package copies match; CTest 73/73 passes. Source snapshot and runtime evidence belong to
+Radiance `run/menu-memory-release-20260930/`. Runtime and visual limits remain explicit.
+
+
+## 2026-09-30: L re-entry passes, shared PostRender runtime owner found
+
+Status: investigating after L's successful runtime but incomplete memory assertion; M implements
+the remaining shared-owner correction and passes automated gates, with M runtime pending.
+Evidence: static, L isolated runtime/maps, M build/automated.
+Supersedes: treating ray-tracing set 5 alone as the complete runtime-buffer owner set.
+
+L completes save/exit/re-entry with no crash/device loss, and drops the old r32 allocation. Its
+maps still contain all three 11,708,928-byte r16 buffers. Producer resizing was correct: PostRender
+shares ShaderPack and also binds its runtime resources, through set 4. That consumer had no
+releaseWorldScene override, so clearing ray-tracing set 5 and the producer could not free them.
+The full bindRuntimeResources callsite check identifies these two modules as the direct consumers.
+
+M adds GPU-idle retirement of the PostRender runtime set. It preserves output images, imported
+textures, shader layouts and raster/PT routing; the normal next-world resource bind repopulates
+it. The real ownership helper regression now retains a buffer through two consumer sets and only
+observes destruction after both reset. CTest 73/73 passes. The pending allocator assertion is that
+both the old r32 and current r16 allocations disappear after unload, then reappear correctly on
+re-entry and disappear again. No visual/long-term/G3 acceptance is implied by ordinary exit.
+
+Canonical cross-repository evidence: Radiance `run/menu-memory-release-20260930/`.
+
+
+## 2026-09-30: Final M shared-owner memory assertion passes
+
+Status: automated-verified; runtime-observed in the bounded isolated fixture, not visually accepted.
+Evidence: Release INSTALL, CTest 73/73, package gates, actual loaded DLL, normal saves/exits and
+VMA detailed maps. M core `2447D81A5F67821EC0FF7672B1F3665AA8DD61FF900B1C5A68FEDF47B88A733C`.
+
+Both ray-tracing and PostRender runtime sets now retire all neighborhood generations after each
+world unload; re-entry rebuilds the appropriate size and fresh SDK history. Neither old r32 nor
+r16 neighborhood allocations appear in M's post-unload maps. Cold/post-world image and buffer
+allocations, process counters and the genuinely empty cached VMA block are recorded in the
+[canonical final entry](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-30-final-m-world-unload-re-entry-memory-verification).
+Small reusable SBT/UI capacity and the fixed execution/asset floor remain distinct from a scene
+leak. No SDK/driver byte-perfect attribution, infinite stability, G3, user visual or public license
+acceptance is implied. Current HEAD/staging/ref state is unchanged; M is not deployed to Prism.
+
+
+Final allocator detail, 2026-09-30: M's two additional device blocks relative to its cold map are
+both 256 MiB. One is completely empty and retained by VMA's documented hysteresis. The other has
+20 allocations totaling 4,275,200 bytes with shader-binding-table buffer usage; these are reusable
+SBT capacity, not old chunk geometry or neighborhood buffers. This explains the 512 MiB difference
+in VMA block reservation despite only about 7 MiB net additional live device allocation (asset/image
+and UI/SBT changes offset). Trimming SBT capacity or changing pool policy is a separately measured
+cache/entry-cost optimization; it was not silently folded into this source checkpoint. Process
+values additionally include SDK/driver allocations outside VMA, so no byte-perfect RTSS attribution
+is claimed. Cold menu WDDM has only one sample in the existing 8 s SmokeProbe.
+
+## 2026-09-30: Paired NeoForge build target and Java runtime interval
+
+Status: build-verified; automated-verified in the paired Java repository only.
+Evidence: Radiance compiled/tested at NeoForge 21.1.228 and 21.1.252 and assembled the same package;
+existing core SHA-256 `2447D81A5F67821EC0FF7672B1F3665AA8DD61FF900B1C5A68FEDF47B88A733C`
+matches both embedded packages. Applies to dirty MCVR over
+`e6e8153e0ff8c3ab6c3108d8d631beea1f99810e`; prior native V4/lifecycle work is preserved.
+
+Radiance now builds with 252 and independently declares `[21.1.228,21.2)` in GAME/Audit metadata.
+The [loader assessment](../../Radiance/docs/research/2026-09-30-neoforge-runtime-range.md) owns the
+API comparison, two endpoint test counts, hashes and acceptance limits. No native product,
+shader or JNI change was needed, so native builds/CTest were not repeated for this loader-only
+task. No client was launched or redeployed, and prior candidate M evidence remains on 251.
+This is not new native, runtime, visual or public-license acceptance. Git refs/staging are unchanged.
+
+## 2026-09-30: Standalone loader-floor correction and bounded 62 client observation
+
+Status: runtime-observed for the named base case; paired build/automated verification.
+Supersedes only the preceding Java runtime-interval policy; native V4/lifecycle work is unchanged.
+Radiance's own armor-glint Mixin requires a Minecraft patch first shipped in NeoForge **21.1.62**;
+61 lacks the six-float method. The final metadata accepts `[21.1.62,)`, builds with 252, and keeps
+Minecraft exactly 1.21.1/FML 4. Optional mod minima no longer choose Radiance's floor. See the
+[Radiance implementation record](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-30-standalone-radiance-minimum-neoforge-21162-and-open-upper-interval).
+
+The package built with 252 is byte-identical to the one used in the isolated 62 base-world run
+(`C3E4DB22F2092354E8C2466C6F589C98FE8585B259F83C3B80EF20F17CA03877`). The actually loaded core
+matches the existing `2447D81A5F67821EC0FF7672B1F3665AA8DD61FF900B1C5A68FEDF47B88A733C`.
+Base-world entry, about 30 s of world-frame observation, all-dimension saving, scene release,
+SDK shutdown and normal process exit are observed. This does not close visual breadth, native
+destruction coverage, GPU root cause or public-license gates. No native source/build/tests, Prism,
+staging or Git refs changed as part of this loader-floor correction.
+
+## 2026-09-30: Paired optional compatibility pins are metadata-only
+
+Status: paired Java package build/automated verification; no new native validation claim.
+Radiance now temporarily accepts exact versions of the ten actual parent/embedded mod IDs in
+the current Create/Sable/Aeronautics combination, all optional/client/NONE. Zume and libraries
+without mod IDs are excluded. NeoForge remains `[21.1.62,)`; no native, shader, JNI or binary
+dependency changed. The [Java ledger entry](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-30-exact-optional-mod-compatibility-declarations-excluding-zume)
+owns the version list, provenance, regression and remaining boundaries.
+
+The build-only JAR is `DF3324CAE8C5D88011E7AD5D0B2B54E1D5030651B32150BB77D409AD47C14639`;
+its existing core remains `2447D81A5F67821EC0FF7672B1F3665AA8DD61FF900B1C5A68FEDF47B88A733C`.
+No native suite or client was re-run and no Prism deployment/staging/ref change occurred. Previous
+62 runtime observations apply to their preceding artifact, not this metadata-only new package.
+
+## 2026-09-30: Paired V4 source checkpoint preparation
+
+Status: source-checkpoint-ready; build/automated evidence as scoped below.
+Applies to the complete reviewed worktree over V3 `e6e8153e0ff8c3ab6c3108d8d631beea1f99810e`.
+The user authorized one additive SSH-signed `Performance Optimization Test V4` in each repository,
+including all current performance, lifecycle, diagnostics and maintenance records, followed by
+normal source-only pushes to develop. Initial port and V1/V2/V3 remain unchanged.
+
+The native candidate includes batched rigid instances/history, interned hit groups, Flywheel clock
+and model retirement, per-section geometry/BLAS storage, fence-based frame retention, world-scene
+release, idle descriptor replacement, shared runtime-buffer invalidation and DLSS viewport release
+with lazy re-entry. All twelve necessary untracked headers/tests are included. It matches the
+product source of candidate M; subsequent native differences are documentation only.
+
+Pre-commit validation: CTest **73/73 executed and passed** in 5.43 s using the matched existing
+Release build, with no native rebuild needed. Current Java/package gates passed in the paired repo;
+test/cache distinctions and earlier runtime limits remain there. Both origin/develop tips match
+their V3 baselines. GitHub reports zero Actions workflows in both repositories and their source
+trees contain only FUNDING metadata. No automatic binary-upload workflow was identified.
+
+Non-portable checkpoint evidence: `D:/Workspaces/Artifacts/RadianceV4Checkpoint/20260930-210652/`
+contains candidate file hashes/diffs, source-to-M comparisons, validation logs and signature
+verification material. A normal additive commit/push is non-destructive, so no duplicate rollback
+bundle is created; existing history/evidence and maintenance refs are retained. No binary, generated
+header, object file, runtime instance or test world belongs to the candidate. Local/source publication
+does not close GPU-root-cause, broad visual/long-term or public-runtime-license gates.
+
+Next-stage preparation is owned by the existing Radiance draw-intent research and roadmap:
+moving/animation-heavy attribution and correctness first, then proven per-instance appearance
+separation from stable geometry. No new native optimization or default enablement is included
+merely to prepare that workstream. Final commit/push identities belong in the user's delivery
+response and external evidence, not a self-SHA backfill.
+
+## 2026-09-30: One-sided records reactivated after V4
+
+Status: investigating; static review only. Current native baseline is
+`6b1b0770d32a5420d9fb3350c0e5a074e1a7065c`, paired with Radiance
+`ed32fd33a2c3773ad2faab7abad92d452a739b6d`.
+The user chose focused visual/semantic work before the prepared performance stage. Review of
+the September27 records and current V4 confirms the same query-facing shadow predicate,
+uniform-face-bit removal and unsafe legacy strip branch remain. The historical physical-direction
+counterexample and spring failure were not re-run or closed. Refer to the
+[paired review](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-09-30-begin-focused-one-sided-surface-record-review-after-v4)
+for scope, priority and the source-versus-physical-direction contract. Only documentation changed;
+no native build/test/client, staging, commit or push occurred.
+
+
+## 2026-10-01: Source-sided directional transport and strip corrective candidate
+
+Status: implemented, build/automated-verified and bounded runtime-observed; visual acceptance
+pending. Native baseline `6b1b0770d32a5420d9fb3350c0e5a074e1a7065c`, paired with Radiance
+`ed32fd33a2c3773ad2faab7abad92d452a739b6d`; repairs remain unstaged/uncommitted.
+See the [cross-repository delivery/evidence entry](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-10-01-one-sided-transport-corrective-candidate-and-prism-delivery)
+and [operator/callsite record](../../Radiance/docs/research/PT_VISUAL_AND_PERFORMANCE_INVESTIGATIONS.md#2026-10-01-source-sided-directional-transport-corrective-candidate-after-v4).
+
+`material_faces.hpp` preserves source flags and backend facing provenance; both built-in packs
+separate selection, reverse light visibility and directional radiance endpoints. Shared helpers,
+primary/secondary sampling and Advanced cache handoffs preserve accepted-side material response
+and invisible-side identity crossing, including medium prefix, bounce ownership, emission and
+AOV roles. Chunk emitter side flags use normal.w and invalidate source light IDs without a GPU
+LightData stride change. No global opaque demotion, object/texture whitelist, geometry deletion,
+new full-window targets, global idle or new fault injection. The existing layout keepalive and
+error/resource retirement protections remain. `entities.cpp` uses the existing safe strip
+triangulation, preserving per-vertex attributes and short/odd-count bounds; springs are QUADS.
+
+Executed: Release INSTALL + generic shaders;169 RT-stage/SHARC-variant compiler/spirv-val cases;
+CTest73/73 excluding the face GPU fixture plus the latter's separately passed120-ray execution;
+512 face-rule CPU combinations,84 discrete operator-reference cases and strip regressions.
+The mathematical oracle lives under tests, not as unused product logic. The ignored paired
+evidence root is `../Radiance/run/one-sided-correction-20260930/`. Final raw product/test input
+table digest `6AA9C1CB598187E574DB6EE2A84F0F56781418D248B4381527F383CCAFABBDED` and compiled core `642D48A57C35091EA88BADE5E66643868D7B964A8F999105C9CC695DD6CE0818` are matched to package, extraction and actual
+loads in both final isolated worlds.
+
+Final main JAR `6D0EAD8FD602634FEA5F7F17553114E70771D11FC0119A505B56A8AAC413F418` ran Vanilla PT62.37s and true Advanced56.75s process lifetimes, each with
+about17s of world-ready spring exercise, normal world saves and SDK resource/plugin teardown,
+without crash, device loss or timeout. The first Advanced-labelled attempt was a documented
+Vanilla fallback and is not claimed as an Advanced result. Earlier candidate results remain
+separate from the final transparent/cache-callsite corrections and final artifact.
+
+Prism main + passive Audit were delivered for user inspection only; agent automation ran under
+Radiance run/, with sound0 and no focus capture. No Git mutation or public publication. Complete
+production-SBT numerical radiance parity, rejected warped spring pose, temporal multilayer guides,
+SHARC-coverage/cost changes, external shader packs and long stability remain open. GPU-loss cause
+and third-party redistribution permission are not inferred from these passes. Supersedes only
+September30's investigation-only status.
+
+
+## 2026-10-01: One-sided operator candidate rejected for foreground transparency
+
+Status: user visual failure, source mechanism confirmed. The deployed paired candidate's
+source-visible identity branch adds background even for opaque thin faces; the original PNG
+alpha is not the confirmed cause. The previous84-case reference models that nonreciprocal
+behavior, and120-ray selection/visibility/endpoint tests do not assert foreground-opacity
+preservation. Bounded straight-spring non-crashing runs are not visual acceptance.
+See the [paired feedback correction](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-10-01-user-rejects-one-sided-candidate-foreground-transparency).
+Clarify the conflicting physical-forward versus source-facing visibility contracts before
+changing production paths; no camera-only bypass, whitelist or selective test rewrite. No
+product changes/build/deployment/Git mutation in this feedback-recording step.
+
+
+## 2026-10-01: Per-ray source-facing correction and opaque-sheet regression
+
+Status: implemented, build/automated-verified, bounded runtime-observed and deployed; visual
+acceptance pending. Unchanged V4 baseline `6b1b0770d32a5420d9fb3350c0e5a074e1a7065c` paired with
+Radiance `ed32fd33a2c3773ad2faab7abad92d452a739b6d`. The user's clarified rule supersedes the
+nonreciprocal transport proposal/candidate and its foreground-transparency failure; all earlier
+facts remain preserved. See the [paired correction/evidence](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-10-01-per-ray-single-sided-correction-replacing-the-rejected-transparent-candidate)
+and [contract](../../Radiance/docs/research/PT_VISUAL_AND_PERFORMANCE_INVESTIGATIONS.md#2026-10-01-accepted-per-ray-one-sided-visibility-contract).
+
+All ray roles use the same source-facing predicate and their own direction. Accepted faces
+keep existing material behavior; rejected faces are not hits. Restored only the49 explicitly
+owned shader files which implemented the rejected foreground/null operator. No added primary
+identity branch, stochastic doubled throughput, directional payload/cache or SHARC bypass remains.
+Retain source-face/backend-flip provenance, mixed-model and mirror handling, emitter face metadata/
+source-ID invalidation, safe legacy strip indices and all V4 resource/error protections. No
+whole-checkout rollback, scene culling, global opaque demotion, whitelist or forced idle.
+
+The rejected helper/oracle files are no longer active; complete recoverable copies and candidate
+artifacts remain in Radiance's earlier evidence, with their future semi-transparent strategy
+recorded as proposed only. New ray_facing_contract_test.cpp covers84 source/provenance checks.
+The Vulkan fixture executes160 source/light/radiance/foreground-background rays, preserving
+uniform/mixed opaque paths. Native suite74/74 passed, including existing512-model and strip tests;
+169 RT-stage/SHARC compiler/spirv-val cases and Release INSTALL/package gates passed. The GPU
+fixture asserts hit/foreground ownership, not full PT color equivalence. Final source table
+`EC8A11CFA39C06D973A139FC1E5C36F37209267237E7855E97F1F4CFA66205D3` and DLL `3C406851C72495DC8A939816E614D2866C68655D3BC8B0D6521974EE79185E03` are matched to the installed complete JAR `A65D50984F32A6034B34A2B9EC4F1A58C7C325DBF5F45F1FEDD8284488B9226D`, extracted files
+and actual loads. Evidence: `../Radiance/run/one-sided-ray-facing-20261001/`.
+
+Muted unattended real-world Vanilla/Advanced processes ran73.03/74.76s with about17s of straight-
+spring exercise and normal all-dimension save/SDK shutdown, no crash/device loss/timeout, and no
+foreground capture. Advanced prerequisites were enabled; no fallback. Competing-load limits and
+preexisting unsupported Veil startup reports are retained; no performance/all-feature claim.
+The final main JAR replaced the rejected Prism build; matching Audit stayed unchanged, and the
+old main/owned lock went through Recycle Bin. No launch or Git mutation. Original twisted-pose
+visual failure, wider material/temporal scenarios, GPU-failure origin and public DLL licensing
+remain separately open until evidence is obtained.
+
+
+## 2026-10-01: Delegated held-item visual precheck, then returned to user
+
+Status: bounded runtime/agent visual observation; no formal user acceptance. The user explicitly
+authorized one Computer-Use session in the existing Prism city world while away. Current loaded
+core `3C406851C72495DC8A939816E614D2866C68655D3BC8B0D6521974EE79185E03` matched the per-ray repair.
+Stone, sandstone, creative physics wand and spring-item solid portions showed no obvious overall
+background transparency in the inspected first-person view. Existing cutout gaps remained.
+See [the exact configuration/evidence boundary](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-10-01-user-authorized-computer-use-held-item-precheck-in-newport-city).
+No native/source/build change, no game-world edits or render-setting changes. Normal world save,
+client exit, owned-lock release and Computer-Use session reset were checked. The user returned
+home and took over all further playtesting; no further automatic Prism control is authorized by
+this session. Broader visuals and previous twist failure are not closed by this limited precheck.
+
+
+## 2026-10-01: Source-proven quad topology and paired world-surface ownership
+
+Status: implemented; automated-verified; controlled runtime-observed; visual acceptance pending.
+Evidence: static, automated, GPU, runtime; V4 worktree retained. `quad_topology.hpp` reconciles exact
+reverse cyclic warped source QUADS after positional offsets, preserving the first member and all
+source attributes. Planar quads stay unchanged. Actual source +/-twist and48 Vulkan visibility
+probes demonstrate the inward-wedge self-shadow mechanism; they are not a torsion root-cause proof.
+A discovered tetrahedron counterexample requires authored draw-mode provenance, not index-pattern
+inference. Entity submission/composition retains that provenance; triangle-list models stay intact.
+Deferred conversion uses an allocation-free small-model admission probe, paired CPU fallback,80-byte
+conversion jobs and preserved position-policy tags. No timing claim after the user canceled benchmarks.
+
+Default bilateral world policy is independent of retained source cull/winding. Paired triangles are
+marked separately within a geometry; unique authored-member selection avoids double interfaces.
+Leading-vertex policy cloning, both upload paths, emission clipping and8 history readers preserve
+indices/tag ownership. No global forced nonopaque path or per-release GPU idle. Flywheel now publishes
+post-build material provenance. Advanced clouds no longer skip the ownership guard on their early
+return. General/special closest-hit diagnostics are default-off and isolated, with paired ownership
+preserved. Source-mode160 and bilateral320-ray Vulkan tests remain executable.
+
+Release INSTALL and native77/77 passed. Source/bilateral/backside shader variants169 each compiled
+and passed SPIR-V validation. Final main/core identities, pipeline/resource hashes and controlled
+normal/Advanced world runs are documented in
+[the paired Radiance entry](../../Radiance/docs/DEVELOPMENT_LEDGER.md#2026-10-01-bilateral-package-verification-and-performance-pause).
+`Radiance/run/geometry-topology-bilateral-20261001/` retains exact staged experiment inputs, source
+indexes and failure history. No staged Git changes/commit/push. Performance runs stay suspended;
+user visual acceptance, torsion comparison, arbitrary-mod/complete transform audits, existing GPU
+fault origin and public NVIDIA binary permission are not implied by this evidence.
+
+
+## 2026-10-01: Bilateral geometry Prism handoff, no launch
+
+Status: deployed; bounded runtime-observed; user visual acceptance pending.
+Main JAR `70A505C397740982EDCB82BA9C16DD5BC19F35326E72E3EB778FDBA987C6ABC8`;
+core `70F9874686F8C3AFB8EDCBA4FB9626F20AAE9CCB3BFA424A0E0E63B8BB01C450`;
+passive Audit `93D11DDC5C3DCC27559FEB55200FC304F4974FF2C80811CDEDDE620B8A5F35B3`.
+Delivery source index62AE9CA05DA06EF89DE2AE149F125ED23BF9B5611568C45562C127B0CE52E833
+includes diagnostic-only eye-height correction; prior snapshots remain with their original hashes.
+Final normal/Advanced, corrected camera-inside diagnostic, and positive/negative actual-producer
+spring runs used this core. Both spring runs retained48 paired quads and corrected24 later members.
+All named processes saved all dimensions, logged scene/descriptor/reconstruction release and exited
+normally, without detected device-lost. Final companions recorded frames0/no timing CSV. These are
+controlled fixture evidence, not user visual acceptance, torsion closure, infinite stability or GPU
+root-cause proof. The earlier boat-fixture failure and above-block "inside" captures remain excluded.
+
+Deployment `20261001-183239-radiance-bilateral-deploy`: stopped-instance and atomic owned-lock checks,
+staged hashes, outer embedded core verification, installed hashes and unchanged non-target hashes
+passed. Replaced only main/Audit in the authorized Prism instance's minecraft/mods; old jars and
+owned lock went to Windows Recycle Bin.9 checked non-target files unchanged. No game/launcher start,
+settings/world changes, Git staging/commit/push, tag or public release. Non-portable evidence lives
+under Radiance/run/geometry-topology-bilateral-20261001 (DELIVERY_ARTIFACTS, SOURCE_DELIVERED,
+FINAL_RUNTIME_RESULTS and prism-deployment-receipt) and the Prism .agent-runs deployment directory.
+Manual observations now own spring/plant/water/hand/boat/reflection/interior presentation. Performance
+experiments remain suspended until the user explicitly resumes them.
+
+
+## 2026-10-01: Consolidate Initial port and V1–V4 into one source checkpoint
+Status: source-history maintenance; existing implementation/validation boundaries unchanged.
+The user authorized the complete current nonignored worktree and all four performance checkpoints
+in one signed Initial port. Upstream parent `9905c81b1999f5845bf66d13501d371c16adf561`, author/committer identity,
+author timestamp/timezone and complete Initial port message are preserved; committer date equals author.
+No product logic/build input change is introduced by this history operation; generated binaries,
+runtime data, ignored evidence and third-party runtimes remain outside the source commit.
+
+| Old checkpoint | Replacement |
+| --- | --- |
+| `71cd493ce9db2067ec46244d8e496bf3e774f896` (Initial port) | Consolidated Initial port, exact SHA in the final receipt below |
+| `cc3503e9a62bcc31429b5aa5c2e5856acec005b2` (Performance Optimization Test V1) | Consolidated Initial port, exact SHA in the final receipt below |
+| `7cbbcd4911099dbf19e7e868b3fe125394c224e9` (Performance Optimization Test V2) | Consolidated Initial port, exact SHA in the final receipt below |
+| `e6e8153e0ff8c3ab6c3108d8d631beea1f99810e` (Performance Optimization Test V3) | Consolidated Initial port, exact SHA in the final receipt below |
+| `6b1b0770d32a5420d9fb3350c0e5a074e1a7065c` (Performance Optimization Test V4) | Consolidated Initial port, exact SHA in the final receipt below |
+
+The receipt preserves exact old SHA → new SHA and tree mappings, original raw metadata, signature
+checks and the one-way companion relationship. Its non-portable retained location is
+`D:\Workspaces\Artifacts\RadianceCommitMaintenance\20261001-193043-collapse-initial\receipt.json`.
+No self-SHA is backfilled into this commit. Earlier audit/source/production identities remain
+historical evidence. Performance experiments stay paused; visual, GPU-root-cause, long-stability
+and public vendor-library license gates remain open.

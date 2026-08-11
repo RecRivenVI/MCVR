@@ -1,8 +1,17 @@
+#include "core/render/streamline_runtime.hpp"
+
+#include "core/logging.hpp"
+#include "core/failure_state.hpp"
+#include "core/diagnostics/device_loss_trace.hpp"
+#include "core/render/renderer.hpp"
 #include "core/vulkan/instance.hpp"
 
 #include "core/render/modules/world/dlss/dlss_wrapper.hpp"
 #include "core/render/modules/world/xess_upscaler/xess_wrapper.hpp"
 
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <set>
 #include <unordered_set>
@@ -10,12 +19,12 @@
 
 const char *DEBUG_LAYER = "VK_LAYER_KHRONOS_validation";
 
-std::ostream &instanceCout() {
-    return std::cout << "[Instance] ";
+auto instanceCout() {
+    return mcvr::log::info("Instance");
 }
 
-std::ostream &instanceCerr() {
-    return std::cerr << "[Instance] ";
+auto instanceCerr() {
+    return mcvr::log::error("Instance");
 }
 
 // Debug callback
@@ -27,10 +36,14 @@ VkBool32 debugCallback(VkDebugReportFlagsEXT flags,
                        const char *pLayerPrefix,
                        const char *pMsg,
                        void *pUserData) {
-    if (flags & VK_DEBUG_REPORT_ERROR_BIT_EXT) {
-        instanceCerr() << "ERROR: [" << pLayerPrefix << "] Code " << msgCode << " : " << pMsg << std::endl;
-    } else if (flags & VK_DEBUG_REPORT_WARNING_BIT_EXT) {
-        instanceCerr() << "WARNING: [" << pLayerPrefix << "] Code " << msgCode << " : " << pMsg << std::endl;
+    try {
+        if (flags & VK_DEBUG_REPORT_ERROR_BIT_EXT) {
+            instanceCerr() << "ERROR: [" << pLayerPrefix << "] Code " << msgCode << " : " << pMsg << std::endl;
+        } else if (flags & VK_DEBUG_REPORT_WARNING_BIT_EXT) {
+            instanceCerr() << "WARNING: [" << pLayerPrefix << "] Code " << msgCode << " : " << pMsg << std::endl;
+        }
+    } catch (...) {
+        // Vulkan callbacks are C ABI boundaries and must not propagate exceptions.
     }
 
     return VK_FALSE;
@@ -39,10 +52,12 @@ VkBool32 debugCallback(VkDebugReportFlagsEXT flags,
 vk::Instance::Instance() {
     GLFW_Init();
 
-    if (volkInitialize() != VK_SUCCESS) {
-        printf("volkInitialize failed!\n");
-        exit(EXIT_SUCCESS);
+    if (const auto result = volkInitialize(); result != VK_SUCCESS) {
+        mcvr::log::error("Instance") << "volkInitialize failed" << std::endl;
+        mcvr::failure::raise(mcvr::failure::Kind::initialization, result, "volkInitialize");
     }
+
+    mcvr::StreamlineRuntime::get().initialize(Renderer::folderPath / "dlss");
 
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -75,6 +90,21 @@ vk::Instance::Instance() {
     }
 
     // DLSS extensions
+    std::vector<VkExtensionProperties> dlssSRExtensions;
+    std::vector<std::string> dlssSRRequired;
+    bool dlssSRQuery = NVSDK_NGX_SUCCEED(NgxContext::getDlssRRRequiredInstanceExtensions(dlssSRExtensions, NVSDK_NGX_Feature_SuperSampling));
+    for (const auto &extension : dlssSRExtensions) {
+        dlssSRRequired.emplace_back(extension.extensionName);
+        extStorage.insert(extension.extensionName);
+    }
+    std::vector<VkExtensionProperties> dlssFGExtensions;
+    std::vector<std::string> dlssFGRequired;
+    bool dlssFGQuery = NVSDK_NGX_SUCCEED(NgxContext::getDlssRRRequiredInstanceExtensions(dlssFGExtensions, NVSDK_NGX_Feature_FrameGeneration));
+    for (const auto &extension : dlssFGExtensions) {
+        dlssFGRequired.emplace_back(extension.extensionName);
+        extStorage.insert(extension.extensionName);
+    }
+
     std::vector<VkExtensionProperties> dlssExtensions;
     NVSDK_NGX_Result dlssExtensionQueryResult = NgxContext::getDlssRRRequiredInstanceExtensions(dlssExtensions);
     if (NVSDK_NGX_SUCCEED(dlssExtensionQueryResult)) {
@@ -122,6 +152,7 @@ vk::Instance::Instance() {
 #ifdef DEBUG
     extStorage.insert(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 #endif
+    if (mcvr::diagnostics::device_loss::enabled()) extStorage.insert(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 
     // Check for extensions
     uint32_t extensionCount = 0;
@@ -129,7 +160,8 @@ vk::Instance::Instance() {
 
     if (extensionCount == 0) {
         instanceCerr() << "no extensions supported!" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::raise(mcvr::failure::Kind::initialization, VK_ERROR_EXTENSION_NOT_PRESENT,
+                             "vkEnumerateInstanceExtensionProperties(no extensions)");
     }
 
     std::vector<VkExtensionProperties> availableExtensions(extensionCount);
@@ -156,6 +188,8 @@ vk::Instance::Instance() {
 
     dlssInstanceExtensionsCompatible_ =
         dlssRequirementQuerySuccess && areRequiredExtensionsSupported(dlssRequiredExtensions);
+    dlssSRCompatible_ = dlssSRQuery && areRequiredExtensionsSupported(dlssSRRequired);
+    dlssFGCompatible_ = dlssFGQuery && areRequiredExtensionsSupported(dlssFGRequired);
     if (!dlssInstanceExtensionsCompatible_) {
         instanceCerr() << "dlss instance extension requirements are not fully satisfied." << std::endl;
     }
@@ -178,6 +212,15 @@ vk::Instance::Instance() {
     }
 
 #ifdef DEBUG
+    uint32_t layerCount = 0;
+    vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
+    std::vector<VkLayerProperties> availableLayers(layerCount);
+    vkEnumerateInstanceLayerProperties(&layerCount, availableLayers.data());
+    const bool validationLayerAvailable =
+        std::any_of(availableLayers.begin(), availableLayers.end(), [](const auto &layer) {
+            return std::strcmp(layer.layerName, DEBUG_LAYER) == 0;
+        });
+
     instanceCout() << "selected extensions:" << std::endl;
     for (const auto &extension : extensions) { instanceCout() << "\t" << extension << std::endl; }
 #endif
@@ -189,8 +232,10 @@ vk::Instance::Instance() {
     createInfo.ppEnabledExtensionNames = extensions.data();
 
 #ifdef DEBUG
-    createInfo.enabledLayerCount = 1;
-    createInfo.ppEnabledLayerNames = &DEBUG_LAYER;
+    if (validationLayerAvailable) {
+        createInfo.enabledLayerCount = 1;
+        createInfo.ppEnabledLayerNames = &DEBUG_LAYER;
+    }
 
     // VkValidationFeatureEnableEXT enables[] = {
     //     VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT,
@@ -206,9 +251,9 @@ vk::Instance::Instance() {
 #endif
 
     // Initialize Vulkan instance
-    if (vkCreateInstance(&createInfo, nullptr, &instance_) != VK_SUCCESS) {
+    if (const auto result = vkCreateInstance(&createInfo, nullptr, &instance_); result != VK_SUCCESS) {
         instanceCerr() << "failed to create instance!" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::raise(mcvr::failure::Kind::initialization, result, "vkCreateInstance");
     } else {
 #ifdef DEBUG
         instanceCout() << "created vulkan instance" << std::endl;
@@ -216,10 +261,15 @@ vk::Instance::Instance() {
     }
 
     volkLoadInstance(instance_);
+    mcvr::StreamlineRuntime::get().hookInstance(instance_);
+
 }
 
 vk::Instance::~Instance() {
-    vkDestroyInstance(instance_, nullptr);
+    if (instance_ != VK_NULL_HANDLE) {
+        vkDestroyInstance(instance_, nullptr);
+        instance_ = VK_NULL_HANDLE;
+    }
 
 #ifdef DEBUG
     instanceCout() << "instance deconstructed" << std::endl;

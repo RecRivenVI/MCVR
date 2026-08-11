@@ -13,11 +13,14 @@
 #include "util/random.glsl"
 #include "util/ray_cone.glsl"
 #include "util/ray.glsl"
+#include "util/material_faces.glsl"
 #include "util/util.glsl"
 #include "common/first_hit_state.glsl"
 #include "common/runtime_primary_secondary_arrays.glsl"
 
 layout(set = 0, binding = 0) uniform sampler2D textures[];
+
+#include "util/emissive_overlay.glsl"
 
 layout(set = 1, binding = 0) uniform accelerationStructureEXT topLevelAS;
 
@@ -60,6 +63,8 @@ layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Ind
 indexBuffer;
 
 #include "util/vertex.glsl"
+#include "util/geometry_backface_debug.glsl"
+#include "util/vertex_shading_cache.glsl"
 
 layout(location = 0) rayPayloadInEXT MainRay mainRay;
 hitAttributeEXT vec2 attribs;
@@ -77,7 +82,12 @@ bool loadPreviousScenePos(uint geometryBufferIndex, uint primitiveID, vec3 baryC
     uint i1 = lastIndexBuffer.indices[indexBaseID + 1u];
     uint i2 = lastIndexBuffer.indices[indexBaseID + 2u];
 
+    uint current0,current1,current2;
+    loadTriangleIndices(geometryBufferIndex,primitiveID,current0,current1,current2);
+    if(current0!=i0 || current1!=i1 || current2!=i2) return false;
+    PositionBuffer currentPositionBuffer=PositionBuffer(positionBufferAddrs.addrs[geometryBufferIndex]);
     PositionBuffer lastPositionBuffer = PositionBuffer(lastPositionAddr);
+    if(((currentPositionBuffer.vertices[current0].pad0 ^ lastPositionBuffer.vertices[i0].pad0)&2u)!=0u) return false;
     vec3 p0 = lastPositionBuffer.vertices[i0].pos;
     vec3 p1 = lastPositionBuffer.vertices[i1].pos;
     vec3 p2 = lastPositionBuffer.vertices[i2].pos;
@@ -91,13 +101,13 @@ void main() {
     uint instanceID = gl_InstanceCustomIndexEXT;
     uint geometryID = gl_GeometryIndexEXT;
     uint geometryBufferIndex = getGeometryBufferIndex(instanceID, geometryID);
+    if (geometryBackfaceDebug(mainRay, instanceAppearances.values[geometryBufferIndex].materialFlags)) return;
 
     uint i0, i1, i2;
     MaterialVertex m0, m1, m2;
-    loadTriangleIndices(geometryBufferIndex, gl_PrimitiveID, i0, i1, i2);
-    loadTriangleMaterial(geometryBufferIndex, i0, i1, i2, m0, m1, m2);
     PositionVertex p0, p1, p2;
-    loadTrianglePositions(geometryBufferIndex, i0, i1, i2, p0, p1, p2);
+    loadTriangle(geometryBufferIndex, gl_PrimitiveID, i0, i1, i2,
+        p0, p1, p2, m0, m1, m2);
 
     vec3 baryCoords = vec3(1.0 - (attribs.x + attribs.y), attribs.x, attribs.y);
     vec3 planeHitWorldPos = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
@@ -105,16 +115,25 @@ void main() {
 
     uint packedData = m0.packedData;
     bool useColorLayer = hasColorLayer(packedData);
+    bool colorLayerMix = hasColorLayerMix(packedData);
     bool useTexture = hasTexture(packedData);
     bool useGlint = hasGlint(packedData);
     bool useOverlay = hasOverlay(packedData);
     vec4 colorLayerValue = useColorLayer ?
                                baryCoords.x * m0.colorLayer + baryCoords.y * m1.colorLayer + baryCoords.z * m2.colorLayer :
                                vec4(1.0);
+    vec3 flywheelLocalPosition = baryCoords.x * p0.pos + baryCoords.y * p1.pos + baryCoords.z * p2.pos;
+    vec3 flywheelLocalNormal = normalize(baryCoords.x * m0.norm + baryCoords.y * m1.norm
+        + baryCoords.z * m2.norm);
+    ivec2 flywheelLightUv = ivec2(round(baryCoords.x * vec2(m0.lightUV)
+        + baryCoords.y * vec2(m1.lightUV) + baryCoords.z * vec2(m2.lightUV)));
+    applyFlywheelFragmentLighting(geometryBufferIndex, flywheelLocalPosition,
+        flywheelLocalNormal, colorLayerValue, flywheelLightUv);
     vec3 colorLayer = colorLayerValue.rgb;
 
     uint textureID = m0.textureID;
     uint alphaMode = getAlphaMode(packedData);
+    bool textSurface = isTextMode(alphaMode);
     uint coordinate = getCoordinate(packedData);
     vec2 textureUV = vec2(0.0);
     TextureMapEntry textureMap = TextureMapEntry(-1, -1, -1);
@@ -125,8 +144,8 @@ void main() {
     vec3 dposdv = vec3(0.0, 1.0, 0.0);
     bool hasHeightMapSurface = false;
     float maxDepthWorld = 0.0;
-    mat3 objectToWorld = mat3(gl_ObjectToWorld3x4EXT);
-    mat3 normalMatrix = transpose(mat3(gl_WorldToObject3x4EXT));
+    mat3 objectToWorld = mat3(gl_ObjectToWorldEXT);
+    mat3 normalMatrix = mat3(gl_WorldToObject3x4EXT);
     vec3 baseGeoNormal =
         normalizeF(normalMatrix * cross(p1.pos - p0.pos, p2.pos - p0.pos), vec3(0.0, 1.0, 0.0));
     vec3 dPduWorld = objectToWorld * dposdu;
@@ -143,23 +162,25 @@ void main() {
 
         float coneRadiusWorld = mainRay.coneWidth + gl_HitTEXT * mainRay.coneSpread;
         computedposduDv(p0.pos, p1.pos, p2.pos, m0.textureUV, m1.textureUV, m2.textureUV, dposdu, dposdv);
-        lod = lodWithCone(textures[nonuniformEXT(textureID)], textureUV, coneRadiusWorld, dposdu, dposdv);
-
+        lod = lodWithObjectCone(textures[nonuniformEXT(textureID)], coneRadiusWorld, mat3(gl_ObjectToWorldEXT),
+            p0.pos, p1.pos, p2.pos, m0.textureUV, m1.textureUV, m2.textureUV);
         dPduWorld = objectToWorld * dposdu;
         dPdvWorld = objectToWorld * dposdv;
         baseGeoNormal = normalizeF(cross(dPduWorld, dPdvWorld), baseGeoNormal);
         if (dot(baseGeoNormal, viewDir) < 0.0) { baseGeoNormal = -baseGeoNormal; }
 
-        bool isWaterMaterial = useRealisticWaterSurface && isFlaggedWaterSurface(textureMap.flag, textureUV, lod);
+        bool isWaterMaterial = useRealisticWaterSurface && isFlaggedWaterSurface(textureMap, textureUV, lod);
         hasFftWaterSurface = isWaterMaterial && abs(baseGeoNormal.y) > 0.75;
 
-        if (parallaxEnabled && textureMap.normal >= 0 && coordinate != 1u) {
+        if (parallaxEnabled && textureMap.normal >= 0 && coordinate != 1u && !textSurface) {
             maxDepthWorld = heightMapMaxDepthWorld(atlasUvMin, atlasUvMax, dPduWorld, dPdvWorld);
             hasHeightMapSurface =
                 maxDepthWorld > heightMapMinWorldDepth && dot(viewDir, baseGeoNormal) > ADV_PARALLAX_MIN_VIEW_DOT;
         }
     }
     if (dot(baseGeoNormal, viewDir) < 0.0) { baseGeoNormal = -baseGeoNormal; }
+    vec3 sourceShadingNormal = vertexBrdfNormal(packedData, m0.norm, m1.norm, m2.norm,
+                                               baryCoords, normalMatrix, baseGeoNormal);
     bool traceLocalHeight = hasHeightMapSurface && shouldTraceRestirParallax(lod, planeHitWorldPos) && !hasFftWaterSurface;
 
     HeightMapHit initialHit;
@@ -199,10 +220,18 @@ void main() {
     vec3 glint = vec3(0.0);
     if (useGlint) {
         vec2 glintUV = baryCoords.x * m0.glintUV + baryCoords.y * m1.glintUV + baryCoords.z * m2.glintUV;
-        glintUV = (worldUBO.textureMat * vec4(glintUV, 0.0, 1.0)).xy;
+        glintUV = transformGlintUv(worldUBO.textureMat, glintUV, m0.packedData);
         glint = sampleTexture(textures[nonuniformEXT(m0.glintTexture)], glintUV, false).rgb;
     }
     glint *= glint;
+    vec2 emissiveOverlayTextureID = encodeFirstHitUint(m0.emissiveOverlayTextureID);
+    vec4 cachedCoatings = vec4(float(packUnorm4x8(vec4(glint, 0.0))),
+                               emissiveOverlayTextureID, float(m0.overlayUV.x));
+    bool cachedVertexNormal = hasVertexShadingNormal(packedData);
+    float cachedOverlayY = encodeVertexShadingOverlayY(cachedVertexNormal,
+        float(m0.overlayUV.y), sourceShadingNormal);
+    cachedCoatings = encodeVertexShadingAux(cachedVertexNormal, cachedCoatings,
+        sourceShadingNormal);
     uint surfaceCachePackedData = packedData | NO_HEIGHT_SURFACE_BIT;
 
     if (raySurfaceCacheTargetSecondary(mainRay)) {
@@ -212,9 +241,9 @@ void main() {
         storeSecondarySurfaceCacheLayer(ivec2(gl_LaunchIDEXT.xy), 3, vec4(baseGeoNormal, atlasUvMin.y));
         storeSecondarySurfaceCacheLayer(ivec2(gl_LaunchIDEXT.xy), 4, vec4(atlasUvMax, encodeFirstHitUint(textureID)));
         storeSecondarySurfaceCacheLayer(ivec2(gl_LaunchIDEXT.xy), 5, colorLayerValue);
-        storeSecondarySurfaceCacheLayer(ivec2(gl_LaunchIDEXT.xy), 6, vec4(glint, float(m0.overlayUV.x)));
+        storeSecondarySurfaceCacheLayer(ivec2(gl_LaunchIDEXT.xy), 6, cachedCoatings);
         storeSecondarySurfaceCacheLayer(ivec2(gl_LaunchIDEXT.xy), 7,
-                                        vec4(float(m0.overlayUV.y), encodeFirstHitUint(surfaceCachePackedData),
+                                        vec4(cachedOverlayY, encodeFirstHitUint(surfaceCachePackedData),
                                              ADV_SURFACE_CACHE_VALID_FLAG));
     } else {
         storePrimarySurfaceCacheLayer(ivec2(gl_LaunchIDEXT.xy), 0, vec4(planeHitWorldPos, textureUV.x));
@@ -223,17 +252,18 @@ void main() {
         storePrimarySurfaceCacheLayer(ivec2(gl_LaunchIDEXT.xy), 3, vec4(baseGeoNormal, atlasUvMin.y));
         storePrimarySurfaceCacheLayer(ivec2(gl_LaunchIDEXT.xy), 4, vec4(atlasUvMax, encodeFirstHitUint(textureID)));
         storePrimarySurfaceCacheLayer(ivec2(gl_LaunchIDEXT.xy), 5, colorLayerValue);
-        storePrimarySurfaceCacheLayer(ivec2(gl_LaunchIDEXT.xy), 6, vec4(glint, float(m0.overlayUV.x)));
+        storePrimarySurfaceCacheLayer(ivec2(gl_LaunchIDEXT.xy), 6, cachedCoatings);
         storePrimarySurfaceCacheLayer(ivec2(gl_LaunchIDEXT.xy), 7,
-                                      vec4(float(m0.overlayUV.y), encodeFirstHitUint(surfaceCachePackedData),
+                                      vec4(cachedOverlayY, encodeFirstHitUint(surfaceCachePackedData),
                                            ADV_SURFACE_CACHE_VALID_FLAG));
     }
     raySetSurfaceCacheWritten(mainRay, true);
 
     SampledSurface surface;
     sampleSurfaceState(useTexture, textureID, textureMap, atlasUvMin, atlasUvMax, initialHit.uv, lod, alphaMode,
-                       colorLayerValue, colorLayer, glint, useOverlay, m0.overlayUV, dPduWorld, dPdvWorld,
-                       baseGeoNormal, hasHeightMapSurface, maxDepthWorld, initialHit, hitWorldPos, viewDir,
+                       colorLayerMix, colorLayerValue, colorLayer, glint, useOverlay, m0.overlayUV, dPduWorld, dPdvWorld,
+                       baseGeoNormal, sourceShadingNormal, hasVertexShadingNormal(packedData),
+                       hasHeightMapSurface, maxDepthWorld, initialHit, hitWorldPos, viewDir,
                        hasFftWaterSurface, surface);
 
     mainRay.normal = surface.shadingNormal;
@@ -346,8 +376,10 @@ void main() {
 
         vec3 nextWorldPos = currentSurface.worldPos + sampleDir * localBounceHit.t;
         sampleSurfaceState(useTexture, textureID, textureMap, atlasUvMin, atlasUvMax, localBounceHit.uv, lod, alphaMode,
-                           colorLayerValue, colorLayer, glint, useOverlay, m0.overlayUV, dPduWorld, dPdvWorld,
-                           baseGeoNormal, hasHeightMapSurface, maxDepthWorld, localBounceHit, nextWorldPos, -sampleDir,
+                           colorLayerMix, colorLayerValue, colorLayer, glint, useOverlay, m0.overlayUV, dPduWorld,
+                           dPdvWorld,
+                           baseGeoNormal, sourceShadingNormal, hasVertexShadingNormal(packedData),
+                           hasHeightMapSurface, maxDepthWorld, localBounceHit, nextWorldPos, -sampleDir,
                            hasFftWaterSurface, currentSurface);
         currentViewDir = -sampleDir;
     }

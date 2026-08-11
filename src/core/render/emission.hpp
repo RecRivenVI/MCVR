@@ -21,6 +21,7 @@ struct LightInfo {
     float area;
 
     uint32_t textureID;
+    uint32_t sourceFaceFlags = 0;
     uint64_t stableID;
 };
 

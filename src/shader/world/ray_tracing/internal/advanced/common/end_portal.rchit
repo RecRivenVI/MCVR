@@ -64,6 +64,7 @@ layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Ind
 indexBuffer;
 
 #include "util/vertex.glsl"
+#include "util/geometry_backface_debug.glsl"
 
 layout(location = 0) rayPayloadInEXT MainRay mainRay;
 hitAttributeEXT vec2 attribs;
@@ -77,6 +78,7 @@ void main() {
     uint geometryID = gl_GeometryIndexEXT;
 
     uint geometryBufferIndex = getGeometryBufferIndex(instanceID, geometryID);
+    if (geometryBackfaceDebug(mainRay, instanceAppearances.values[geometryBufferIndex].materialFlags)) return;
 
     uint i0;
     uint i1;

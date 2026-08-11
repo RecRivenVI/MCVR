@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 
 #include "core/all_extern.hpp"
 
@@ -39,11 +40,12 @@ class HostVisibleBuffer : public Buffer, public SharedObject<HostVisibleBuffer> 
 
     size_t size_;
     VkBufferUsageFlags bufferUsage_;
+    const char *allocTraceTag_ = nullptr;
     void *mappedPtr_ = nullptr;
     VkDeviceAddress bufferAddress_ = 0;
     VkBuffer buffer_ = VK_NULL_HANDLE;
     VmaAllocation allocation_ = VK_NULL_HANDLE;
-    VmaAllocationInfo allocationInfo_;
+    VmaAllocationInfo allocationInfo_{};
 };
 
 class DeviceLocalBuffer : public Buffer, public SharedObject<DeviceLocalBuffer> {
@@ -79,6 +81,9 @@ class DeviceLocalBuffer : public Buffer, public SharedObject<DeviceLocalBuffer> 
 
     void uploadToStagingBuffer(void *src);
     void uploadToStagingBuffer(void *src, size_t size, size_t offset);
+    // The callback must fill the whole buffer and must not retain the pointer or submit GPU work.
+    // Allocation, flush and existing transient retirement are identical to ordinary uploads.
+    void writeToStagingBuffer(const std::function<void(void *, size_t)> &write);
     void flushStagingBuffer();
     void releaseStaging();
 
@@ -92,6 +97,7 @@ class DeviceLocalBuffer : public Buffer, public SharedObject<DeviceLocalBuffer> 
     void uploadToBuffer(std::shared_ptr<CommandBuffer> cmdBuffer, size_t size, size_t srcOffset, size_t dstOffset);
 
     size_t size() override;
+    VkBufferUsageFlags usageFlags() const noexcept { return bufferUsage_; }
     VkBuffer &vkStagingBuffer();
     VkBuffer &vkBuffer() override;
     void *mappedPtr();
@@ -102,8 +108,10 @@ class DeviceLocalBuffer : public Buffer, public SharedObject<DeviceLocalBuffer> 
     std::shared_ptr<Device> device_;
 
     bool persistStaging_;
+    void prepareStagingBuffer();
     std::shared_ptr<TemporaryStagingBuffer> transientStagingRetainer_ = nullptr;
     size_t size_;
+    const char *allocTraceTag_ = nullptr;
     void *mappedPtr_ = nullptr;
     VkBufferUsageFlags bufferUsage_;
     VmaAllocationCreateFlags vmaAllocationFlags_;
@@ -111,20 +119,22 @@ class DeviceLocalBuffer : public Buffer, public SharedObject<DeviceLocalBuffer> 
     VkDeviceAddress bufferAddress_ = 0;
     VkBuffer stagingBuffer_ = VK_NULL_HANDLE;
     VmaAllocation stagingAllocation_ = VK_NULL_HANDLE;
-    VmaAllocationInfo stagingAllocationInfo_;
+    VmaAllocationInfo stagingAllocationInfo_{};
     VkBuffer buffer_ = VK_NULL_HANDLE;
     VmaAllocation allocation_ = VK_NULL_HANDLE;
-    VmaAllocationInfo allocationInfo_;
+    VmaAllocationInfo allocationInfo_{};
 };
 
 class TemporaryStagingBuffer : public SharedObject<TemporaryStagingBuffer> {
   public:
-    TemporaryStagingBuffer(std::shared_ptr<VMA> vma, VkBuffer buffer, VmaAllocation allocation);
+    TemporaryStagingBuffer(std::shared_ptr<VMA> vma, VkBuffer buffer, VmaAllocation allocation, size_t size);
     ~TemporaryStagingBuffer();
 
   private:
     std::shared_ptr<VMA> vma_;
     VkBuffer buffer_ = VK_NULL_HANDLE;
     VmaAllocation allocation_ = VK_NULL_HANDLE;
+    size_t size_ = 0;
+    const char *allocTraceTag_ = nullptr;
 };
 }; // namespace vk

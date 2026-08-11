@@ -50,6 +50,8 @@ class XessSrModule : public WorldModule, public SharedObject<XessSrModule> {
     void
     bindTexture(std::shared_ptr<vk::Sampler> sampler, std::shared_ptr<vk::DeviceLocalImage> image, int index) override;
 
+    void onResourceReload() override;
+
     void preClose() override;
 
     static void getRenderResolution(uint32_t displayWidth,
@@ -75,8 +77,17 @@ class XessSrModule : public WorldModule, public SharedObject<XessSrModule> {
     float preExposure_ = 1.0f;
     bool xessEnabled_ = true;
 
-    std::shared_ptr<mcvr::XeSSWrapper> xess_;
-    bool initialized_ = false;
+
+
+
+    struct ViewHistory {
+        std::shared_ptr<mcvr::XeSSWrapper> xess_;
+        bool initialized_ = false;
+        glm::vec3 lastCameraPos_ = glm::vec3(0.0f);
+        glm::vec3 lastCameraDir_ = glm::vec3(0.0f, 0.0f, -1.0f);
+        bool firstFrame_ = true;
+    };
+    std::vector<ViewHistory> histories_;
 
     std::vector<std::shared_ptr<vk::DeviceLocalImage>> deviceDepthImages_;
     std::vector<std::shared_ptr<vk::DeviceLocalImage>> xessMotionVectorImages_;
@@ -86,9 +97,9 @@ class XessSrModule : public WorldModule, public SharedObject<XessSrModule> {
     std::shared_ptr<vk::ComputePipeline> motionUpscalePipeline_;
     std::shared_ptr<vk::ComputePipeline> normalRoughnessUpscalePipeline_;
 
-    glm::vec3 lastCameraPos_ = glm::vec3(0.0f);
-    glm::vec3 lastCameraDir_ = glm::vec3(0.0f, 0.0f, -1.0f);
-    bool firstFrame_ = true;
+
+
+
 
     std::vector<std::array<std::shared_ptr<vk::DeviceLocalImage>, 5>> inputImages_;
     std::vector<std::array<std::shared_ptr<vk::DeviceLocalImage>, 4>> outputImages_;
