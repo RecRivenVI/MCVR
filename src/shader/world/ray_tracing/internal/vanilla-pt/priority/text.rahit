@@ -1,0 +1,46 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#include "util/priority_coverage.glsl"
+#include "common/shared.hpp"
+
+layout(set = 0, binding = 0) uniform sampler2D textures[];
+layout(set = 1, binding = 1) readonly buffer BLASOffsets { uint offsets[]; } blasOffsets;
+layout(set = 1, binding = 2) readonly buffer IndexBufferAddr { uint64_t addrs[]; } indexBufferAddrs;
+layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer IndexBuffer { uint indices[]; } indexBuffer;
+#include "util/vertex.glsl"
+
+hitAttributeEXT vec2 attribs;
+
+#include "util/material_faces.glsl"
+void main() {
+    if (!acceptsMaterialFace(instanceAppearances.values[getGeometryBufferIndex(gl_InstanceCustomIndexEXT, gl_GeometryIndexEXT)].materialFlags,
+                             gl_HitKindEXT == gl_HitKindFrontFacingTriangleEXT)) {
+        ignoreIntersectionEXT;
+        return;
+    }
+
+    uint geometryBufferIndex = getGeometryBufferIndex(gl_InstanceCustomIndexEXT, gl_GeometryIndexEXT);
+    uint i0, i1, i2;
+    MaterialVertex m0, m1, m2;
+    loadTriangleIndices(geometryBufferIndex, gl_PrimitiveID, i0, i1, i2);
+    loadTriangleMaterial(geometryBufferIndex, i0, i1, i2, m0, m1, m2);
+    vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
+    vec4 layer = hasColorLayer(m0.packedData)
+        ? bary.x * m0.colorLayer + bary.y * m1.colorLayer + bary.z * m2.colorLayer
+        : vec4(1.0);
+    vec4 texel = vec4(1.0);
+    if (hasTexture(m0.packedData)) {
+        vec2 uv = bary.x * m0.textureUV + bary.y * m1.textureUV + bary.z * m2.textureUV;
+        texel = textureLod(textures[nonuniformEXT(m0.textureID)], uv, 0.0);
+    }
+    uint mode = getAlphaMode(m0.packedData);
+    if (resolvePriorityAlpha(resolveTextCoverage(texel, hasTexture(m0.packedData), layer.a,
+                            mode), mode) <= 0.001) {
+        ignoreIntersectionEXT;
+    }
+}

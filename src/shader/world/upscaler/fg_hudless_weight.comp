@@ -1,0 +1,12 @@
+#version 460
+layout(local_size_x=8, local_size_y=8) in;
+layout(set=0,binding=0) uniform sampler2D hudless;
+layout(set=0,binding=1,rgba16f) uniform writeonly image2D destination;
+layout(set=0,binding=2) uniform sampler2D finalColor;
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(destination)))) return;
+    float transmission = 1.0 - clamp(texelFetch(finalColor, pixel, 0).a, 0.0, 1.0);
+    // Multiply before linear filtering. Multiplying filtered H and A loses covariance.
+    imageStore(destination, pixel, vec4(texelFetch(hudless, pixel, 0).rgb * transmission, transmission));
+}

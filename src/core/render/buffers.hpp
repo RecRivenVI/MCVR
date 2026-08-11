@@ -1,5 +1,6 @@
 
 #pragma once
+#include <atomic>
 
 #include "common/shared.hpp"
 #include "common/singleton.hpp"
@@ -18,9 +19,13 @@ class Buffers : public SharedObject<Buffers> {
 
     void resetFrame();
     uint32_t allocateBuffer();
+    uint32_t allocatePersistentBuffer();
+    void releasePersistentBuffer(uint32_t id);
     void initializeBuffer(uint32_t id, uint32_t size, VkBufferUsageFlags usageFlags);
     void buildIndexBuffer(uint32_t dstId, int type, int drawMode, int vertexCount, int expectedIndexCount);
     void queueOverlayUpload(uint8_t *srcPointer, uint32_t dstId);
+    void queuePersistentUploadRange(uint8_t *srcPointer, uint32_t size, uint32_t dstId,
+                                    uint32_t dstOffset);
     void queueImportantWorldUpload(std::shared_ptr<vk::DeviceLocalBuffer> buffer);
     void queueImportantWorldUpload(std::shared_ptr<vk::DeviceLocalBuffer> vertexBuffer,
                                    std::shared_ptr<vk::DeviceLocalBuffer> indexBuffer);
@@ -29,9 +34,11 @@ class Buffers : public SharedObject<Buffers> {
     bool registerOverlayDrawUniformSize(uint32_t size);
     void appendOverlayDrawUniform(uint8_t *srcPointer, uint32_t size, uint32_t &uniformOffset);
     void appendOverlayPostUniform(vk::Data::OverlayPostUBO &ubo);
+    vk::Data::OverlayPostUBO recordedOverlayPostUniform(uint32_t offset);
     void buildAndUploadOverlayUniformBuffer();
 
     void setAndUploadWorldUniformBuffer(vk::Data::WorldUBO &ubo);
+    void invalidateWorldHistory() { worldHistoryValid_.store(false, std::memory_order_release); }
     void setAndUploadSkyUniformBuffer(vk::Data::SkyUBO &ubo);
     void setAndUploadTextureMappingBuffer(vk::Data::TextureMapping &mapping);
     void setAndUploadExposureDataBuffer(vk::Data::ExposureData &exposureData);
@@ -80,6 +87,8 @@ class Buffers : public SharedObject<Buffers> {
     uint32_t overlayPostUniformDescriptorRange_ = 1;
 
     std::vector<std::shared_ptr<vk::HostVisibleBuffer>> worldUniformBuffer_;
+    vk::Data::WorldUBO lastWorldUbo_{};
+    std::atomic<bool> worldHistoryValid_{false};
     std::vector<std::shared_ptr<vk::HostVisibleBuffer>> lastWorldUniformBuffer_;
     std::vector<std::shared_ptr<vk::HostVisibleBuffer>> skyUniformBuffer_;
     std::vector<std::shared_ptr<vk::HostVisibleBuffer>> textureMappingBuffer_;
@@ -88,5 +97,16 @@ class Buffers : public SharedObject<Buffers> {
     std::shared_ptr<std::vector<std::shared_ptr<vk::DeviceLocalBuffer>>> importantIndexVertexBuffer_;
 
     bool useJitter_ = true;
+    size_t jitterSequenceIndex_ = 0;
     std::recursive_mutex mtx_;
+    struct PersistentBuffer {
+        std::shared_ptr<vk::DeviceLocalBuffer> buffer;
+        uint32_t size = 0;
+        VkBufferUsageFlags usage = 0;
+        bool uploadReady = false;
+        bool rangeWriteOpen = false;
+    };
+    std::map<uint32_t, PersistentBuffer> persistentBuffers_;
+    std::vector<std::shared_ptr<vk::DeviceLocalBuffer>> pendingPersistentUploads_;
+    uint32_t nextPersistentId_ = 0x40000000u;
 };

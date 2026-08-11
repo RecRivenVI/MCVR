@@ -164,14 +164,43 @@ namespace VertexFormat {
 
         T_IVEC2 lightUV;
         T_UINT packedData;
-        T_UINT pad0;
+        T_UINT emissiveOverlayTextureID;
     };
+
+    struct InstanceAppearance {
+        T_VEC4 colorMultiply;
+        T_VEC4 colorReplace;
+        T_VEC4 uv;
+        T_VEC4 shadow;
+        T_IVEC2 overlay;
+        T_IVEC2 light;
+        T_UINT flags;
+        T_UINT textureOverride;
+        T_FLOAT fluidProgress;
+        T_INT lightScene;
+        T_VEC4 normalCorrection0;
+        T_VEC4 normalCorrection1;
+        T_VEC4 normalCorrection2;
+        T_UINT lightSectionStart;
+        T_UINT lightSectionCount;
+        T_UINT materialFlags;
+        T_UINT materialState;
+        T_MAT4 lightTransform;
+        T_VEC4 entityLight0;
+        T_VEC4 entityLight1;
+        T_MAT4 crumblingTransform;
+        T_VEC4 crumblingNormal0;
+        T_VEC4 crumblingNormal1;
+        T_VEC4 crumblingNormal2;
+    };
+
 #ifdef __cplusplus
 }; // namespace VertexFormat
 
 static_assert(sizeof(VertexFormat::MaterialVertex) == 80);
 static_assert(offsetof(VertexFormat::MaterialVertex, lightUV) == 64);
 static_assert(offsetof(VertexFormat::MaterialVertex, packedData) == 72);
+static_assert(sizeof(VertexFormat::InstanceAppearance) == 368);
 #endif
 
 #ifdef __cplusplus
@@ -206,6 +235,10 @@ namespace Data {
         T_VEC2 blurDir;
         T_FLOAT radius;
         T_FLOAT radiusMultiplier;
+        T_VEC4 diagramRect;
+        T_VEC4 diagramLineColor;
+        T_VEC4 diagramShadowColor;
+        T_VEC4 diagramParams;
     };
 
     struct WorldUBO {
@@ -236,7 +269,7 @@ namespace Data {
 
         T_UINT fogType;
         T_UINT skyType;
-        T_UINT pad2;
+        T_FLOAT glintStrength;
         T_UINT pad3;
 
         T_DVEC4 cameraPos; // w for padding
@@ -246,8 +279,27 @@ namespace Data {
         T_UINT endSkyTextureID;
         T_UINT endPortalTextureID;
         T_UINT lightMapTextureID;
-        T_UINT pad4;
+        T_UINT uiPrimaryOwner; // 0 = ordinary world; UI view owner for direct camera visibility
+
+        // Display-resolution camera effects are composed after denoising/upscaling and after
+        // exposure metering, but before tone mapping.  A negative texture id disables a layer.
+        // x=block atlas, y=fluid overlay, z=fire atlas, w=reserved.
+        T_IVEC4 cameraEffectTextureIDs;
+
+        // Atlas UV bounds are (u0, v0, u1, v1). The standalone fluid texture uses
+        // cameraFluidParams=(uBase, vBase, repeatU, alpha) and cameraFluidColor.a=repeatV;
+        // signed repeat axes also encode Veil's fullscreen-triangle orientation.
+        T_VEC4 cameraBlockUV;
+        T_VEC4 cameraBlockColor;
+        T_VEC4 cameraFluidParams;
+        T_VEC4 cameraFluidColor;
+        T_VEC4 cameraFireUV;
+        // x=alpha, y=scene-linear emission scale, z/w reserved.
+        T_VEC4 cameraFireParams;
     };
+#ifdef __cplusplus
+    static_assert(sizeof(WorldUBO) == 704, "WorldUBO layout must match BufferProxy serialization");
+#endif
 
     struct SkyUBO {
         T_VEC3 baseColor;
@@ -266,7 +318,10 @@ namespace Data {
 
         T_UINT sunTextureID;
         T_UINT moonTextureID;
-        T_UINT pad0;
+        // Vanilla's LevelRenderer multiplies the star vertex color and alpha by
+        // ClientLevel#getStarBrightness(partialTick). Keep this in the existing
+        // final four-byte slot so the JNI/UBO ABI remains 80 bytes.
+        T_FLOAT starBrightness;
     };
 
     struct TextureMapEntry {

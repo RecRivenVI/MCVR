@@ -12,6 +12,8 @@ class Device;
 class RenderPass;
 class DescriptorTable;
 class GraphicsPipelineBuilder;
+class RayTracingPipelineBuilder;
+class ComputePipelineBuilder;
 class Shader;
 
 class GraphicsPipeline : public SharedObject<GraphicsPipeline> {
@@ -27,9 +29,15 @@ class GraphicsPipeline : public SharedObject<GraphicsPipeline> {
     std::shared_ptr<Device> device_;
 
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+
+    // Strong ownership of the pipeline layout generation. Descriptor tables are rebuilt while
+    // this pipeline remains bound, so the layout must outlive the table (see descriptor.hpp).
+    std::shared_ptr<void> pipelineLayoutKeepAlive_;
 };
 
 class RayTracingPipeline : public SharedObject<RayTracingPipeline> {
+    friend RayTracingPipelineBuilder;
+
   public:
     RayTracingPipeline(std::shared_ptr<Device> device, VkPipeline pipeline);
     ~RayTracingPipeline();
@@ -40,10 +48,13 @@ class RayTracingPipeline : public SharedObject<RayTracingPipeline> {
     std::shared_ptr<Device> device_;
 
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+
+    std::shared_ptr<void> pipelineLayoutKeepAlive_;
 };
 
 class ComputePipeline : public SharedObject<ComputePipeline> {
     friend GraphicsPipelineBuilder;
+    friend ComputePipelineBuilder;
 
   public:
     ComputePipeline(std::shared_ptr<Device> device, VkPipeline pipeline);
@@ -55,6 +66,8 @@ class ComputePipeline : public SharedObject<ComputePipeline> {
     std::shared_ptr<Device> device_;
 
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+
+    std::shared_ptr<void> pipelineLayoutKeepAlive_;
 };
 
 class GraphicsPipelineBuilder {
@@ -208,6 +221,7 @@ class GraphicsPipelineBuilder {
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     uint32_t subpassIndex_ = 0;
+    std::shared_ptr<void> pipelineLayoutKeepAlive_;
 };
 
 class RayTracingPipelineBuilder {
@@ -249,6 +263,7 @@ class RayTracingPipelineBuilder {
     ShaderGroupBuilder shaderGroupBuilder_;
 
     VkPipelineLayout pipelineLayout_;
+    std::shared_ptr<void> pipelineLayoutKeepAlive_;
 };
 
 template <typename T>
@@ -256,8 +271,10 @@ GraphicsPipelineBuilder &GraphicsPipelineBuilder::defineVertexInputState() {
     VertexLayoutInfo &vertexLayoutInfo = Vertex::vertexLayoutInfo<T>();
 
     vertexInputStateCreateInfo_.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertexInputStateCreateInfo_.vertexBindingDescriptionCount = 1;
-    vertexInputStateCreateInfo_.pVertexBindingDescriptions = &vertexLayoutInfo.bindingDescription;
+    vertexInputStateCreateInfo_.vertexBindingDescriptionCount =
+        static_cast<uint32_t>(vertexLayoutInfo.bindingDescriptions.size());
+    vertexInputStateCreateInfo_.pVertexBindingDescriptions =
+        vertexLayoutInfo.bindingDescriptions.data();
     vertexInputStateCreateInfo_.vertexAttributeDescriptionCount = vertexLayoutInfo.attributeDescriptions.size();
     vertexInputStateCreateInfo_.pVertexAttributeDescriptions = vertexLayoutInfo.attributeDescriptions.data();
 
@@ -277,5 +294,6 @@ class ComputePipelineBuilder {
   private:
     VkShaderModule shaderModule_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
+    std::shared_ptr<void> pipelineLayoutKeepAlive_;
 };
 }; // namespace vk

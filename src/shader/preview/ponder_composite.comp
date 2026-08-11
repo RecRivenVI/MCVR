@@ -1,0 +1,26 @@
+#version 460
+layout(local_size_x=8, local_size_y=8) in;
+layout(set=0,binding=0) uniform sampler2D sceneColor;
+layout(set=0,binding=1) uniform sampler2D primaryDepth;
+layout(rgba8,set=0,binding=2) uniform writeonly image2D outputImage;
+layout(push_constant) uniform CompositeParams { vec2 jitter; } params;
+float hit(ivec2 p) {
+    // Classify each sample BEFORE filtering: mixing finite depth with an infinity
+    // sentinel either erases edge pixels or dilates them to a leaking hard edge.
+    ivec2 size=textureSize(primaryDepth,0);
+    if(any(lessThan(p,ivec2(0))) || any(greaterThanEqual(p,size))) return 0.0;
+    float depth=texelFetch(primaryDepth,p,0).r;
+    return (!isinf(depth) && !isnan(depth) && depth<60000.0) ? 1.0 : 0.0;
+}
+void main() {
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy), size=imageSize(outputImage);
+    if(any(greaterThanEqual(p,size))) return;
+    vec2 uv=(vec2(p)+0.5)/vec2(size);
+    vec3 color=textureLod(sceneColor,uv,0).rgb;
+    vec2 samplePixel=uv*vec2(textureSize(primaryDepth,0))-0.5-params.jitter;
+    ivec2 p0=ivec2(floor(samplePixel));
+    vec2 f=fract(samplePixel);
+    float coverage=mix(mix(hit(p0),hit(p0+ivec2(1,0)),f.x),
+                       mix(hit(p0+ivec2(0,1)),hit(p0+ivec2(1,1)),f.x),f.y);
+    imageStore(outputImage,p,vec4(color,coverage));
+}

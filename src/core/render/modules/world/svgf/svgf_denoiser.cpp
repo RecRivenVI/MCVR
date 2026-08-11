@@ -1,3 +1,4 @@
+#include "core/logging.hpp"
 #include "svgf_denoiser.hpp"
 #include "core/render/renderer.hpp"
 #include "core/render/buffers.hpp"
@@ -60,7 +61,7 @@ bool SvgfDenoiser::init(std::shared_ptr<vk::Instance> instance,
     // ffxInfo.renderHeight = height;
     
     // if (!m_ffxDenoiser.init(ffxInfo)) {
-    //     std::cerr << "Failed to initialize FFX Denoiser, continuing without it." << std::endl;
+    //     mcvr::log::error("SvgfDenoiser") << "Failed to initialize FFX Denoiser, continuing without it." << std::endl;
     // }
 
     return true;
@@ -194,7 +195,7 @@ void SvgfDenoiser::createPipelines() {
 
         auto shader = vk::Shader::create(m_device, (Renderer::folderPath / "shaders/world/svgf/" / shaderName).string());
         if (!shader) {
-            std::cerr << "Failed to load shader: " << shaderName << std::endl;
+            mcvr::log::error("SvgfDenoiser") << "Failed to load shader: " << shaderName << std::endl;
             return;
         }
         
@@ -204,7 +205,7 @@ void SvgfDenoiser::createPipelines() {
         pipelineInfo.stage.module = shader->vkShaderModule();
         pipelineInfo.stage.pName = "main";
         pipelineInfo.layout = p.pipelineLayout;
-        vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &p.pipeline);
+        m_device->createComputePipelines(1, &pipelineInfo, nullptr, &p.pipeline);
 
         p.descriptorPool = m_descriptorPool;
         std::vector<VkDescriptorSetLayout> layouts(m_contextCount, p.descriptorSetLayout);
@@ -449,7 +450,7 @@ void SvgfDenoiser::denoise(std::shared_ptr<vk::CommandBuffer> commandBuffer,
     static int logCounter = 0;
 
     if (frameIndex >= m_framePingPong.size()) {
-        std::cerr << "[SVGF] Error: frameIndex " << frameIndex << " out of bounds (size " << m_framePingPong.size() << ")" << std::endl;
+        mcvr::log::error("SvgfDenoiser") << "[SVGF] Error: frameIndex " << frameIndex << " out of bounds (size " << m_framePingPong.size() << ")" << std::endl;
         return;
     }
 
@@ -498,7 +499,7 @@ void SvgfDenoiser::denoise(std::shared_ptr<vk::CommandBuffer> commandBuffer,
             clearImg(m_specHistory[i].specNormal);
             clearImg(m_specHistory[i].specHistoryLength);
         }
-        std::cerr << "[SVGF] History buffers cleared" << std::endl;
+        mcvr::log::error("SvgfDenoiser") << "[SVGF] History buffers cleared" << std::endl;
     }
 
     auto transition = [&](const std::shared_ptr<vk::DeviceLocalImage>& img, bool discard = false) {

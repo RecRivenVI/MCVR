@@ -12,6 +12,7 @@
 class Framework;
 class Chunks;
 class Entities;
+class Instancing;
 
 class World : public SharedObject<World> {
   public:
@@ -68,6 +69,7 @@ class World : public SharedObject<World> {
 
     std::shared_ptr<Chunks> chunks();
     std::shared_ptr<Entities> entities();
+    std::shared_ptr<Instancing> instancing();
 
     void setCameraPos(glm::dvec3 cameraPos);
     glm::dvec3 getCameraPos();
@@ -77,8 +79,9 @@ class World : public SharedObject<World> {
   private:
     std::shared_ptr<Chunks> chunks_;
     std::shared_ptr<Entities> entities_;
+    std::shared_ptr<Instancing> instancing_;
 
     glm::dvec3 cameraPos_ = {0, 0, 0};
 
-    bool shouldRenderWorld_;
+    bool shouldRenderWorld_ = false;
 };

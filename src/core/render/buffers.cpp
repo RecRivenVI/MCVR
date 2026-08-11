@@ -1,8 +1,12 @@
 
+
+#include "core/logging.hpp"
 #include "core/render/buffers.hpp"
 
 #include "common/shared.hpp"
 #include "core/render/chunks.hpp"
+#include "core/render/index_patterns.hpp"
+#include "core/render/pending_uploads.hpp"
 #include "core/render/modules/ui_module.hpp"
 #include "core/render/pipeline.hpp"
 #include "core/render/render_framework.hpp"
@@ -13,16 +17,18 @@
 #include <cstring>
 #include <random>
 
-std::ostream &buffersCout() {
-    return std::cout << "[Buffers] ";
+auto buffersCout() {
+    return mcvr::log::info("Buffers");
 }
 
-std::ostream &buffersCerr() {
-    return std::cerr << "[Buffers] ";
+auto buffersCerr() {
+    return mcvr::log::error("Buffers");
 }
 
 Buffers::Buffers(std::shared_ptr<Framework> framework) {
-    uint32_t size = framework->swapchain()->imageCount();
+    // Offscreen scene construction can upload geometry before its first frame reset.
+    importantIndexVertexBuffer_ = std::make_shared<std::vector<std::shared_ptr<vk::DeviceLocalBuffer>>>();
+    uint32_t size = framework->recordingContextCount();
     auto device = framework->device();
     auto vma = framework->vma();
     auto alignTo = [](uint32_t value, uint32_t alignment) {
@@ -77,6 +83,12 @@ bool Buffers::ensureOverlayDrawUniformBufferCapacityLocked(std::shared_ptr<Frame
 
     auto newBuffer =
         vk::HostVisibleBuffer::create(framework->vma(), framework->device(), newSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    auto recordingFrame = framework->safeAcquireCurrentContext();
+    if (recordingFrame && recordingFrame->frameIndex == frameIndex && !recordingFrame->frameSubmitted) {
+        auto &data = overlayDrawUniformData_[frameIndex];
+        const auto bytes = std::min<size_t>(data.size(), buffer->size());
+        if (bytes != 0) buffer->uploadToBuffer(data.data(), bytes, 0);
+    }
     framework->frameResourceRetainer().retain(buffer);
     overlayDrawUniformBuffer_[frameIndex] = newBuffer;
     overlayDrawUniformData_[frameIndex].reserve(newSize);
@@ -114,20 +126,47 @@ uint32_t Buffers::allocateBuffer() {
     return overlayNextID_++;
 }
 
+uint32_t Buffers::allocatePersistentBuffer() {
+    std::lock_guard lock(mtx_);
+    if (nextPersistentId_ >= 0x7fffffffu) throw std::runtime_error("Persistent buffer names exhausted");
+    uint32_t id = nextPersistentId_++;
+    persistentBuffers_.emplace(id, PersistentBuffer{});
+    return id;
+}
+
+void Buffers::releasePersistentBuffer(uint32_t id) {
+    std::lock_guard lock(mtx_);
+    auto found = persistentBuffers_.find(id);
+    if (found == persistentBuffers_.end()) return;
+    auto framework = Renderer::instance().framework();
+    if (framework && framework->isRunning()) framework->frameResourceRetainer().retain(found->second.buffer);
+    persistentBuffers_.erase(found);
+}
+
 void Buffers::initializeBuffer(uint32_t id, uint32_t size, VkBufferUsageFlags usageFlags) {
     std::unique_lock<std::recursive_mutex> lck(mtx_);
     auto framework = Renderer::instance().framework();
-    auto context = framework->safeAcquireCurrentContext();
-
-    auto frameIndex = framework->safeAcquireCurrentContext()->frameIndex;
+    if (!framework || !framework->isRunning()) throw std::runtime_error("Vulkan framework is unavailable");
     auto device = framework->device();
     auto vma = framework->vma();
+
+    if (id >= 0x40000000u) {
+        auto found = persistentBuffers_.find(id);
+        if (found == persistentBuffers_.end()) throw std::runtime_error("Unknown persistent buffer");
+        auto &record = found->second;
+        auto replacement = vk::DeviceLocalBuffer::create(vma, device, std::max(4u, size), usageFlags);
+        framework->frameResourceRetainer().retain(record.buffer);
+        record = {replacement, size, usageFlags, true, false};
+        return;
+    }
+
+    auto context = framework->safeAcquireCurrentContext();
+    if (!context) throw std::runtime_error("Buffer initialization requires an acquired frame");
 
     auto bufferIter = overlayIndexVertexBuffer_[context->frameIndex].find(id);
     if (!validOverlayIndex_[context->frameIndex].contains(id) ||
         bufferIter == overlayIndexVertexBuffer_[context->frameIndex].end()) {
-        buffersCerr() << "The given buffer id: " << id << " is not allocated for buffer" << std::endl;
-        exit(EXIT_FAILURE);
+        throw std::out_of_range("Overlay buffer id is not allocated: " + std::to_string(id));
     }
 
     validOverlayIndex_[context->frameIndex].at(id) = size;
@@ -146,32 +185,68 @@ void Buffers::initializeBuffer(uint32_t id, uint32_t size, VkBufferUsageFlags us
 
 void Buffers::buildIndexBuffer(uint32_t dstId, int type, int drawMode, int vertexCount, int expectedIndexCount) {
     std::unique_lock<std::recursive_mutex> lck(mtx_);
-    auto buildQuadIndices = [this, dstId, vertexCount, expectedIndexCount]<typename V>() {
-        int indexCount = vertexCount / 4 * 6;
-        if (indexCount != expectedIndexCount) { throw std::runtime_error("index count not match!"); }
+    auto buildFourVertexIndices = [this, dstId, vertexCount,
+                                   expectedIndexCount](mcvr::render::FourVertexIndexPattern pattern) {
+        auto indices = mcvr::render::buildFourVertexIndices<uint16_t>(vertexCount, expectedIndexCount, pattern);
+        queueOverlayUpload(reinterpret_cast<uint8_t *>(indices.data()), dstId);
+    };
+    auto buildFourVertexIndices32 = [this, dstId, vertexCount,
+                                     expectedIndexCount](mcvr::render::FourVertexIndexPattern pattern) {
+        auto indices = mcvr::render::buildFourVertexIndices<uint32_t>(vertexCount, expectedIndexCount, pattern);
+        queueOverlayUpload(reinterpret_cast<uint8_t *>(indices.data()), dstId);
+    };
+    auto buildSequentialIndices = [this, dstId, vertexCount, expectedIndexCount]<typename V>() {
+        if (vertexCount != expectedIndexCount) { throw std::runtime_error("sequential index count not match!"); }
 
         std::vector<V> indices;
-        for (int i = 0; i < vertexCount; i += 4) {
-            indices.push_back(i + 0);
-            indices.push_back(i + 1);
-            indices.push_back(i + 2);
-            indices.push_back(i + 2);
-            indices.push_back(i + 3);
-            indices.push_back(i + 0);
-        }
+        indices.reserve(expectedIndexCount);
+        for (int i = 0; i < expectedIndexCount; ++i) { indices.push_back(static_cast<V>(i)); }
 
         queueOverlayUpload(reinterpret_cast<uint8_t *>(indices.data()), dstId);
     };
 
     switch (drawMode) {
-        case 7: {
+        case 0: {
             switch (type) {
                 case 0: {
-                    buildQuadIndices.template operator()<uint16_t>();
+                    buildFourVertexIndices(mcvr::render::FourVertexIndexPattern::MINECRAFT_LINES);
                     break;
                 }
                 case 1: {
-                    buildQuadIndices.template operator()<uint32_t>();
+                    buildFourVertexIndices32(mcvr::render::FourVertexIndexPattern::MINECRAFT_LINES);
+                    break;
+                }
+            }
+            break;
+        }
+
+        case 7: {
+            switch (type) {
+                case 0: {
+                    buildFourVertexIndices(mcvr::render::FourVertexIndexPattern::QUADS);
+                    break;
+                }
+                case 1: {
+                    buildFourVertexIndices32(mcvr::render::FourVertexIndexPattern::QUADS);
+                    break;
+                }
+            }
+            break;
+        }
+
+        case 1:
+        case 2:
+        case 3:
+        case 4:
+        case 5:
+        case 6: {
+            switch (type) {
+                case 0: {
+                    buildSequentialIndices.template operator()<uint16_t>();
+                    break;
+                }
+                case 1: {
+                    buildSequentialIndices.template operator()<uint32_t>();
                     break;
                 }
             }
@@ -179,7 +254,7 @@ void Buffers::buildIndexBuffer(uint32_t dstId, int type, int drawMode, int verte
         }
 
         default: {
-            std::cout << "Get draw mode=" << drawMode << std::endl;
+            mcvr::log::info("Buffers") << "Get draw mode=" << drawMode << std::endl;
             throw std::runtime_error("not implemented yet");
         }
     }
@@ -187,11 +262,58 @@ void Buffers::buildIndexBuffer(uint32_t dstId, int type, int drawMode, int verte
 
 void Buffers::queueOverlayUpload(uint8_t *srcPointer, uint32_t dstId) {
     std::unique_lock<std::recursive_mutex> lck(mtx_);
+    if (dstId >= 0x40000000u) {
+        auto found = persistentBuffers_.find(dstId);
+        if (found == persistentBuffers_.end() || !found->second.buffer)
+            throw std::runtime_error("Upload requires initialized persistent buffer storage");
+        auto &record = found->second;
+        if (!record.uploadReady)
+            throw std::runtime_error("Persistent buffer must be initialized before each upload");
+        if (record.size > 0) {
+            if (!srcPointer) throw std::invalid_argument("Null persistent buffer upload");
+            record.buffer->uploadToStagingBuffer(srcPointer, record.size, 0);
+            pendingPersistentUploads_.push_back(record.buffer);
+            record.rangeWriteOpen = true;
+        }
+        record.uploadReady = false;
+        return;
+    }
     auto context = Renderer::instance().framework()->safeAcquireCurrentContext();
     auto buffer = overlayIndexVertexBuffer_[context->frameIndex].at(dstId);
     if (validOverlayIndex_[context->frameIndex].contains(dstId) && buffer != nullptr) {
         auto size = validOverlayIndex_[context->frameIndex].at(dstId);
         if (size > 0) { buffer->uploadToStagingBuffer(srcPointer, size, 0); }
+    }
+}
+
+void Buffers::queuePersistentUploadRange(uint8_t *srcPointer, uint32_t size,
+                                         uint32_t dstId, uint32_t dstOffset) {
+    std::unique_lock<std::recursive_mutex> lck(mtx_);
+    auto found = persistentBuffers_.find(dstId);
+    if (found == persistentBuffers_.end() || !found->second.buffer)
+        throw std::runtime_error("Range upload requires initialized persistent buffer storage");
+    auto &record = found->second;
+    if (dstOffset > record.size || size > record.size - dstOffset)
+        throw std::out_of_range("Persistent buffer range upload exceeds storage");
+    if (size == 0) return;
+    if (!srcPointer) throw std::invalid_argument("Null persistent buffer range upload");
+    if (!record.rangeWriteOpen) {
+        auto framework = Renderer::instance().framework();
+        if (!framework || !framework->isRunning())
+            throw std::runtime_error("Vulkan framework is unavailable for range upload");
+        auto replacement = vk::DeviceLocalBuffer::create(framework->vma(), framework->device(),
+            std::max(4u, record.size), record.usage);
+        if (record.size != 0) {
+            replacement->uploadToStagingBuffer(record.buffer->mappedPtr(), record.size, 0);
+        }
+        framework->frameResourceRetainer().retain(record.buffer);
+        record.buffer = replacement;
+        record.rangeWriteOpen = true;
+    }
+    record.buffer->uploadToStagingBuffer(srcPointer, size, dstOffset);
+    if (std::find(pendingPersistentUploads_.begin(), pendingPersistentUploads_.end(),
+                  record.buffer) == pendingPersistentUploads_.end()) {
+        pendingPersistentUploads_.push_back(record.buffer);
     }
 }
 
@@ -211,6 +333,8 @@ void Buffers::queueImportantWorldUpload(std::shared_ptr<vk::DeviceLocalBuffer> b
 
 void Buffers::performQueuedUpload() {
     std::unique_lock<std::recursive_mutex> lck(mtx_);
+    auto uploads = mcvr::takePendingUploads(importantIndexVertexBuffer_);
+    Renderer::instance().framework()->frameResourceRetainer().retain(uploads);
     auto frameIndex = Renderer::instance().framework()->safeAcquireCurrentContext()->frameIndex;
     std::shared_ptr<vk::CommandBuffer> cmdBuffer =
         Renderer::instance().framework()->safeAcquireCurrentContext()->uploadCommandBuffer;
@@ -243,7 +367,7 @@ void Buffers::performQueuedUpload() {
         });
     }
 
-    for (auto buffer : *importantIndexVertexBuffer_) {
+    for (auto buffer : *uploads) {
         uploadPreBufferBarriers.push_back({
             .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
             .srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT,
@@ -267,6 +391,30 @@ void Buffers::performQueuedUpload() {
         });
     }
 
+    for (const auto &buffer : pendingPersistentUploads_) {
+        uploadPreBufferBarriers.push_back({
+            .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            .srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            .dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+            .srcQueueFamilyIndex = mainQueueIndex,
+            .dstQueueFamilyIndex = mainQueueIndex,
+            .buffer = buffer,
+        });
+        uploadPostBufferBarriers.push_back({
+            .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            .srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+                            VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
+                            VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT,
+            .dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT |
+                             VK_ACCESS_2_MEMORY_READ_BIT,
+            .srcQueueFamilyIndex = mainQueueIndex,
+            .dstQueueFamilyIndex = mainQueueIndex,
+            .buffer = buffer,
+        });
+    }
+
     cmdBuffer->barriersBufferImage(uploadPreBufferBarriers, {});
 
     for (auto [bufferId, size] : validOverlayIndex_[frameIndex]) {
@@ -274,7 +422,15 @@ void Buffers::performQueuedUpload() {
         if (size > 0) { buffer->uploadToBuffer(cmdBuffer, size, 0, 0); }
     }
 
-    for (auto buffer : *importantIndexVertexBuffer_) { buffer->uploadToBuffer(cmdBuffer); }
+    for (auto buffer : *uploads) { buffer->uploadToBuffer(cmdBuffer); }
+
+    auto &retainer = Renderer::instance().framework()->frameResourceRetainer();
+    for (const auto &buffer : pendingPersistentUploads_) {
+        buffer->uploadToBuffer(cmdBuffer);
+        retainer.retain(buffer);
+    }
+    for (auto &[id, record] : persistentBuffers_) record.rangeWriteOpen = false;
+    pendingPersistentUploads_.clear();
 
     cmdBuffer->barriersBufferImage(uploadPostBufferBarriers, {});
 }
@@ -336,6 +492,7 @@ void Buffers::appendOverlayPostUniform(vk::Data::OverlayPostUBO &ubo) {
     std::unique_lock<std::recursive_mutex> lck(mtx_);
     auto framework = Renderer::instance().framework();
     auto context = framework->safeAcquireCurrentContext();
+    if (context->frameSubmitted) throw std::logic_error("Cannot append post uniforms after frame submission");
     auto frameIndex = context->frameIndex;
 
     uint32_t uniformOffset = overlayPostUniformCount_[frameIndex] * overlayPostUniformStride_;
@@ -353,6 +510,9 @@ void Buffers::appendOverlayPostUniform(vk::Data::OverlayPostUBO &ubo) {
 
         auto newBuffer =
             vk::HostVisibleBuffer::create(framework->vma(), framework->device(), newSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+        // Earlier draws retain this descriptor/buffer generation until submission.
+        const auto retiredBytes = std::min<size_t>(cpuData.size(), buffer->size());
+        if (retiredBytes != 0) buffer->uploadToBuffer(cpuData.data(), retiredBytes, 0);
         framework->frameResourceRetainer().retain(buffer);
         overlayPostUniformBuffer_[frameIndex] = newBuffer;
         cpuData.reserve(newSize);
@@ -362,6 +522,17 @@ void Buffers::appendOverlayPostUniform(vk::Data::OverlayPostUBO &ubo) {
     }
 
     overlayPostUniformCount_[frameIndex]++;
+}
+
+vk::Data::OverlayPostUBO Buffers::recordedOverlayPostUniform(uint32_t offset) {
+    std::lock_guard lock(mtx_);
+    auto frame = Renderer::instance().framework()->safeAcquireCurrentContext();
+    const auto &data = overlayPostUniformData_.at(frame->frameIndex);
+    if (offset > data.size() || data.size() - offset < sizeof(vk::Data::OverlayPostUBO))
+        throw std::out_of_range("Post uniform has not been recorded");
+    vk::Data::OverlayPostUBO result;
+    std::memcpy(&result, data.data() + offset, sizeof(result));
+    return result;
 }
 
 void Buffers::buildAndUploadOverlayUniformBuffer() {
@@ -388,7 +559,6 @@ void Buffers::buildAndUploadOverlayUniformBuffer() {
     }
 }
 
-static size_t sequenceIndex = 0;
 
 // halton low discrepancy sequence, from https://www.shadertoy.com/view/wdXSW8
 glm::vec2 halton(int index) {
@@ -413,17 +583,6 @@ void Buffers::setAndUploadWorldUniformBuffer(vk::Data::WorldUBO &ubo) {
     auto vma = framework->vma();
     auto device = framework->device();
 
-    static vk::Data::WorldUBO lastUBO = []() {
-        vk::Data::WorldUBO init{};
-        init.cameraViewMat = glm::mat4(1.0f);
-        init.cameraEffectedViewMat = glm::mat4(1.0f);
-        init.cameraProjMat = glm::mat4(1.0f);
-        init.cameraViewMatInv = glm::mat4(1.0f);
-        init.cameraEffectedViewMatInv = glm::mat4(1.0f);
-        init.cameraProjMatInv = glm::mat4(1.0f);
-        return init;
-    }();
-
     glm::mat4 mapGLToVulkan(1.0f);
     mapGLToVulkan[1][1] = -1.0f;
     mapGLToVulkan[2][2] = 0.5f;
@@ -442,7 +601,7 @@ void Buffers::setAndUploadWorldUniformBuffer(vk::Data::WorldUBO &ubo) {
         ubo.seed = distrib(engine);
     }
 
-    ubo.cameraJitter = useJitter_ ? halton(sequenceIndex++) - glm::vec2(0.5) : glm::vec2(0.0);
+    ubo.cameraJitter = useJitter_ ? halton(jitterSequenceIndex_++) - glm::vec2(0.5) : glm::vec2(0.0);
 
     auto world = Renderer::instance().world();
     ubo.cameraPos.x = world->getCameraPos().x;
@@ -469,9 +628,10 @@ void Buffers::setAndUploadWorldUniformBuffer(vk::Data::WorldUBO &ubo) {
     }
 
     worldUniformBuffer_[context->frameIndex]->uploadToBuffer(&ubo);
-    lastWorldUniformBuffer_[context->frameIndex]->uploadToBuffer(&lastUBO);
+    const bool hasHistory = worldHistoryValid_.exchange(true, std::memory_order_acq_rel);
+    lastWorldUniformBuffer_[context->frameIndex]->uploadToBuffer(hasHistory ? &lastWorldUbo_ : &ubo);
 
-    lastUBO = ubo;
+    lastWorldUbo_ = ubo;
 }
 
 void Buffers::setAndUploadSkyUniformBuffer(vk::Data::SkyUBO &ubo) {
@@ -528,13 +688,21 @@ int Buffers::getPostID() {
 }
 
 std::shared_ptr<vk::DeviceLocalBuffer> Buffers::getBuffer(uint32_t id) {
+    std::lock_guard lock(mtx_);
+    if (id >= 0x40000000u) {
+        auto found = persistentBuffers_.find(id);
+        if (found == persistentBuffers_.end() || !found->second.buffer)
+            throw std::runtime_error("Draw requires a live uploaded persistent buffer");
+        if (found->second.size > 0 && found->second.uploadReady)
+            throw std::runtime_error("Draw requires uploaded persistent buffer data");
+        return found->second.buffer;
+    }
     auto context = Renderer::instance().framework()->safeAcquireCurrentContext();
 
     auto bufferIter = overlayIndexVertexBuffer_[context->frameIndex].find(id);
     if (!validOverlayIndex_[context->frameIndex].contains(id) ||
         bufferIter == overlayIndexVertexBuffer_[context->frameIndex].end()) {
-        buffersCerr() << "The given buffer id: " << id << " is not allocated for buffer" << std::endl;
-        exit(EXIT_FAILURE);
+        throw std::out_of_range("Overlay buffer id is not allocated: " + std::to_string(id));
     }
 
     return bufferIter->second;

@@ -1,6 +1,8 @@
 #include "core/render/modules/world/shader_pack/shader_pack.hpp"
 
 #include "core/render/renderer.hpp"
+#include "core/render/scene_scope.hpp"
+#include "core/vulkan/inline_update.hpp"
 #include "core/util/parallel.hpp"
 
 #include "mz.h"
@@ -13,6 +15,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <set>
@@ -969,6 +972,8 @@ ShaderPackLoader::parseRayTracingPassConfig(
 
         ShaderPackLoader::HitGroupConfig group;
         group.name = groupName;
+        group.definitions = parseDefinitions(
+            groupJson, context + "." + ShaderPackLoader::KEY_HIT_GROUPS + "." + groupName);
         if (auto closestRef =
                 optionalString(shadersJson, ShaderPackLoader::KEY_RCHIT,
                                context + "." + ShaderPackLoader::KEY_HIT_GROUPS + "." + groupName + "." +
@@ -1771,7 +1776,8 @@ ShaderPack::createPassExecutionBuffer(std::shared_ptr<vk::Device> device,
                                        std::shared_ptr<vk::VMA> vma,
                                        size_t executionBufferSize) {
     if (executionBufferSize == 0) { return nullptr; }
-    return vk::DeviceLocalBuffer::create(vma, device, true, executionBufferSize,
+    if (executionBufferSize > 65536) throw std::invalid_argument("Pass execution variables exceed 64 KiB");
+    return vk::DeviceLocalBuffer::create(vma, device, false, executionBufferSize,
                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, 0, VMA_MEMORY_USAGE_GPU_ONLY);
 }
 
@@ -1823,6 +1829,10 @@ bool ShaderPack::initialize(const BuildConfig &config, std::string &error) {
     hasSharcRuntime_ = false;
     if (config.shouldUseSharc && shaderPack_.sharc.has_value()) { hasSharcRuntime_ = true; }
 
+    {
+        std::lock_guard lock(shaderObjectCacheMutex_);
+        shaderObjectCache_.clear();
+    }
     return true;
 }
 
@@ -1853,7 +1863,7 @@ void ShaderPack::refreshRuntimeBuffers() {
     auto device = framework->device();
     auto vma = framework->vma();
     auto &frr = framework->frameResourceRetainer();
-    uint32_t frameCount = framework->swapchain()->imageCount();
+    uint32_t frameCount = framework->recordingContextCount();
 
     for (auto &runtimeBuffer : runtimeBuffers_) {
         const size_t expectedSize =
@@ -1894,7 +1904,7 @@ void ShaderPack::bindRuntimeResources(const std::shared_ptr<vk::DescriptorTable>
         if (texture.config.sampledBinding.has_value()) {
             std::shared_ptr<vk::DeviceLocalImage> image =
                 texture.config.imported ? texture.importedImage
-                                        : texture.frameImages[texture.config.shared ? 0 : frameIndex];
+                                        : texture.frameImages[textureSlot(texture.config.shared, frameIndex)];
             VkImageLayout layout = texture.config.imported || !texture.config.storageBinding.has_value() ?
                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL :
                                        VK_IMAGE_LAYOUT_GENERAL;
@@ -1902,7 +1912,7 @@ void ShaderPack::bindRuntimeResources(const std::shared_ptr<vk::DescriptorTable>
                                               texture.sampledViewIndex);
         }
         if (texture.config.storageBinding.has_value() && !texture.config.imported) {
-            descriptorTable->bindImage(texture.frameImages[texture.config.shared ? 0 : frameIndex], VK_IMAGE_LAYOUT_GENERAL,
+            descriptorTable->bindImage(texture.frameImages[textureSlot(texture.config.shared, frameIndex)], VK_IMAGE_LAYOUT_GENERAL,
                                        setIndex, *texture.config.storageBinding);
         }
     }
@@ -1994,6 +2004,13 @@ void ShaderPack::preClose() {
     referenceHeight_ = 0;
 }
 
+void ShaderPack::restartRuntime() {
+    preClose();
+    // Retain parsed sources/attributes, but reset temporal variables and size-dependent history.
+    initStageRuntime(rayTracingStageRuntime_, shaderPack_.rayTracingExecution);
+    initStageRuntime(postRenderStageRuntime_, shaderPack_.postRenderExecution);
+}
+
 std::shared_ptr<vk::Shader> ShaderPack::createShader(
     std::shared_ptr<vk::Device> device,
     const std::filesystem::path &path,
@@ -2001,11 +2018,59 @@ std::shared_ptr<vk::Shader> ShaderPack::createShader(
     const std::unordered_map<std::string, std::string> &definitions,
     ShaderPackLoader::Stage executionStage,
     uint32_t executionSet) const {
+    const std::string source = executionSource(executionStage, executionSet);
+    ShaderCreateInfo request{
+        .path = path,
+        .stage = stage,
+        .definitions = definitions,
+        .executionStage = executionStage,
+        .executionSet = executionSet,
+    };
+    const std::string objectKey = shaderObjectCacheKey(device, request, source);
+    std::lock_guard lock(shaderObjectCacheMutex_);
+    if (auto existing = shaderObjectCache_.find(objectKey);
+        existing != shaderObjectCache_.end()) {
+        return existing->second;
+    }
+
     const std::filesystem::path cacheDir = Renderer::folderPath / "cache/shaders";
     auto compileResult = vk::Shader::compileGlslToSpv(
         path.string(), stage, mergeDefinitions(shaderAttributes_, definitions),
-        shaderPack_.includeDirectories, executionSource(executionStage, executionSet), cacheDir);
-    return vk::Shader::create(device, std::move(compileResult));
+        shaderPack_.includeDirectories, source, cacheDir);
+    auto shader = vk::Shader::create(device, std::move(compileResult));
+    shaderObjectCache_.emplace(objectKey, shader);
+    return shader;
+}
+
+std::string ShaderPack::shaderObjectCacheKey(
+    const std::shared_ptr<vk::Device> &device,
+    const ShaderCreateInfo &request,
+    const std::string &source) const {
+    std::ostringstream key;
+    auto appendString = [&](std::string_view value) {
+        key << value.size() << ':' << value << '|';
+    };
+    auto appendDefinitions =
+        [&](const std::unordered_map<std::string, std::string> &definitions) {
+            std::vector<std::pair<std::string, std::string>> sorted(
+                definitions.begin(), definitions.end());
+            std::sort(sorted.begin(), sorted.end());
+            key << sorted.size() << '|';
+            for (const auto &[name, value] : sorted) {
+                appendString(name);
+                appendString(value);
+            }
+        };
+
+    key << reinterpret_cast<std::uintptr_t>(device->vkDevice()) << '|';
+    appendString(request.path.lexically_normal().generic_string());
+    key << static_cast<uint32_t>(request.stage) << '|';
+    appendDefinitions(shaderAttributes_);
+    appendDefinitions(request.definitions);
+    key << static_cast<uint32_t>(request.executionStage) << '|'
+        << request.executionSet << '|';
+    appendString(source);
+    return key.str();
 }
 
 static bool isShaderIdentifierStart(char ch) {
@@ -2183,6 +2248,34 @@ ShaderPack::createShaders(std::shared_ptr<vk::Device> device,
                           ) const {
     if (requests.empty()) { return {}; }
 
+    std::unique_lock objectCacheLock(shaderObjectCacheMutex_);
+    std::vector<std::shared_ptr<vk::Shader>> shaders(requests.size());
+    std::vector<std::string> objectKeys(requests.size());
+    std::vector<std::string> executionSources(requests.size());
+    std::vector<size_t> missRequestIndices;
+    missRequestIndices.reserve(requests.size());
+    for (size_t i = 0; i < requests.size(); ++i) {
+        executionSources[i] =
+            executionSource(requests[i].executionStage, requests[i].executionSet);
+        objectKeys[i] = shaderObjectCacheKey(device, requests[i], executionSources[i]);
+        if (auto existing = shaderObjectCache_.find(objectKeys[i]);
+            existing != shaderObjectCache_.end()) {
+            shaders[i] = existing->second;
+        } else {
+            missRequestIndices.push_back(i);
+        }
+    }
+
+#ifdef DEBUG
+    if (stats != nullptr) {
+        *stats = {};
+        stats->requestCount = requests.size();
+    }
+#endif
+    if (missRequestIndices.empty()) {
+        return shaders;
+    }
+
     const std::filesystem::path cacheDir = Renderer::folderPath / "cache/shaders";
     std::vector<std::filesystem::path> includeDirectories;
     includeDirectories.reserve(shaderPack_.includeDirectories.size());
@@ -2215,9 +2308,8 @@ ShaderPack::createShaders(std::shared_ptr<vk::Device> device,
     std::unordered_map<std::string, size_t> keyToIndex;
     std::vector<std::unordered_map<std::string, std::string>> filteredRequestAttributes(requests.size());
     std::vector<std::unordered_map<std::string, std::string>> requestDefinitions(requests.size());
-    std::vector<std::string> executionSources(requests.size());
 
-    for (size_t i = 0; i < requests.size(); i++) {
+    for (size_t i : missRequestIndices) {
         filteredRequestAttributes[i] = filterShaderAttributes(
             shaderAttributes_, requests[i].path, attributeKeys, includeDirectories, dependencyCache);
         requestDefinitions[i] = stripAttributeDefinitions(requests[i].definitions, attributeKeys);
@@ -2242,7 +2334,6 @@ ShaderPack::createShaders(std::shared_ptr<vk::Device> device,
 
 #ifdef DEBUG
     if (stats != nullptr) {
-        stats->requestCount = requests.size();
         stats->uniqueShaderCount = uniqueIndices.size();
         for (const auto &compileResult : compileResults) {
             if (compileResult.cacheHit) {
@@ -2255,10 +2346,14 @@ ShaderPack::createShaders(std::shared_ptr<vk::Device> device,
     }
 #endif
 
-    std::vector<std::shared_ptr<vk::Shader>> shaders(requests.size());
-    mcvr::parallelFor(requests.size(), [&](size_t i) {
-        shaders[i] = vk::Shader::create(device, compileResults[requestToUniqueIndex[i]].clone());
+    std::vector<std::shared_ptr<vk::Shader>> uniqueShaders(uniqueIndices.size());
+    mcvr::parallelFor(uniqueIndices.size(), [&](size_t ui) {
+        uniqueShaders[ui] = vk::Shader::create(device, compileResults[ui].clone());
     });
+    for (size_t i : missRequestIndices) {
+        shaders[i] = uniqueShaders[requestToUniqueIndex[i]];
+        shaderObjectCache_.emplace(objectKeys[i], shaders[i]);
+    }
     return shaders;
 }
 
@@ -2510,8 +2605,9 @@ void ShaderPack::uploadExecutionBuffer(ShaderPackLoader::Stage stage,
         values[i] = parseFloatValue(variable, valueIter != variables.end() ? valueIter->second.value : variable.defaultValue);
     }
 
-    executionBuffer->uploadToStagingBuffer(values.data(), values.size() * sizeof(float), 0);
-    executionBuffer->uploadToBuffer(commandBuffer);
+    std::vector<uint32_t> words(values.size());
+    std::memcpy(words.data(), values.data(), values.size() * sizeof(float));
+    vk::recordInlineUpdate(commandBuffer->vkCommandBuffer(), executionBuffer->vkBuffer(), words);
     descriptorTable->bindBuffer(executionBuffer, executionSet, ShaderPackLoader::EXECUTION_BINDING);
     commandBuffer->barriersBufferImage(
         {{
@@ -2631,7 +2727,7 @@ std::shared_ptr<vk::DeviceLocalImage> ShaderPack::findRuntimeVKTexture(RuntimeTe
 std::shared_ptr<vk::DeviceLocalImage> ShaderPack::findRuntimeVKTexture(const RuntimeTexture &runtimeTexture,
                                                                        uint32_t frameIndex) const {
     if (runtimeTexture.config.imported) { return runtimeTexture.importedImage; }
-    return runtimeTexture.frameImages[runtimeTexture.config.shared ? 0 : frameIndex];
+    return runtimeTexture.frameImages[textureSlot(runtimeTexture.config.shared, frameIndex)];
 }
 
 uint32_t ShaderPack::runtimeTextureSingleLayerViewIndex(const RuntimeTexture &runtimeTexture, uint32_t layer) const {
@@ -2754,7 +2850,9 @@ void ShaderPack::initRuntimeTextures() {
     auto framework = framework_.lock();
     auto device = framework->device();
     auto vma = framework->vma();
-    uint32_t frameCount = framework->swapchain()->imageCount();
+    uint32_t frameCount = framework->recordingContextCount();
+    runtimeViewCount_ = SceneRecordingScope::active() ? SceneRecordingScope::active()->viewCount : 1;
+    runtimeFramesPerView_ = frameCount / runtimeViewCount_;
 
     std::vector<RuntimeTexture> runtimeTextures(shaderPack_.textures.size());
     mcvr::parallelFor(shaderPack_.textures.size(), [&](size_t textureIndex) {
@@ -2768,7 +2866,8 @@ void ShaderPack::initRuntimeTextures() {
         if (textureConfig.imported) {
             runtimeTexture.sampledViewIndex = 0;
         } else {
-            uint32_t textureFrameCount = textureConfig.shared ? 1 : frameCount;
+            // "shared" is temporal across frames of one view, never across cameras.
+            uint32_t textureFrameCount = textureConfig.shared ? runtimeViewCount_ : frameCount;
             runtimeTexture.frameImages.resize(textureFrameCount);
             for (uint32_t frameIndex = 0; frameIndex < textureFrameCount; frameIndex++) {
                 uint32_t width = 0;
@@ -2915,7 +3014,7 @@ void ShaderPack::initRuntimeBuffers() {
     auto framework = framework_.lock();
     auto device = framework->device();
     auto vma = framework->vma();
-    uint32_t frameCount = framework->swapchain()->imageCount();
+    uint32_t frameCount = framework->recordingContextCount();
 
     std::vector<RuntimeBuffer> runtimeBuffers(shaderPack_.buffers.size());
     mcvr::parallelFor(shaderPack_.buffers.size(), [&](size_t bufferIndex) {
@@ -3072,7 +3171,11 @@ void ShaderPack::loadRuntimeResources() {
 
     commandBuffer->end();
     if (hasUploads) {
-        commandBuffer->submitMainQueueIndividual(device);
-        vkQueueWaitIdle(device->mainVkQueue());
+        const VkResult result = commandBuffer->submitMainQueueIndividual(device);
+        if (result != VK_SUCCESS) {
+            framework->recordFailure(result, "vkQueueSubmit(shader-pack texture upload)");
+            return;
+        }
+        if (framework->waitRenderQueueIdle() != VK_SUCCESS) { return; }
     }
 }

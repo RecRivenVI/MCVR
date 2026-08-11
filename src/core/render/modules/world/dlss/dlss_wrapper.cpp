@@ -1,3 +1,5 @@
+#include "core/logging.hpp"
+#include "core/render/streamline_evaluate_result.hpp"
 /*
  * Copyright (c) 2024-2025, NVIDIA CORPORATION.  All rights reserved.
  *
@@ -37,391 +39,161 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "core/render/modules/world/dlss/dlss_wrapper.hpp"
-
-// #include <nvh/nvprint.hpp>
-// #include <nvp/nvpsystem.hpp>
-// #include <nvvk/commands_vk.hpp>
-// #include <nvvk/debug_util_vk.hpp>
-
-#include <nvsdk_ngx_defs_dlssd.h>
-#include <nvsdk_ngx_helpers_dlssd.h>
-#include <nvsdk_ngx_helpers_dlssd_vk.h>
-#include <nvsdk_ngx_helpers_vk.h>
-
-#include <glm/ext.hpp>
-
-#include <codecvt>
-#include <filesystem>
+#include "dlss_wrapper.hpp"
+#include "core/render/renderer.hpp"
+#include "core/vulkan/all_core_vulkan.hpp"
 #include <iostream>
+#include <cstring>
+#include <fstream>
 #include <sstream>
+#include <sl_helpers.h>
 
-#include "core/vulkan/command.hpp"
-#include "core/vulkan/device.hpp"
-#include "core/vulkan/image.hpp"
-#include "core/vulkan/instance.hpp"
-#include "core/vulkan/physical_device.hpp"
-
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Static members  and globals
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// Application ID assigned from NVIDIA, currently unused, but can't be 0
-static const unsigned long long g_ApplicationID = 0xbaadf00dbaadcafe;
-
-#define LOGE std::cout << "[DLSS Error] "
-#define LOGW std::cout << "[DLSS Warning] "
-#define LOGI std::cout << "[DLSS Info] "
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Helpers
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-#define NGX_RETURN_ON_FAIL(x)                                                                                          \
-    {                                                                                                                  \
-        NVSDK_NGX_Result result = checkNgxResult((x), __func__, __LINE__);                                             \
-        if (NVSDK_NGX_FAILED(result)) return result;                                                                   \
+namespace {
+auto &runtime() { return mcvr::StreamlineRuntime::get(); }
+NVSDK_NGX_Result result(bool ok) { return ok ? NVSDK_NGX_Result_Success : NVSDK_NGX_Result_FAIL_FeatureNotSupported; }
+sl::DLSSMode mode(NVSDK_NGX_PerfQuality_Value quality) {
+    switch (quality) {
+    case NVSDK_NGX_PerfQuality_Value_MaxPerf: return sl::DLSSMode::eMaxPerformance;
+    case NVSDK_NGX_PerfQuality_Value_Balanced: return sl::DLSSMode::eBalanced;
+    case NVSDK_NGX_PerfQuality_Value_UltraPerformance: return sl::DLSSMode::eUltraPerformance;
+    case NVSDK_NGX_PerfQuality_Value_DLAA: return sl::DLSSMode::eDLAA;
+    default: return sl::DLSSMode::eMaxQuality;
     }
-
-#define NGX_CHECK(x) checkNgxResult((x), __func__, __LINE__)
-
-
-// Function taken from stack overflow https://stackoverflow.com/questions/4804298/how-to-convert-wstring-into-string
-std::string ws2s(const std::wstring &wstr) {
-    using convert_typeX = std::codecvt_utf8<wchar_t>;
-    std::wstring_convert<convert_typeX, wchar_t> converterX;
-
-    return converterX.to_bytes(wstr);
 }
-
-NVSDK_NGX_Result checkNgxResult(NVSDK_NGX_Result result, const char *func, int line) {
-    if (NVSDK_NGX_FAILED(result)) {
-        std::ostringstream stream;
-        LOGE << ws2s(GetNGXResultAsString(result)) << " at " << func << ":" << line << std::endl;
+template<class Options, class Preset> void setOptions(Options &o, VkExtent2D size, NVSDK_NGX_PerfQuality_Value quality, Preset preset) {
+    o.mode=mode(quality); o.outputWidth=size.width; o.outputHeight=size.height;
+    o.dlaaPreset=o.qualityPreset=o.balancedPreset=o.performancePreset=o.ultraPerformancePreset=o.ultraQualityPreset=preset;
+}
+}
+NVSDK_NGX_Result NgxContext::init(const NgxInitInfo &info) { device_=info.device; return result(runtime().ready()); }
+NgxContext::~NgxContext() = default;
+void NgxContext::deinit() { device_.reset(); }
+NVSDK_NGX_Result NgxContext::queryDlssRRAvailable() { return result(runtime().supported(sl::kFeatureDLSS_RR)); }
+NVSDK_NGX_Result NgxContext::queryDlssSRAvailable() { return result(runtime().supported(sl::kFeatureDLSS)); }
+NVSDK_NGX_Result NgxContext::queryDlssFGAvailable() { return result(runtime().supported(sl::kFeatureDLSS_G) && runtime().supported(sl::kFeatureReflex)); }
+// The interposer's create-instance/create-device proxies merge SDK requirements.
+NVSDK_NGX_Result NgxContext::getDlssRRRequiredInstanceExtensions(std::vector<VkExtensionProperties>&, NVSDK_NGX_Feature) { return result(runtime().ready()); }
+NVSDK_NGX_Result NgxContext::getDlssRRRequiredDeviceExtensions(std::shared_ptr<vk::Instance>, std::shared_ptr<vk::PhysicalDevice>, std::vector<VkExtensionProperties>&, NVSDK_NGX_Feature) { return result(runtime().ready()); }
+NVSDK_NGX_Result NgxContext::querySupportedDlssInputSizes(const QuerySizeInfo &q, SupportedSizes &sizes) {
+    auto &sl=runtime();
+    if (q.rayReconstruction) {
+        if (!sl.slDLSSDGetOptimalSettings) return result(false);
+        sl::DLSSDOptions o{}; setOptions(o,q.outputSize,q.quality,static_cast<sl::DLSSDPreset>(Renderer::options.dlssRrModel));
+        sl::DLSSDOptimalSettings s{};
+        if (!sl.check(sl.slDLSSDGetOptimalSettings(o,s),"RR optimal size")) return result(false);
+        sizes={{s.renderWidthMin,s.renderHeightMin},{s.renderWidthMax,s.renderHeightMax},{s.optimalRenderWidth,s.optimalRenderHeight}};
+    } else {
+        if (!sl.slDLSSGetOptimalSettings) return result(false);
+        sl::DLSSOptions o{}; setOptions(o,q.outputSize,q.quality,static_cast<sl::DLSSPreset>(Renderer::options.dlssSrModel));
+        sl::DLSSOptimalSettings s{};
+        if (!sl.check(sl.slDLSSGetOptimalSettings(o,s),"SR optimal size")) return result(false);
+        sizes={{s.renderWidthMin,s.renderHeightMin},{s.renderWidthMax,s.renderHeightMax},{s.optimalRenderWidth,s.optimalRenderHeight}};
     }
-
-    return result;
+    return result(sizes.optimalSize.width && sizes.optimalSize.height);
 }
-
-void NVSDK_CONV NGX_AppLogCallback(const char *message,
-                                   NVSDK_NGX_Logging_Level loggingLevel,
-                                   NVSDK_NGX_Feature sourceComponent) {
-    LOGE << message << std::endl;
+NVSDK_NGX_Result NgxContext::initDlssRR(const DlssRRInitInfo &info, std::shared_ptr<vk::CommandPool> pool, std::shared_ptr<DlssRR> dlss) {
+    return dlss->init(device_,pool,nullptr,info);
 }
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Class code
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-NVSDK_NGX_Result NgxContext::init(const NgxInitInfo &initInfo) {
-#ifdef DEBUG
-    std::cout << "NgxContext::init" << std::endl;
-#endif
-
-    if (!initInfo.instance || !initInfo.physicalDevice || !initInfo.device) {
-        return NVSDK_NGX_Result_FAIL_InvalidParameter;
+NVSDK_NGX_Result DlssRR::init(std::shared_ptr<vk::Device> device, std::shared_ptr<vk::CommandPool>, NVSDK_NGX_Parameter*, const NgxContext::DlssRRInitInfo &info) {
+    deinit(); m_device=device; m_inputSize=info.inputSize; m_outputSize=info.outputSize; m_rayReconstruction=info.rayReconstruction;
+    m_lastFailure.clear(); m_lastFailureStage.clear(); m_lastFailureCode=sl::Result::eOk;
+    m_viewport=runtime().allocateViewport();
+    auto &sl=runtime(); const sl::ViewportHandle viewport(m_viewport);
+    bool ok=false;
+    if (m_rayReconstruction && sl.slDLSSDSetOptions) {
+        sl::DLSSDOptions o{}; setOptions(o,m_outputSize,info.quality,static_cast<sl::DLSSDPreset>(Renderer::options.dlssRrModel));
+        o.normalRoughnessMode=sl::DLSSDNormalRoughnessMode::ePacked;
+        o.worldToCameraView=mcvr::slMatrix(glm::mat4(1)); o.cameraViewToWorld=o.worldToCameraView;
+        m_rrOptions=o;
+        const auto setResult=sl.slDLSSDSetOptions(viewport,o);
+        ok=setResult==sl::Result::eOk;
+        if (!ok) return recordFailure("RR options",setResult);
+    } else if (!m_rayReconstruction && sl.slDLSSSetOptions) {
+        sl::DLSSOptions o{}; setOptions(o,m_outputSize,info.quality,static_cast<sl::DLSSPreset>(Renderer::options.dlssSrModel));
+        const auto setResult=sl.slDLSSSetOptions(viewport,o);
+        ok=setResult==sl::Result::eOk;
+        if (!ok) return recordFailure("SR options",setResult);
     }
-    assert(!device_ && !ngxParams_ && "Init already called");
-
-    applicationPath_.assign(initInfo.applicationPath.begin(), initInfo.applicationPath.end());
-#ifdef DEBUG
-    std::cout << "NgxContext::init application path: " << initInfo.applicationPath << std::endl;
-    std::wcout << "NgxContext::init applicationPath_: " << applicationPath_ << std::endl;
-#endif
-
-    NVSDK_NGX_FeatureCommonInfo info = {};
-    // info.LoggingInfo.LoggingCallback     = &NGX_AppLogCallback;
-    info.LoggingInfo.MinimumLoggingLevel = initInfo.loggingLevel;
-
-    // Init NGX API
-    NGX_RETURN_ON_FAIL(NVSDK_NGX_VULKAN_Init(g_ApplicationID, applicationPath_.c_str(), initInfo.instance->vkInstance(),
-                                             initInfo.physicalDevice->vkPhysicalDevice(), initInfo.device->vkDevice(),
-                                             vkGetInstanceProcAddr, vkGetDeviceProcAddr, &info));
-
-    device_ = initInfo.device;
-
-    NVSDK_NGX_Result result = NGX_CHECK(NVSDK_NGX_VULKAN_GetCapabilityParameters(&ngxParams_));
-
-    if (NVSDK_NGX_FAILED(result)) {
-        deinit();
-        return result;
-    }
-
-    return NVSDK_NGX_Result_Success;
+    mcvr::log::info("DlssWrapper") << "[Streamline] " << (m_rayReconstruction?"RR":"SR") << " viewport=" << m_viewport
+        << " input=" << m_inputSize.width << 'x' << m_inputSize.height << " output=" << m_outputSize.width << 'x' << m_outputSize.height << std::endl;
+    return result(ok);
 }
-
-NgxContext::~NgxContext() {
-    assert(!ngxParams_ && !device_ && "Must call deinit");
-}
-
-void NgxContext::deinit() {
-    if (ngxParams_) { NVSDK_NGX_VULKAN_DestroyParameters(ngxParams_); }
-    if (device_) { NVSDK_NGX_VULKAN_Shutdown1(device_->vkDevice()); }
-
-    ngxParams_ = nullptr;
-    device_ = nullptr;
-}
-
-NVSDK_NGX_Result NgxContext::queryDlssRRAvailable() {
-    assert(ngxParams_);
-
-    int DLSS_Supported;
-    int needsUpdatedDriver;
-    unsigned minDriverVersionMajor;
-    unsigned minDriverVersionMinor;
-
-    // Check if DLSS_D (which is the DLSS_RR RayReconstruction Denoiser) is available.
-    // Beware: Don't confuse this with DLSS, which is a different feature just providing upscaling
-    NVSDK_NGX_Result resUpdatedDriver =
-        NGX_CHECK(ngxParams_->Get(NVSDK_NGX_Parameter_SuperSamplingDenoising_NeedsUpdatedDriver, &needsUpdatedDriver));
-    NVSDK_NGX_Result resVersionMajor = NGX_CHECK(
-        ngxParams_->Get(NVSDK_NGX_Parameter_SuperSamplingDenoising_MinDriverVersionMajor, &minDriverVersionMajor));
-    NVSDK_NGX_Result resVersionMinor = NGX_CHECK(
-        ngxParams_->Get(NVSDK_NGX_Parameter_SuperSamplingDenoising_MinDriverVersionMinor, &minDriverVersionMinor));
-
-    if (NVSDK_NGX_SUCCEED(resUpdatedDriver)) {
-        if (needsUpdatedDriver) {
-            // NVIDIA DLSS cannot be loaded due to outdated driver.
-            if (NVSDK_NGX_SUCCEED(resVersionMajor) && NVSDK_NGX_SUCCEED(resVersionMinor)) {
-                // Min Driver Version required: minDriverVersionMajor.minDriverVersionMinor
-                LOGW << "Minimum driver version required: " << minDriverVersionMajor << "." << minDriverVersionMinor
-                     << std::endl;
-                return NVSDK_NGX_Result_FAIL_OutOfDate;
-            }
-        }
-    }
-
-    NVSDK_NGX_Result resDlssSupported =
-        NGX_CHECK(ngxParams_->Get(NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &DLSS_Supported));
-    if (NVSDK_NGX_FAILED(resDlssSupported) || !DLSS_Supported) {
-        LOGW << "not available on this hardware/platform" << std::endl;
-        return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
-    }
-    resDlssSupported =
-        NGX_CHECK(ngxParams_->Get(NVSDK_NGX_Parameter_SuperSamplingDenoising_FeatureInitResult, &DLSS_Supported));
-    if (NVSDK_NGX_FAILED(resDlssSupported) || !DLSS_Supported) {
-        LOGW << "denied for this application" << std::endl;
-        return NVSDK_NGX_Result_FAIL_Denied;
-    }
-
-    return NVSDK_NGX_Result_Success;
-}
-
-NVSDK_NGX_Result NgxContext::initDlssRR(const DlssRRInitInfo &initInfo,
-                                        std::shared_ptr<vk::CommandPool> cmdPool,
-                                        std::shared_ptr<DlssRR> dlssrr) {
-    NGX_RETURN_ON_FAIL(dlssrr->init(device_, cmdPool, ngxParams_, initInfo));
-    return NVSDK_NGX_Result_Success;
-}
-
-NVSDK_NGX_Result NgxContext::getDlssRRRequiredInstanceExtensions(std::vector<VkExtensionProperties> &extensions) {
-    NVSDK_NGX_FeatureCommonInfo commonInfo = {};
-
-    NVSDK_NGX_FeatureDiscoveryInfo info{};
-    info.SDKVersion = NVSDK_NGX_Version_API;
-    info.FeatureID = NVSDK_NGX_Feature_RayReconstruction;
-    info.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Application_Id;
-    info.Identifier.v.ApplicationId = g_ApplicationID;
-    // info.ApplicationDataPath        = m_applicationPath.c_str();
-    info.FeatureInfo = &commonInfo;
-
-    uint32_t numExtensions = 0;
-    VkExtensionProperties *props;
-
-    NGX_RETURN_ON_FAIL(NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements(&info, &numExtensions, &props));
-
-    extensions.insert(extensions.end(), props, props + numExtensions);
-
-    return NVSDK_NGX_Result_Success;
-}
-
-NVSDK_NGX_Result NgxContext::getDlssRRRequiredDeviceExtensions(std::shared_ptr<vk::Instance> instance,
-                                                               std::shared_ptr<vk::PhysicalDevice> physicalDevice,
-                                                               std::vector<VkExtensionProperties> &extensions) {
-    NVSDK_NGX_FeatureCommonInfo commonInfo = {};
-
-    NVSDK_NGX_FeatureDiscoveryInfo info{};
-    info.SDKVersion = NVSDK_NGX_Version_API;
-    info.FeatureID = NVSDK_NGX_Feature_RayReconstruction;
-    info.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Application_Id;
-    info.Identifier.v.ApplicationId = g_ApplicationID;
-    info.ApplicationDataPath = L"";
-    info.FeatureInfo = &commonInfo;
-
-    uint32_t numExtensions = 0;
-    VkExtensionProperties *props;
-
-    NVSDK_NGX_Result result = NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements(
-        instance->vkInstance(), physicalDevice->vkPhysicalDevice(), &info, &numExtensions, &props);
-    if (NVSDK_NGX_FAILED(result)) {
-        LOGW << ws2s(GetNGXResultAsString(result)) << " while querying DLSS device extensions; skipping." << std::endl;
-        return result;
-    }
-
-    extensions.insert(extensions.end(), props, props + numExtensions);
-
-    return NVSDK_NGX_Result_Success;
-}
-
-NVSDK_NGX_Result NgxContext::querySupportedDlssInputSizes(const QuerySizeInfo &queryInfo, SupportedSizes &sizes) {
-    assert(ngxParams_);
-    assert(queryInfo.quality != NVSDK_NGX_PerfQuality_Value_UltraQuality); // Unsupported currently for DLSS_RR
-
-    float sharpness; // unused in DLSS_RR?
-
-    NGX_RETURN_ON_FAIL(NGX_DLSSD_GET_OPTIMAL_SETTINGS(
-        ngxParams_, queryInfo.outputSize.width, queryInfo.outputSize.height, queryInfo.quality,
-        &sizes.optimalSize.width, &sizes.optimalSize.height, &sizes.maxSize.width, &sizes.maxSize.height,
-        &sizes.minSize.width, &sizes.minSize.height, &sharpness));
-
-    // NGX_DLSSD_GET_OPTIMAL_SETTINGS can return successfully yet still return garbage values.
-    assert(sizes.optimalSize.width > 0 && sizes.optimalSize.height > 0 && sizes.maxSize.width > 0 &&
-           sizes.maxSize.height > 0 && sizes.minSize.width > 0 && sizes.minSize.height > 0);
-
-    return NVSDK_NGX_Result_Success;
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-NVSDK_NGX_Result DlssRR::init(std::shared_ptr<vk::Device> device,
-                              std::shared_ptr<vk::CommandPool> cmdPool,
-                              NVSDK_NGX_Parameter *ngxParams,
-                              const NgxContext::DlssRRInitInfo &info) {
-#ifdef DEBUG
-    std::cout << "DlssRR::init" << std::endl;
-#endif
-
-    assert(!m_dlssdHandle && "Cannot call init twice");
-
-    m_device = device;
-    m_ngxParams = ngxParams;
-
-    m_outputSize = info.outputSize;
-    m_inputSize = info.inputSize;
-
-    m_resources.fill({.Resource = {.ImageViewInfo = {}}});
-
-    NVSDK_NGX_DLSSD_Create_Params dlssdParams{};
-
-    dlssdParams.InDenoiseMode = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
-    // We expose only packed normal/roughness here because of providing float16 normals
-    dlssdParams.InRoughnessMode = NVSDK_NGX_DLSS_Roughness_Mode_Packed; // we pack roughness into the normal's w channel
-    dlssdParams.InUseHWDepth = NVSDK_NGX_DLSS_Depth_Type_Linear;        // we're providing linear depth
-
-    dlssdParams.InWidth = m_inputSize.width;
-    dlssdParams.InHeight = m_inputSize.height;
-    dlssdParams.InTargetWidth = m_outputSize.width;
-    dlssdParams.InTargetHeight = m_outputSize.height;
-
-    // Though marked as 'optional', these are absolutely needed
-    dlssdParams.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
-    dlssdParams.InPerfQualityValue = info.quality;
-
-    const uint32_t creationNodeMask = 0x1;
-    const uint32_t visibilityNodeMask = 0x1;
-
-    // This allows you to switch "presets", i.e. different models for the denoiser
-    m_ngxParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality, info.preset);
-    m_ngxParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality, info.preset);
-    m_ngxParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced, info.preset);
-    m_ngxParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance, info.preset);
-    m_ngxParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance, info.preset);
-
-    {
-        std::shared_ptr<vk::CommandBuffer> cmdBuffer = vk::CommandBuffer::create(device, cmdPool);
-        cmdBuffer->begin(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
-        NGX_RETURN_ON_FAIL(NGX_VULKAN_CREATE_DLSSD_EXT1(device->vkDevice(), cmdBuffer->vkCommandBuffer(),
-                                                        creationNodeMask, visibilityNodeMask, &m_dlssdHandle, ngxParams,
-                                                        &dlssdParams));
-        cmdBuffer->end()->submitMainQueueIndividual(device);
-    }
-
-    return NVSDK_NGX_Result_Success;
-}
-
 void DlssRR::deinit() {
-#ifdef DEBUG
-    std::cout << "DlssRR::deinit" << std::endl;
-#endif
-
-    if (m_dlssdHandle) { NVSDK_NGX_VULKAN_ReleaseFeature(m_dlssdHandle); }
-    m_dlssdHandle = nullptr;
-    m_device = VK_NULL_HANDLE;
+    // SetOptions only records configuration. Streamline does not create feature
+    // resources until the first successful evaluation, and rejects attempts to
+    // free a configured-but-never-evaluated viewport.
+    if (m_featureEvaluated && m_viewport && runtime().ready()) runtime().check(runtime().slFreeResources(m_rayReconstruction?sl::kFeatureDLSS_RR:sl::kFeatureDLSS,sl::ViewportHandle(m_viewport)),"free reconstruction viewport");
+    m_viewport=0; m_device.reset(); m_images={}; m_resetPending=true; m_lastFrame=UINT32_MAX; m_featureEvaluated=false;
 }
-
-DlssRR::~DlssRR() {
-#ifdef DEBUG
-    std::cout << "DlssRR::~DlssRR" << std::endl;
-#endif
-    assert(!m_dlssdHandle && "Must call deinit");
+DlssRR::~DlssRR() { deinit(); }
+void DlssRR::setResource(DlssResource resourceId, std::shared_ptr<vk::DeviceLocalImage> image) { m_images[resourceId]=std::move(image); }
+void DlssRR::resetResource(DlssResource resourceId) { m_images[resourceId].reset(); }
+void DlssRR::requestHistoryReset() { m_resetPending=true; }
+NVSDK_NGX_Result DlssRR::recordFailure(const char *stage, sl::Result failure, uint32_t frame) {
+    const bool firstOccurrence = m_lastFailureCode != failure || m_lastFailureStage != stage;
+    std::ostringstream description;
+    description << stage << ": " << sl::getResultAsStr(failure) << " (" << int(failure) << ')'
+        << ", feature=" << (m_rayReconstruction ? "DLSS-RR" : "DLSS-SR")
+        << ", viewport=" << m_viewport;
+    if (frame != UINT32_MAX) description << ", frame=" << frame;
+    description << ", input=" << m_inputSize.width << 'x' << m_inputSize.height
+        << ", output=" << m_outputSize.width << 'x' << m_outputSize.height;
+    m_lastFailure=description.str();
+    m_lastFailureCode=failure;
+    m_lastFailureStage=stage;
+    if (firstOccurrence) {
+        runtime().check(failure,stage);
+        std::ofstream diagnostic("radiance-streamline.log",std::ios::app);
+        if (diagnostic) diagnostic << m_lastFailure << '\n';
+    }
+    return result(false);
 }
-
-void DlssRR::setResource(DlssResource resourceId, std::shared_ptr<vk::DeviceLocalImage> image) {
-    assert(m_dlssdHandle);
-
-    VkExtent2D size = resourceId == RESOURCE_COLOR_OUT ? m_outputSize : m_inputSize;
-
-    NVSDK_NGX_Resource_VK resource = NVSDK_NGX_Create_ImageView_Resource_VK(
-        image->vkImageView(), image->vkImage(), vk::wholeColorSubresourceRange, image->vkFormat(), size.width,
-        size.height, resourceId == RESOURCE_COLOR_OUT /*readWrite*/);
-
-    m_resources[resourceId] = resource;
+NVSDK_NGX_Result DlssRR::denoise(std::shared_ptr<vk::CommandBuffer> cmd, glm::uvec2 size, glm::vec2 jitter,
+    const glm::mat4 &view, const glm::mat4 &projection, bool reset) {
+    auto &sl=runtime(); auto token=sl.frame();
+    if (!token || !m_viewport) {
+        m_lastFailure="reconstruction precondition failed: missing frame token or viewport";
+        return result(false);
+    }
+    // A cached Ponder scene may be drawn twice within one real frame. Its first
+    // reconstruction already produced the output; never advance that history twice.
+    if (m_lastFrame==uint32_t(*token)) return result(true);
+    const sl::ViewportHandle viewport(m_viewport);
+    if (m_rayReconstruction) {
+        m_rrOptions.worldToCameraView=mcvr::slMatrix(view); m_rrOptions.cameraViewToWorld=mcvr::slMatrix(glm::inverse(view));
+        const auto setResult=sl.slDLSSDSetOptions(viewport,m_rrOptions);
+        if (setResult!=sl::Result::eOk) return recordFailure("RR camera options",setResult,uint32_t(*token));
+    }
+    const auto previous=m_previousProjection*m_previousView*glm::inverse(view)*glm::inverse(projection);
+    auto constants=mcvr::slConstants(size,jitter,view,projection,previous,reset||m_resetPending);
+    const auto constantsResult=sl.slSetConstants(constants,*token,viewport);
+    if (constantsResult!=sl::Result::eOk) return recordFailure("reconstruction constants",constantsResult,uint32_t(*token));
+    const sl::BufferType types[]{sl::kBufferTypeScalingInputColor,sl::kBufferTypeScalingOutputColor,
+        sl::kBufferTypeAlbedo,sl::kBufferTypeSpecularAlbedo,sl::kBufferTypeNormalRoughness,
+        sl::kBufferTypeMotionVectors,m_rayReconstruction?sl::kBufferTypeLinearDepth:sl::kBufferTypeDepth,sl::kBufferTypeSpecularHitDistance};
+    std::array<sl::Resource,RESOURCE_NUM> resources{};
+    std::vector<sl::ResourceTag> tags; tags.reserve(RESOURCE_NUM);
+    for (unsigned i=0;i<RESOURCE_NUM;++i) {
+        if (!m_images[i]) continue;
+        if (!m_rayReconstruction && i!=RESOURCE_COLOR_IN && i!=RESOURCE_COLOR_OUT && i!=RESOURCE_MOTIONVECTOR && i!=RESOURCE_LINEARDEPTH) continue;
+        auto &image=*m_images[i]; auto &r=resources[i];
+        r=sl::Resource(sl::ResourceType::eTex2d,(void*)image.vkImage(),nullptr,(void*)image.vkImageView(),image.imageLayout());
+        r.width=image.width(); r.height=image.height(); r.nativeFormat=image.vkFormat(); r.mipLevels=1; r.arrayLayers=1; r.flags=0; r.usage=VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+        const sl::Extent extent{0,0,r.width,r.height};
+        tags.emplace_back(&r,types[i],sl::ResourceLifecycle::eValidUntilEvaluate,&extent);
+    }
+    const auto tagsResult=sl.slSetTagForFrame(*token,viewport,tags.data(),uint32_t(tags.size()),(sl::CommandBuffer*)cmd->vkCommandBuffer());
+    if (tagsResult!=sl::Result::eOk) return recordFailure("reconstruction tags",tagsResult,uint32_t(*token));
+    const sl::BaseStructure *inputs[]{&viewport};
+    const auto evaluateResult=sl.slEvaluateFeature(m_rayReconstruction?sl::kFeatureDLSS_RR:sl::kFeatureDLSS,*token,inputs,1,(sl::CommandBuffer*)cmd->vkCommandBuffer());
+    if (!mcvr::streamlineEvaluationCompleted(evaluateResult))
+        return recordFailure("reconstruction evaluate",evaluateResult,uint32_t(*token));
+    // The SDK already logs its budget warning. Retain successful output/history
+    // and, critically, register the feature for normal viewport resource release.
+    m_featureEvaluated=true;
+    m_lastFailure.clear(); m_lastFailureStage.clear(); m_lastFailureCode=sl::Result::eOk;
+    m_resetPending=false; m_lastFrame=uint32_t(*token); m_previousView=view; m_previousProjection=projection;
+    return result(true);
 }
-
-void DlssRR::resetResource(DlssResource resourceId) {
-    m_resources[resourceId] = {};
-}
-
-NVSDK_NGX_Result DlssRR::denoise(std::shared_ptr<vk::CommandBuffer> cmdBuffer,
-                                 glm::uvec2 renderSize,
-                                 glm::vec2 jitter,
-                                 const glm::mat4 &modelView,
-                                 const glm::mat4 &projection,
-                                 bool reset) {
-    assert(m_dlssdHandle);
-
-    auto getResource = [this](DlssResource res) -> NVSDK_NGX_Resource_VK * {
-        return m_resources[res].Resource.ImageViewInfo.ImageView ? &m_resources[res] : nullptr;
-    };
-
-    NVSDK_NGX_VK_DLSSD_Eval_Params evalParams = {};
-
-    evalParams.pInColor = getResource(RESOURCE_COLOR_IN);
-    evalParams.pInOutput = getResource(RESOURCE_COLOR_OUT);
-    evalParams.pInDiffuseAlbedo = getResource(RESOURCE_DIFFUSE_ALBEDO);
-    evalParams.pInSpecularAlbedo = getResource(RESOURCE_SPECULAR_ALBEDO);
-    evalParams.pInSpecularHitDistance = getResource(RESOURCE_SPECULAR_HITDISTANCE);
-    evalParams.pInNormals = getResource(RESOURCE_NORMALROUGHNESS);
-    evalParams.pInDepth = getResource(RESOURCE_LINEARDEPTH);
-    evalParams.pInMotionVectors = getResource(RESOURCE_MOTIONVECTOR);
-    // Is this needed with NVSDK_NGX_DLSS_Roughness_Mode_Packed?
-    evalParams.pInRoughness = getResource(RESOURCE_NORMALROUGHNESS);
-
-    evalParams.InJitterOffsetX = -jitter.x;
-    evalParams.InJitterOffsetY = -jitter.y;
-    evalParams.InMVScaleX = 1.0f;
-    evalParams.InMVScaleY = 1.0f;
-
-    evalParams.InRenderSubrectDimensions.Width = renderSize.x;
-    evalParams.InRenderSubrectDimensions.Height = renderSize.y;
-
-    // DLSS_RR expects row_major + 'left_multiply' matrices here.
-    // Ours (glm) are column-major + right_multiply. To convert we'd have to
-    // 1) transpose for row_major
-    // 2) transpose again for left_multiply
-    // Mdlss = (M^T)^T = M  ; thus, supply our original matrices and it magically works
-    evalParams.pInWorldToViewMatrix = const_cast<float *>(glm::value_ptr(modelView));
-    evalParams.pInViewToClipMatrix = const_cast<float *>(glm::value_ptr(projection));
-
-    evalParams.InReset = reset;
-
-    NGX_RETURN_ON_FAIL(
-        NGX_VULKAN_EVALUATE_DLSSD_EXT(cmdBuffer->vkCommandBuffer(), m_dlssdHandle, m_ngxParams, &evalParams));
-
-    return NVSDK_NGX_Result_Success;
-}
-
-std::string getNGXResultString(NVSDK_NGX_Result result) {
-    return ws2s(GetNGXResultAsString(result));
-}
+std::string getNGXResultString(NVSDK_NGX_Result value) { return std::to_string(static_cast<unsigned>(value)); }
+NVSDK_NGX_Result checkNgxResult(NVSDK_NGX_Result value,const char*,int) { return value; }

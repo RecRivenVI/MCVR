@@ -1,3 +1,4 @@
+#include "core/logging.hpp"
 #include "xess_sr_module.hpp"
 
 #include "core/render/buffers.hpp"
@@ -55,7 +56,7 @@ bool XessSrModule::parseQualityModeValue(const std::string &value, QualityMode &
 void XessSrModule::init(std::shared_ptr<Framework> framework, std::shared_ptr<WorldPipeline> worldPipeline) {
     WorldModule::init(framework, worldPipeline);
 
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
     deviceDepthImages_.resize(size);
     xessMotionVectorImages_.resize(size);
     inputImages_.resize(size);
@@ -71,7 +72,7 @@ bool XessSrModule::setOrCreateInputImages(std::vector<std::shared_ptr<vk::Device
     if (!fw) return false;
 
     if (displayWidth_ == 0 || displayHeight_ == 0) {
-        VkExtent2D extent = fw->swapchain()->vkExtent();
+        VkExtent2D extent = worldPipeline_.lock()->renderExtent();
         displayWidth_ = extent.width;
         displayHeight_ = extent.height;
     }
@@ -122,7 +123,7 @@ bool XessSrModule::setOrCreateOutputImages(std::vector<std::shared_ptr<vk::Devic
         }
 
         if (displayWidth_ == 0 || displayHeight_ == 0) {
-            VkExtent2D extent = fw->swapchain()->vkExtent();
+            VkExtent2D extent = worldPipeline_.lock()->renderExtent();
             displayWidth_ = extent.width;
             displayHeight_ = extent.height;
         }
@@ -147,9 +148,8 @@ bool XessSrModule::setOrCreateOutputImages(std::vector<std::shared_ptr<vk::Devic
 void XessSrModule::build() {
     auto fw = framework_.lock();
     auto wp = worldPipeline_.lock();
-    uint32_t size = fw->swapchain()->imageCount();
+    uint32_t size = fw->recordingContextCount();
 
-    xess_ = std::make_shared<mcvr::XeSSWrapper>();
 
     mcvr::XeSSConfig config{};
     config.instance = fw->instance()->vkInstance();
@@ -164,13 +164,18 @@ void XessSrModule::build() {
     config.velocityScaleX = 1.0f;
     config.velocityScaleY = 1.0f;
 
+    histories_.resize(wp->viewCount());
+    for (auto &history : histories_) {
+        history.xess_ = std::make_shared<mcvr::XeSSWrapper>();
     if (!xessEnabled_) {
-        initialized_ = false;
-    } else if (!xess_->initialize(config)) {
-        std::cerr << "XessSrModule: failed to initialize XeSS, fallback to blit" << std::endl;
-        initialized_ = false;
+        history.initialized_ = false;
+    } else if (!history.xess_->initialize(config)) {
+        mcvr::log::error("XessSrModule") << "XessSrModule: failed to initialize XeSS, fallback to blit" << std::endl;
+        history.initialized_ = false;
     } else {
-        initialized_ = true;
+        history.initialized_ = true;
+    }
+
     }
 
     initDescriptorTables();
@@ -200,7 +205,7 @@ void XessSrModule::build() {
 
 void XessSrModule::initDescriptorTables() {
     auto fw = framework_.lock();
-    uint32_t size = fw->swapchain()->imageCount();
+    uint32_t size = fw->recordingContextCount();
     depthDescriptorTables_.resize(size);
 
     for (uint32_t i = 0; i < size; i++) {
@@ -262,7 +267,7 @@ void XessSrModule::initDescriptorTables() {
 
 void XessSrModule::initImages() {
     auto fw = framework_.lock();
-    uint32_t size = fw->swapchain()->imageCount();
+    uint32_t size = fw->recordingContextCount();
 
     for (uint32_t i = 0; i < size; i++) {
         deviceDepthImages_[i] =
@@ -342,12 +347,18 @@ void XessSrModule::bindTexture(std::shared_ptr<vk::Sampler> sampler,
                                std::shared_ptr<vk::DeviceLocalImage> image,
                                int index) {}
 
+void XessSrModule::onResourceReload() {
+    for (auto &history : histories_) history.firstFrame_ = true;
+}
+
 void XessSrModule::preClose() {
-    if (xess_ != nullptr) {
-        xess_->destroy();
-        xess_.reset();
+    for (auto &history : histories_) {
+    if (history.xess_ != nullptr) {
+        history.xess_->destroy();
+        history.xess_.reset();
     }
-    initialized_ = false;
+    history.initialized_ = false;
+    }
 }
 
 void XessSrModule::updateRenderResolution() {
@@ -398,19 +409,19 @@ XessSrModuleContext::XessSrModuleContext(std::shared_ptr<FrameworkContext> frame
 
 bool XessSrModuleContext::checkCameraReset(const glm::vec3 &cameraPos, const glm::vec3 &cameraDir) {
     auto module = xessModule_.lock();
-    if (module->firstFrame_) {
-        module->firstFrame_ = false;
-        module->lastCameraPos_ = cameraPos;
-        module->lastCameraDir_ = cameraDir;
+    if (module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).firstFrame_) {
+        module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).firstFrame_ = false;
+        module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).lastCameraPos_ = cameraPos;
+        module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).lastCameraDir_ = cameraDir;
         return true;
     }
 
-    float positionDelta = glm::length(cameraPos - module->lastCameraPos_);
-    float directionDot = glm::dot(glm::normalize(cameraDir), glm::normalize(module->lastCameraDir_));
+    float positionDelta = glm::length(cameraPos - module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).lastCameraPos_);
+    float directionDot = glm::dot(glm::normalize(cameraDir), glm::normalize(module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).lastCameraDir_));
     bool shouldReset = (positionDelta > 1.0f) || (directionDot < 0.866f);
 
-    module->lastCameraPos_ = cameraPos;
-    module->lastCameraDir_ = cameraDir;
+    module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).lastCameraPos_ = cameraPos;
+    module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).lastCameraDir_ = cameraDir;
     return shouldReset;
 }
 
@@ -623,7 +634,7 @@ void XessSrModuleContext::render() {
         dispatchUpscaledNormalRoughness();
     };
 
-    if (!module->xessEnabled_ || !module->initialized_ || !module->xess_) {
+    if (!module->xessEnabled_ || !module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).initialized_ || !module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).xess_) {
         fallbackBlit();
         return;
     }
@@ -806,7 +817,7 @@ void XessSrModuleContext::render() {
     input.inputWidth = module->renderWidth_;
     input.inputHeight = module->renderHeight_;
 
-    if (!module->xess_->dispatch(input)) {
+    if (!module->histories_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).xess_->dispatch(input)) {
         fallbackBlit();
         return;
     }

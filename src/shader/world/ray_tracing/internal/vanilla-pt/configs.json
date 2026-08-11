@@ -378,6 +378,24 @@
             "address_mode": "clamp_to_edge"
         },
         {
+            "name": "priority_geometry",
+            "type": "intermediate",
+            "format": "R16G16B16A16_SFLOAT",
+            "scale": 1,
+            "storage_binding": 38,
+            "filter": "nearest",
+            "address_mode": "clamp_to_edge"
+        },
+        {
+            "name": "priority_background",
+            "type": "intermediate",
+            "format": "R16G16B16A16_SFLOAT",
+            "scale": 1,
+            "storage_binding": 39,
+            "filter": "nearest",
+            "address_mode": "clamp_to_edge"
+        },
+        {
             "name": "post_dof_blur",
             "type": "intermediate",
             "format": "R16G16B16A16_SFLOAT",
@@ -565,6 +583,15 @@
                         }
                     ]
                 }
+            },
+            {
+                "pass": "priority_background"
+            },
+            {
+                "pass": "priority_geometry"
+            },
+            {
+                "pass": "priority_composite"
             }
         ]
     },
@@ -578,21 +605,6 @@
             }
         ],
         "commands": [
-            {
-                "pass": "post_render_particle"
-            },
-            {
-                "pass": "post_render_weather"
-            },
-            {
-                "pass": "post_render_text"
-            },
-            {
-                "pass": "post_render_name_tag"
-            },
-            {
-                "pass": "post_render_star"
-            },
             {
                 "if_else": {
                     "condition": "VPT_POST_ENABLE_MOTION_BLUR != 0",
@@ -741,7 +753,35 @@
                     "type": "triangle",
                     "shaders": {
                         "rchit": "world/world_no_reflect.rchit",
-                        "rahit": "world/world_no_reflect.rahit"
+                        "rahit": "world/default.rahit"
+                    }
+                },
+                "text": {
+                    "type": "triangle",
+                    "shaders": {
+                        "rchit": "world/default.rchit",
+                        "rahit": "world/text.rahit"
+                    }
+                },
+                "text_intensity": {
+                    "type": "triangle",
+                    "shaders": {
+                        "rchit": "world/default.rchit",
+                        "rahit": "world/text.rahit"
+                    }
+                },
+                "text_background": {
+                    "type": "triangle",
+                    "shaders": {
+                        "rchit": "world/default.rchit",
+                        "rahit": "world/text.rahit"
+                    }
+                },
+                "text_background_see_through": {
+                    "type": "triangle",
+                    "shaders": {
+                        "rchit": "world/default.rchit",
+                        "rahit": "world/text.rahit"
                     }
                 },
                 "text_see_through": {
@@ -780,6 +820,27 @@
                     }
                 },
                 "beacon_beam": {
+                    "type": "triangle",
+                    "shaders": {
+                        "rchit": "world/transparent_only.rchit",
+                        "rahit": "world/transparent_only.rahit"
+                    }
+                },
+                "entity_translucent_emissive": {
+                    "type": "triangle",
+                    "shaders": {
+                        "rchit": "world/transparent_only.rchit",
+                        "rahit": "world/transparent_only.rahit"
+                    }
+                },
+                "energy_swirl": {
+                    "type": "triangle",
+                    "shaders": {
+                        "rchit": "world/transparent_only.rchit",
+                        "rahit": "world/transparent_only.rahit"
+                    }
+                },
+                "dragon_rays": {
                     "type": "triangle",
                     "shaders": {
                         "rchit": "world/transparent_only.rchit",
@@ -829,6 +890,203 @@
             "gz": "1"
         },
         {
+            "type": "ray_tracing",
+            "name": "priority_background",
+            "outputs": {
+                "images": [
+                    "priority_background",
+                    "out:diffuse_albedo_metallic",
+                    "out:specular_albedo",
+                    "out:normal_roughness",
+                    "out:motion_vector",
+                    "out:linear_depth",
+                    "out:specular_hit_depth",
+                    "out:first_hit_depth"
+                ]
+            },
+            "rgen": "priority/background.rgen",
+            "default_hit_group": "priority_ignore",
+            "hit_groups": {
+                "priority_ignore": {
+                    "type": "triangle",
+                    "shaders": {
+                        "rchit": "priority/ignore.rchit",
+                        "rahit": "priority/ignore.rahit"
+                    }
+                },
+                "text_background": {
+                    "type": "triangle",
+                    "shaders": {
+                        "rchit": "priority/text.rchit",
+                        "rahit": "priority/text.rahit"
+                    }
+                },
+                "text_background_see_through": {
+                    "type": "triangle",
+                    "shaders": {
+                        "rchit": "priority/text.rchit",
+                        "rahit": "priority/text.rahit"
+                    }
+                }
+            },
+            "miss": [
+                {
+                    "name": "priority",
+                    "shader": "priority/priority.rmiss"
+                }
+            ]
+        },
+        {
+            "type": "ray_tracing",
+            "name": "priority_geometry",
+            "outputs": {
+                "images": [
+                    "priority_geometry",
+                    "out:diffuse_albedo_metallic",
+                    "out:specular_albedo",
+                    "out:normal_roughness",
+                    "out:motion_vector",
+                    "out:linear_depth",
+                    "out:specular_hit_depth",
+                    "out:first_hit_depth"
+                ]
+            },
+            "rgen": "priority/priority.rgen",
+            "default_hit_group": "priority_ignore",
+            "hit_groups": {
+                "priority_ignore": {
+                    "type": "triangle",
+                    "shaders": {
+                        "rchit": "priority/ignore.rchit",
+                        "rahit": "priority/ignore.rahit"
+                    }
+                },
+                "priority_outline": {
+                    "type": "triangle",
+                    "shaders": {
+                        "rchit": "priority/outline.rchit"
+                    }
+                },
+                "priority_outline_black": {
+                    "type": "triangle", "defines": {"PRIORITY_OUTLINE_COLOR": "vec3(0.0, 0.0, 0.0)"},
+                    "shaders": {"rchit": "priority/outline.rchit"}
+                },
+                "priority_outline_dark_blue": {
+                    "type": "triangle", "defines": {"PRIORITY_OUTLINE_COLOR": "vec3(0.0, 0.0, 0.666666667)"},
+                    "shaders": {"rchit": "priority/outline.rchit"}
+                },
+                "priority_outline_dark_green": {
+                    "type": "triangle", "defines": {"PRIORITY_OUTLINE_COLOR": "vec3(0.0, 0.666666667, 0.0)"},
+                    "shaders": {"rchit": "priority/outline.rchit"}
+                },
+                "priority_outline_dark_aqua": {
+                    "type": "triangle", "defines": {"PRIORITY_OUTLINE_COLOR": "vec3(0.0, 0.666666667, 0.666666667)"},
+                    "shaders": {"rchit": "priority/outline.rchit"}
+                },
+                "priority_outline_dark_red": {
+                    "type": "triangle", "defines": {"PRIORITY_OUTLINE_COLOR": "vec3(0.666666667, 0.0, 0.0)"},
+                    "shaders": {"rchit": "priority/outline.rchit"}
+                },
+                "priority_outline_dark_purple": {
+                    "type": "triangle", "defines": {"PRIORITY_OUTLINE_COLOR": "vec3(0.666666667, 0.0, 0.666666667)"},
+                    "shaders": {"rchit": "priority/outline.rchit"}
+                },
+                "priority_outline_gold": {
+                    "type": "triangle", "defines": {"PRIORITY_OUTLINE_COLOR": "vec3(1.0, 0.666666667, 0.0)"},
+                    "shaders": {"rchit": "priority/outline.rchit"}
+                },
+                "priority_outline_gray": {
+                    "type": "triangle", "defines": {"PRIORITY_OUTLINE_COLOR": "vec3(0.666666667, 0.666666667, 0.666666667)"},
+                    "shaders": {"rchit": "priority/outline.rchit"}
+                },
+                "priority_outline_dark_gray": {
+                    "type": "triangle", "defines": {"PRIORITY_OUTLINE_COLOR": "vec3(0.333333333, 0.333333333, 0.333333333)"},
+                    "shaders": {"rchit": "priority/outline.rchit"}
+                },
+                "priority_outline_blue": {
+                    "type": "triangle", "defines": {"PRIORITY_OUTLINE_COLOR": "vec3(0.333333333, 0.333333333, 1.0)"},
+                    "shaders": {"rchit": "priority/outline.rchit"}
+                },
+                "priority_outline_green": {
+                    "type": "triangle", "defines": {"PRIORITY_OUTLINE_COLOR": "vec3(0.333333333, 1.0, 0.333333333)"},
+                    "shaders": {"rchit": "priority/outline.rchit"}
+                },
+                "priority_outline_aqua": {
+                    "type": "triangle", "defines": {"PRIORITY_OUTLINE_COLOR": "vec3(0.333333333, 1.0, 1.0)"},
+                    "shaders": {"rchit": "priority/outline.rchit"}
+                },
+                "priority_outline_red": {
+                    "type": "triangle", "defines": {"PRIORITY_OUTLINE_COLOR": "vec3(1.0, 0.333333333, 0.333333333)"},
+                    "shaders": {"rchit": "priority/outline.rchit"}
+                },
+                "priority_outline_light_purple": {
+                    "type": "triangle", "defines": {"PRIORITY_OUTLINE_COLOR": "vec3(1.0, 0.333333333, 1.0)"},
+                    "shaders": {"rchit": "priority/outline.rchit"}
+                },
+                "priority_outline_yellow": {
+                    "type": "triangle", "defines": {"PRIORITY_OUTLINE_COLOR": "vec3(1.0, 1.0, 0.333333333)"},
+                    "shaders": {"rchit": "priority/outline.rchit"}
+                },
+                "simulated:lock": {
+                    "type": "triangle",
+                    "shaders": {"rchit": "priority/name_tag_text.rchit", "rahit": "priority/text.rahit"}
+                },
+                "text": {
+                    "type": "triangle",
+                    "shaders": {
+                        "rchit": "priority/name_tag_text.rchit",
+                        "rahit": "priority/text.rahit"
+                    }
+                },
+                "text_intensity": {
+                    "type": "triangle",
+                    "shaders": {
+                        "rchit": "priority/name_tag_text.rchit",
+                        "rahit": "priority/text.rahit"
+                    }
+                },
+                "text_see_through": {
+                    "type": "triangle",
+                    "shaders": {
+                        "rchit": "priority/text.rchit",
+                        "rahit": "priority/text.rahit"
+                    }
+                },
+                "text_intensity_see_through": {
+                    "type": "triangle",
+                    "shaders": {
+                        "rchit": "priority/text.rchit",
+                        "rahit": "priority/text.rahit"
+                    }
+                }
+            },
+            "miss": [
+                {
+                    "name": "priority",
+                    "shader": "priority/priority.rmiss"
+                }
+            ]
+        },
+        {
+            "type": "compute",
+            "name": "priority_composite",
+            "inputs": {
+                "images": [
+                    "priority_geometry",
+                    "priority_background"
+                ]
+            },
+            "outputs": {
+                "images": [
+                    "out:radiance"
+                ]
+            },
+            "compute": "priority/composite.comp",
+            "gx": "(RENDER_WIDTH + 7) / 8",
+            "gy": "(RENDER_HEIGHT + 7) / 8",
+            "gz": "1"
+        },
+        {
             "type": "compute",
             "name": "volumetric_cloud_apply",
             "inputs": {
@@ -848,86 +1106,6 @@
             "gx": "(RENDER_WIDTH + 7) / 8",
             "gy": "(RENDER_HEIGHT + 7) / 8",
             "gz": "1"
-        },
-        {
-            "type": "render",
-            "stage": "post_render",
-            "name": "post_render_particle",
-            "content": "particle",
-            "vertex": "post_render/render_world_post.vert",
-            "fragment": "post_render/render_world_post.frag",
-            "outputs": {
-                "images": [
-                    "out:ldr"
-                ]
-            },
-            "depth_write": false
-        },
-        {
-            "type": "render",
-            "stage": "post_render",
-            "name": "post_render_weather",
-            "content": "weather",
-            "vertex": "post_render/render_world_post.vert",
-            "fragment": "post_render/render_world_post.frag",
-            "outputs": {
-                "images": [
-                    "out:ldr"
-                ]
-            },
-            "depth_write": false
-        },
-        {
-            "type": "render",
-            "stage": "post_render",
-            "name": "post_render_text",
-            "content": "text",
-            "vertex": "post_render/render_text.vert",
-            "fragment": "post_render/render_text.frag",
-            "outputs": {
-                "images": [
-                    "out:ldr",
-                    "out:first_hit_depth"
-                ]
-            },
-            "depth_write": true,
-            "depth_compare": "less"
-        },
-        {
-            "type": "render",
-            "stage": "post_render",
-            "name": "post_render_name_tag",
-            "content": "name_tag",
-            "vertex": "post_render/render_text.vert",
-            "fragment": "post_render/render_text.frag",
-            "outputs": {
-                "images": [
-                    "out:ldr",
-                    "out:first_hit_depth"
-                ]
-            },
-            "depth_write": true,
-            "depth_compare": "always"
-        },
-        {
-            "type": "render",
-            "stage": "post_render",
-            "name": "post_render_star",
-            "content": "star",
-            "vertex": "post_render/render_star.vert",
-            "fragment": "post_render/render_star.frag",
-            "inputs": {
-                "images": [
-                    "post_star_cloud_transmittance"
-                ]
-            },
-            "outputs": {
-                "images": [
-                    "out:ldr"
-                ]
-            },
-            "depth_write": true,
-            "depth_compare": "less"
         },
         {
             "type": "full_screen",

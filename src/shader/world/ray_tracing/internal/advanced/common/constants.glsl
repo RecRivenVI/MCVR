@@ -20,7 +20,7 @@ const float ADV_TEMPORAL_REUSE_PLANE_DISTANCE_MOTION_SCALE = 1.50;
 const float ADV_TEMPORAL_REUSE_MIN_TANGENT_MOTION_SCALE = 6.0;
 const float ADV_TEMPORAL_REUSE_TANGENT_PIXEL_FOOTPRINT_MOTION_SCALE = 96.0;
 const int ADV_PRIMARY_TRACE_STEP_LIMIT = 2;
-const uint ADV_RAY_FLAGS = gl_RayFlagsNoneEXT;
+const uint ADV_RAY_FLAGS = gl_RayFlagsCullBackFacingTrianglesEXT;
 const vec3 ADV_WATER_TINT = vec3(0.0, 0.48, 0.65);
 const vec3[] ADV_COLORS = vec3[](
     vec3(0.022087, 0.098399, 0.110818),

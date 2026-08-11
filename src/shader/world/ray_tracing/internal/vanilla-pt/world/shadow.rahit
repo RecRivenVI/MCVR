@@ -11,6 +11,7 @@
 #include "util/random.glsl"
 #include "util/ray.glsl"
 #include "util/ray_cone.glsl"
+#include "util/text_mode.glsl"
 #include "util/util.glsl"
 #include "common/shared.hpp"
 
@@ -40,6 +41,7 @@ layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Ind
 indexBuffer;
 
 #include "util/vertex.glsl"
+#include "util/material_faces.glsl"
 
 layout(location = 1) rayPayloadInEXT ShadowRay shadowRay;
 hitAttributeEXT vec2 attribs;
@@ -48,6 +50,11 @@ void main() {
     uint instanceID = gl_InstanceCustomIndexEXT;
     uint geometryID = gl_GeometryIndexEXT;
     uint geometryBufferIndex = getGeometryBufferIndex(instanceID, geometryID);
+    if (!acceptsMaterialFace(instanceAppearances.values[geometryBufferIndex].materialFlags,
+                             gl_HitKindEXT == gl_HitKindFrontFacingTriangleEXT)) {
+        ignoreIntersectionEXT;
+        return;
+    }
 
     uint i0, i1, i2;
     PositionVertex p0, p1, p2;
@@ -74,16 +81,33 @@ void main() {
     bool isWaterMaterial = false;
     bool useRealisticWaterSurface = VPT_WATER_SURFACE_MODE == 1u;
     if (hasTexture(packedData)) {
-        int flagTextureID = mapping.entries[textureID].flag;
+        TextureMapEntry textureMap = mapping.entries[textureID];
+        int flagTextureID = textureMap.flag;
         if (flagTextureID >= 0) {
             flags = ivec4(round(sampleTexture(textures[nonuniformEXT(flagTextureID)], textureUV, 0.0, false) * 255.0));
             isWaterMaterial = useRealisticWaterSurface && (flags.r & 0x1) > 0;
         }
     }
-    vec4 shadedAlbedo = albedo * colorLayer;
+    bool textSurface = isTextMode(alphaMode);
+    vec3 shadedRgb = textSurface ?
+                         albedo.rgb * colorLayer.rgb :
+                         (hasColorLayerMix(packedData) ?
+                              mix(albedo.rgb, colorLayer.rgb, clamp(colorLayer.a, 0.0, 1.0)) :
+                              albedo.rgb * colorLayer.rgb);
+    float shadedAlpha = textSurface ? albedo.a * colorLayer.a :
+                                      (hasColorLayerMix(packedData) ? albedo.a : albedo.a * colorLayer.a);
+    vec4 shadedAlbedo = vec4(shadedRgb, shadedAlpha);
     float alpha = resolveSurfaceAlpha(shadedAlbedo.a, alphaMode);
-    if (alpha < 0.05) {
-        ignoreIntersectionEXT;
+
+    // World text uses stochastic coverage in its primary any-hit shader. Use
+    // the same coverage decision for direct-light visibility so glyph edges
+    // do not become opaque or dielectric shadows.
+    if (textSurface) {
+        uint coverageSeed = xxhash32(uvec3(uint(gl_PrimitiveID), instanceID,
+                                            floatBitsToUint(gl_HitTEXT)));
+        if (alpha <= 0.0 || (alpha < 1.0 && rand(coverageSeed) >= alpha)) {
+            ignoreIntersectionEXT;
+        }
         return;
     }
 
@@ -94,7 +118,31 @@ void main() {
         }
     }
 
-    if (!isWaterMaterial && alphaMode != ALPHA_MODE_TRANSPARENT) {
+    if (isAdditiveAlphaMode(alphaMode)) {
+        ignoreIntersectionEXT;
+        return;
+    }
+
+    if (isCoverageAlphaMode(alphaMode)) {
+        if (alpha <= 0.0) {
+            ignoreIntersectionEXT;
+            return;
+        }
+        if (alpha >= 1.0) {
+            terminateRayEXT;
+            return;
+        }
+        shadowRay.throughput *= vec3(1.0 - alpha);
+        ignoreIntersectionEXT;
+        return;
+    }
+
+    if (alpha < 0.05) {
+        ignoreIntersectionEXT;
+        return;
+    }
+
+    if (!isWaterMaterial && !isTransmissionAlphaMode(alphaMode)) {
         terminateRayEXT;
         return;
     }
@@ -107,22 +155,15 @@ void main() {
         }
     }
 
-    vec2 glintUV = baryCoords.x * m0.glintUV + baryCoords.y * m1.glintUV + baryCoords.z * m2.glintUV;
-    glintUV = (ubo.textureMat * vec4(glintUV, 0.0, 1.0)).xy;
-    vec3 glint = hasGlint(packedData) ? sampleTexture(textures[nonuniformEXT(m0.glintTexture)], glintUV, false).rgb :
-                                          vec3(0.0);
-    glint *= glint;
-
     vec3 tint = shadedAlbedo.rgb;
     if (hasOverlay(packedData)) {
         vec4 overlayColor = sampleTexture(textures[nonuniformEXT(ubo.overlayTextureID)], m0.overlayUV, 0, false);
-        tint = mix(overlayColor.rgb, tint, overlayColor.a) + glint;
-    } else {
-        tint += glint;
+        tint = mix(overlayColor.rgb, tint, overlayColor.a);
     }
     shadedAlbedo.a = alpha;
 
-    LabPBRMat mat = convertLabPBRMaterial(shadedAlbedo, specular, vec4(0.0));
+    LabPBRMat mat = convertLabPBRMaterial(shadedAlbedo, specular, vec4(0.0),
+                                          isTransmissionAlphaMode(alphaMode));
 
     if (isWaterMaterial || mat.transmission > 0.0 || alpha < 0.95) {
         vec3 shadowTransmission =
@@ -130,7 +171,7 @@ void main() {
         if (isWaterMaterial && VPT_WATER_SURFACE_MODE == 1u) {
             vec3 dposdu;
             vec3 dposdv;
-            mat3 objectToWorld = mat3(gl_ObjectToWorld3x4EXT);
+            mat3 objectToWorld = mat3(gl_ObjectToWorldEXT);
             computedposduDv(p0.pos, p1.pos, p2.pos, m0.textureUV, m1.textureUV, m2.textureUV, dposdu, dposdv);
             vec3 dPduWorld = objectToWorld * dposdu;
             vec3 dPdvWorld = objectToWorld * dposdv;

@@ -11,6 +11,8 @@ layout(set = 5, binding = ADV_MATERIAL_STATE_BINDING, rgba16f) uniform image2DAr
 layout(set = 5, binding = 7, rgba16f) uniform image2DArray rayMaterialStateImage;
 #endif
 
+#include "util/ui_primary_visibility.glsl"
+
 const uint rayBounceMask = 0xFFu;
 const uint rayInsideBoatBit = 1u << 8u;
 const uint rayStopBit = 1u << 9u;

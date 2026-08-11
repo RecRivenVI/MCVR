@@ -1,3 +1,4 @@
+#include "core/logging.hpp"
 #include "xess_wrapper.hpp"
 
 #include <iostream>
@@ -27,7 +28,7 @@ bool XeSSWrapper::getRequiredInstanceExtensions(std::vector<const char *> &exten
     uint32_t minVersion = 0;
     xess_result_t result = xessVKGetRequiredInstanceExtensions(&count, &rawExtensions, &minVersion);
     if (result != XESS_RESULT_SUCCESS) {
-        std::cerr << "[XeSS] xessVKGetRequiredInstanceExtensions failed: " << static_cast<int>(result) << std::endl;
+        mcvr::log::error("XessWrapper") << "[XeSS] xessVKGetRequiredInstanceExtensions failed: " << static_cast<int>(result) << std::endl;
         return false;
     }
     if (count > 0 && rawExtensions == nullptr) { return false; }
@@ -54,7 +55,7 @@ bool XeSSWrapper::getRequiredDeviceExtensions(VkInstance instance,
     const char *const *rawExtensions = nullptr;
     xess_result_t result = xessVKGetRequiredDeviceExtensions(instance, physicalDevice, &count, &rawExtensions);
     if (result != XESS_RESULT_SUCCESS) {
-        std::cerr << "[XeSS] xessVKGetRequiredDeviceExtensions failed: " << static_cast<int>(result) << std::endl;
+        mcvr::log::error("XessWrapper") << "[XeSS] xessVKGetRequiredDeviceExtensions failed: " << static_cast<int>(result) << std::endl;
         return false;
     }
     if (count > 0 && rawExtensions == nullptr) { return false; }
@@ -74,7 +75,7 @@ bool XeSSWrapper::getRequiredDeviceFeatures(VkInstance instance, VkPhysicalDevic
 #else
     xess_result_t result = xessVKGetRequiredDeviceFeatures(instance, physicalDevice, features);
     if (result != XESS_RESULT_SUCCESS) {
-        std::cerr << "[XeSS] xessVKGetRequiredDeviceFeatures failed: " << static_cast<int>(result) << std::endl;
+        mcvr::log::error("XessWrapper") << "[XeSS] xessVKGetRequiredDeviceFeatures failed: " << static_cast<int>(result) << std::endl;
         return false;
     }
     return true;
@@ -161,12 +162,12 @@ bool XeSSWrapper::initialize(const XeSSConfig &config) {
 
     if (instance_ == VK_NULL_HANDLE || physicalDevice_ == VK_NULL_HANDLE || device_ == VK_NULL_HANDLE ||
         renderWidth_ == 0 || renderHeight_ == 0 || displayWidth_ == 0 || displayHeight_ == 0) {
-        std::cerr << "[XeSS] Invalid init config" << std::endl;
+        mcvr::log::error("XessWrapper") << "[XeSS] Invalid init config" << std::endl;
         return false;
     }
 
 #ifndef MCVR_ENABLE_XESS
-    std::cerr << "[XeSS] XeSS support is not enabled at compile time" << std::endl;
+    mcvr::log::error("XessWrapper") << "[XeSS] XeSS support is not enabled at compile time" << std::endl;
     return false;
 #else
     if (!initContextAndPipelines()) { return false; }
@@ -205,7 +206,7 @@ bool XeSSWrapper::dispatch(const XeSSInput &input) {
 
     if (!isImageValid(input.colorTexture) || !isImageValid(input.velocityTexture) || !isImageValid(input.outputTexture) ||
         input.inputWidth == 0 || input.inputHeight == 0) {
-        std::cerr << "[XeSS] Invalid execute input" << std::endl;
+        mcvr::log::error("XessWrapper") << "[XeSS] Invalid execute input" << std::endl;
         return false;
     }
 
@@ -241,7 +242,7 @@ bool XeSSWrapper::dispatch(const XeSSInput &input) {
     xess_result_t result =
         xessVKExecute(reinterpret_cast<xess_context_handle_t>(contextHandle_), input.commandBuffer, &exec);
     if (result != XESS_RESULT_SUCCESS) {
-        std::cerr << "[XeSS] xessVKExecute failed: " << static_cast<int>(result) << std::endl;
+        mcvr::log::error("XessWrapper") << "[XeSS] xessVKExecute failed: " << static_cast<int>(result) << std::endl;
         return false;
     }
     return true;
@@ -278,7 +279,7 @@ bool XeSSWrapper::initContextAndPipelines() {
     xess_result_t result = xessVKCreateContext(instance_, physicalDevice_, device_,
                                                reinterpret_cast<xess_context_handle_t *>(&contextHandle_));
     if (result != XESS_RESULT_SUCCESS || contextHandle_ == nullptr) {
-        std::cerr << "[XeSS] xessVKCreateContext failed: " << static_cast<int>(result) << std::endl;
+        mcvr::log::error("XessWrapper") << "[XeSS] xessVKCreateContext failed: " << static_cast<int>(result) << std::endl;
         return false;
     }
     contextCreated_ = true;
@@ -321,14 +322,14 @@ bool XeSSWrapper::initXeSS(uint32_t displayWidth, uint32_t displayHeight, XeSSQu
 
     xess_result_t initResult = xessVKInit(reinterpret_cast<xess_context_handle_t>(contextHandle_), &initParams);
     if (initResult != XESS_RESULT_SUCCESS) {
-        std::cerr << "[XeSS] xessVKInit failed: " << static_cast<int>(initResult) << std::endl;
+        mcvr::log::error("XessWrapper") << "[XeSS] xessVKInit failed: " << static_cast<int>(initResult) << std::endl;
         return false;
     }
 
     xess_result_t velocityResult =
         xessSetVelocityScale(reinterpret_cast<xess_context_handle_t>(contextHandle_), velocityScaleX_, velocityScaleY_);
     if (velocityResult != XESS_RESULT_SUCCESS) {
-        std::cerr << "[XeSS] xessSetVelocityScale failed: " << static_cast<int>(velocityResult) << std::endl;
+        mcvr::log::error("XessWrapper") << "[XeSS] xessSetVelocityScale failed: " << static_cast<int>(velocityResult) << std::endl;
     }
 
     return true;

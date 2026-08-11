@@ -1,11 +1,15 @@
 #include "core/vulkan/command.hpp"
 
+#include "core/logging.hpp"
+#include "core/failure_state.hpp"
+
 #include "core/vulkan/buffer.hpp"
 #include "core/vulkan/descriptor.hpp"
 #include "core/vulkan/device.hpp"
 #include "core/vulkan/framebuffer.hpp"
 #include "core/vulkan/image.hpp"
 #include "core/vulkan/physical_device.hpp"
+#include "core/vulkan/command_result.hpp"
 #include "core/vulkan/pipeline.hpp"
 #include "core/vulkan/render_pass.hpp"
 #include "core/vulkan/sbt.hpp"
@@ -13,20 +17,20 @@
 
 #include <iostream>
 
-std::ostream &commandPoolCout() {
-    return std::cout << "[CommandPool] ";
+auto commandPoolCout() {
+    return mcvr::log::info("CommandPool");
 }
 
-std::ostream &commandPoolCerr() {
-    return std::cerr << "[CommandPool] ";
+auto commandPoolCerr() {
+    return mcvr::log::error("CommandPool");
 }
 
-std::ostream &commandBufferCout() {
-    return std::cout << "[CommandBuffer] ";
+auto commandBufferCout() {
+    return mcvr::log::info("CommandBuffer");
 }
 
-std::ostream &commandBufferCerr() {
-    return std::cerr << "[CommandBuffer] ";
+auto commandBufferCerr() {
+    return mcvr::log::error("CommandBuffer");
 }
 
 vk::CommandPool::CommandPool(std::shared_ptr<PhysicalDevice> physicalDevice, std::shared_ptr<Device> device)
@@ -42,9 +46,10 @@ vk::CommandPool::CommandPool(std::shared_ptr<PhysicalDevice> physicalDevice,
     poolCreateInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolCreateInfo.queueFamilyIndex = queueIndex;
 
-    if (vkCreateCommandPool(device_->vkDevice(), &poolCreateInfo, nullptr, &commandPool_) != VK_SUCCESS) {
+    if (const auto result = vkCreateCommandPool(device_->vkDevice(), &poolCreateInfo, nullptr, &commandPool_);
+        result != VK_SUCCESS) {
         commandPoolCerr() << "failed to create command pool" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::raise(mcvr::failure::Kind::runtime, result, "vkCreateCommandPool");
     } else {
 #ifdef DEBUG
         commandPoolCout() << "created command pool" << std::endl;
@@ -72,9 +77,10 @@ vk::CommandBuffer::CommandBuffer(std::shared_ptr<Device> device, std::shared_ptr
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     allocInfo.commandBufferCount = 1;
 
-    if (vkAllocateCommandBuffers(device_->vkDevice(), &allocInfo, &commandBuffer_) != VK_SUCCESS) {
+    if (const auto result = vkAllocateCommandBuffers(device_->vkDevice(), &allocInfo, &commandBuffer_);
+        result != VK_SUCCESS) {
         commandBufferCerr() << "failed to allocate command buffer" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::raise(mcvr::failure::Kind::runtime, result, "vkAllocateCommandBuffers");
     } else {
 #ifdef DEBUG
         commandBufferCout() << "allocated command buffer" << std::endl;
@@ -91,7 +97,11 @@ std::shared_ptr<vk::CommandBuffer> vk::CommandBuffer::begin(VkCommandBufferUsage
     bufferBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bufferBeginInfo.flags = flags;
 
-    vkBeginCommandBuffer(commandBuffer_, &bufferBeginInfo);
+    checkedCommandOperation("vkBeginCommandBuffer",
+        [&] { return vkBeginCommandBuffer(commandBuffer_, &bufferBeginInfo); },
+        [&](VkResult result, const char *name) { device_->recordFailure(result, name); });
+    device_->nameObject(VK_OBJECT_TYPE_COMMAND_BUFFER, reinterpret_cast<uint64_t>(commandBuffer_), "MCVR command buffer");
+    device_->checkpoint(commandBuffer_, "command.begin");
     return shared_from_this();
 }
 
@@ -260,30 +270,37 @@ vk::CommandBuffer::raytracing(std::shared_ptr<SBT> sbt, uint32_t width, uint32_t
 }
 
 std::shared_ptr<vk::CommandBuffer> vk::CommandBuffer::end() {
-    vkEndCommandBuffer(commandBuffer_);
+    checkedCommandOperation("vkEndCommandBuffer",
+        [&] { return vkEndCommandBuffer(commandBuffer_); },
+        [&](VkResult result, const char *name) { device_->recordFailure(result, name); });
     return shared_from_this();
 }
 
 std::shared_ptr<vk::CommandBuffer> vk::CommandBuffer::reset(VkCommandBufferResetFlags flags) {
-    vkResetCommandBuffer(commandBuffer_, flags);
+    checkedCommandOperation("vkResetCommandBuffer",
+        [&] { return vkResetCommandBuffer(commandBuffer_, flags); },
+        [&](VkResult result, const char *name) { device_->recordFailure(result, name); });
     return shared_from_this();
 }
 
-void vk::CommandBuffer::submitMainQueueIndividual(std::shared_ptr<Device> device) {
-    submitMainQueueIndividual(device, nullptr);
+VkResult vk::CommandBuffer::submitMainQueueIndividual(std::shared_ptr<Device> device) {
+    return submitMainQueueIndividual(device, nullptr);
 }
 
-void vk::CommandBuffer::submitMainQueueIndividual(std::shared_ptr<vk::Device> device,
-                                                  std::shared_ptr<vk::Fence> fence) {
+VkResult vk::CommandBuffer::submitMainQueueIndividual(std::shared_ptr<vk::Device> device,
+                                                       std::shared_ptr<vk::Fence> fence) {
     VkSubmitInfo submitInfo = {};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &commandBuffer_;
 
-    vkQueueSubmit(device->mainVkQueue(), 1, &submitInfo, fence == nullptr ? VK_NULL_HANDLE : fence->vkFence());
+    const VkResult result =
+        vkQueueSubmit(device->mainVkQueue(), 1, &submitInfo, fence == nullptr ? VK_NULL_HANDLE : fence->vkFence());
+    if (result != VK_SUCCESS) { device->recordFailure(result, "vkQueueSubmit(CommandBuffer::individual)"); }
+    return result;
 }
 
-void vk::CommandBuffer::submitMainQueue(std::shared_ptr<Device> device, SubmitInfo submitInfo) {
+VkResult vk::CommandBuffer::submitMainQueue(std::shared_ptr<Device> device, SubmitInfo submitInfo) {
     std::vector<VkSemaphore> waitSemaphores;
     std::vector<VkPipelineStageFlags> waitStageMasks;
     for (auto [semaphore, mask] : submitInfo.waitSemaphoresAndStageMasks) {
@@ -303,5 +320,7 @@ void vk::CommandBuffer::submitMainQueue(std::shared_ptr<Device> device, SubmitIn
     vkSubmitInfo.signalSemaphoreCount = signalSemaphores.size();
     vkSubmitInfo.pSignalSemaphores = signalSemaphores.data();
 
-    vkQueueSubmit(device->mainVkQueue(), 1, &vkSubmitInfo, submitInfo.signalFence);
+    const VkResult result = vkQueueSubmit(device->mainVkQueue(), 1, &vkSubmitInfo, submitInfo.signalFence);
+    if (result != VK_SUCCESS) { device->recordFailure(result, "vkQueueSubmit(CommandBuffer)"); }
+    return result;
 }

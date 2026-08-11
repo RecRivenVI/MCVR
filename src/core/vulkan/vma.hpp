@@ -1,7 +1,7 @@
 #pragma once
 
-#include <functional>
 #include <deque>
+#include <functional>
 
 #include "core/all_extern.hpp"
 

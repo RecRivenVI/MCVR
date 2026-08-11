@@ -1,3 +1,7 @@
+#include "core/logging.hpp"
+#include "core/failure_state.hpp"
+#include "core/diagnostics/device_loss_trace.hpp"
+#include "core/render/scene_scope.hpp"
 #include "core/render/modules/world/ray_tracing/ray_tracing_module.hpp"
 
 #include "core/render/buffers.hpp"
@@ -200,7 +204,7 @@ RayTracingModule::RayTracingModule() {}
 void RayTracingModule::init(std::shared_ptr<Framework> framework, std::shared_ptr<WorldPipeline> worldPipeline) {
     WorldModule::init(framework, worldPipeline);
 
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     hdrNoisyOutputImages_.resize(size);
     diffuseAlbedoImages_.resize(size);
@@ -366,8 +370,7 @@ void RayTracingModule::loadShaderPack() {
     auto worldPipeline = worldPipeline_.lock();
     shaderPack_ = worldPipeline != nullptr ? worldPipeline->shaderPack() : nullptr;
     if (shaderPack_ == nullptr) {
-        std::cerr << "[Ray Tracing] Failed to get shared shader pack runtime." << std::endl;
-        exit(EXIT_FAILURE);
+        throw std::runtime_error("Ray tracing shader-pack runtime is unavailable");
     }
     hasSharcRuntime_ = shaderPack_->hasSharcRuntime();
 }
@@ -422,7 +425,7 @@ RayTracingModule::findExecutionVariableConfig(std::string_view name) {
 
 void RayTracingModule::initDescriptorTables() {
     auto framework = framework_.lock();
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
     VkShaderStageFlags runtimeTextureStageFlags =
         VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
         VK_SHADER_STAGE_ANY_HIT_BIT_KHR | VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_VERTEX_BIT |
@@ -508,6 +511,18 @@ void RayTracingModule::initDescriptorTables() {
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                 .descriptorCount = 1,
                 .stageFlags = runtimeTextureStageFlags,
+            })
+            .defineDescriptorLayoutSetBinding({
+                .binding = 10,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR,
+            })
+            .defineDescriptorLayoutSetBinding({
+                .binding = 11,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR,
             });
         set1Bindings.endDescriptorLayoutSetBinding();
         set1.endDescriptorLayoutSet();
@@ -656,7 +671,7 @@ void RayTracingModule::refreshRuntimeBuffers(uint32_t frameIndex) {
 
 void RayTracingModule::loadRuntimeResources() {
     auto framework = framework_.lock();
-    for (uint32_t frameIndex = 0; frameIndex < framework->swapchain()->imageCount(); frameIndex++) {
+    for (uint32_t frameIndex = 0; frameIndex < framework->recordingContextCount(); frameIndex++) {
         shaderPack_->bindRuntimeResources(rayTracingDescriptorTables_[frameIndex], 5, frameIndex);
     }
 }
@@ -742,7 +757,7 @@ void RayTracingModule::initSharc() {
     auto framework = framework_.lock();
     auto device = framework->device();
     auto vma = framework->vma();
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     sharcConfigBuffers_.resize(size);
 
@@ -761,16 +776,7 @@ void RayTracingModule::initSharc() {
         vk::DeviceLocalBuffer::create(vma, device, false, static_cast<size_t>(sharcCapacity) * sizeof(uint32_t) * 4,
                                       sharcStorageUsage, 0, VMA_MEMORY_USAGE_GPU_ONLY);
 
-    auto clearCommandPool = vk::CommandPool::create(framework->physicalDevice(), device);
-    auto clearCommandBuffer = vk::CommandBuffer::create(device, clearCommandPool);
-    clearCommandBuffer->begin(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
-    vkCmdFillBuffer(clearCommandBuffer->vkCommandBuffer(), sharcHashEntriesBuffer_->vkBuffer(), 0, VK_WHOLE_SIZE, 0);
-    vkCmdFillBuffer(clearCommandBuffer->vkCommandBuffer(), sharcLockBuffer_->vkBuffer(), 0, VK_WHOLE_SIZE, 0);
-    vkCmdFillBuffer(clearCommandBuffer->vkCommandBuffer(), sharcAccumulationBuffer_->vkBuffer(), 0, VK_WHOLE_SIZE, 0);
-    vkCmdFillBuffer(clearCommandBuffer->vkCommandBuffer(), sharcResolvedBuffer_->vkBuffer(), 0, VK_WHOLE_SIZE, 0);
-    clearCommandBuffer->end();
-    clearCommandBuffer->submitMainQueueIndividual(device);
-    vkQueueWaitIdle(device->mainVkQueue());
+    if (clearSharcStorage() != VK_SUCCESS) { return; }
 
     for (uint32_t i = 0; i < size; i++) {
         sharcConfigBuffers_[i] =
@@ -781,6 +787,33 @@ void RayTracingModule::initSharc() {
         rayTracingDescriptorTables_[i]->bindBuffer(sharcResolvedBuffer_, 4, 3);
         rayTracingDescriptorTables_[i]->bindBuffer(sharcLockBuffer_, 4, 4);
     }
+}
+
+VkResult RayTracingModule::clearSharcStorage() {
+    if (!hasSharcRuntime_ || sharcHashEntriesBuffer_ == nullptr || sharcLockBuffer_ == nullptr ||
+        sharcAccumulationBuffer_ == nullptr || sharcResolvedBuffer_ == nullptr) {
+        return VK_SUCCESS;
+    }
+
+    auto framework = framework_.lock();
+    auto device = framework->device();
+    auto clearCommandPool = vk::CommandPool::create(framework->physicalDevice(), device);
+    auto clearCommandBuffer = vk::CommandBuffer::create(device, clearCommandPool);
+    clearCommandBuffer->begin(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+    vkCmdFillBuffer(clearCommandBuffer->vkCommandBuffer(), sharcHashEntriesBuffer_->vkBuffer(), 0, VK_WHOLE_SIZE, 0);
+    vkCmdFillBuffer(clearCommandBuffer->vkCommandBuffer(), sharcLockBuffer_->vkBuffer(), 0, VK_WHOLE_SIZE, 0);
+    vkCmdFillBuffer(clearCommandBuffer->vkCommandBuffer(), sharcAccumulationBuffer_->vkBuffer(), 0, VK_WHOLE_SIZE, 0);
+    vkCmdFillBuffer(clearCommandBuffer->vkCommandBuffer(), sharcResolvedBuffer_->vkBuffer(), 0, VK_WHOLE_SIZE, 0);
+    clearCommandBuffer->end();
+    VkResult result = clearCommandBuffer->submitMainQueueIndividual(device);
+    if (result != VK_SUCCESS) { return framework->recordFailure(result, "vkQueueSubmit(SHARC clear)"); }
+    return framework->waitRenderQueueIdle();
+}
+
+void RayTracingModule::onResourceReload() {
+    if (clearSharcStorage() != VK_SUCCESS) { return; }
+    sharcFrameIndex_ = 0;
+    isFirstSharcFrame_ = true;
 }
 
 void RayTracingModule::updateSharcConfig(uint32_t frameIndex) {
@@ -980,6 +1013,10 @@ RayTracingModule::collectRayTracingPassShaderRequests(
     pass.hitShaderGroups.resize(pass.config.hitGroups.size());
     for (size_t groupIndex = 0; groupIndex < pass.config.hitGroups.size(); groupIndex++) {
         const auto &groupConfig = pass.config.hitGroups[groupIndex];
+        auto groupDefinitions = definitions;
+        for (const auto &[key, value] : groupConfig.definitions) {
+            groupDefinitions[key] = value;
+        }
         HitShaderGroup group;
         group.name = groupConfig.name;
         group.type = groupConfig.type;
@@ -987,7 +1024,7 @@ RayTracingModule::collectRayTracingPassShaderRequests(
             requests.push_back({
                 .path = *groupConfig.closestHit,
                 .stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR,
-                .definitions = definitions,
+                .definitions = groupDefinitions,
                 .executionStage = ShaderPackLoader::Stage::RayTracing,
                 .executionSet = executionSet,
             });
@@ -997,7 +1034,7 @@ RayTracingModule::collectRayTracingPassShaderRequests(
             requests.push_back({
                 .path = *groupConfig.anyHit,
                 .stage = VK_SHADER_STAGE_ANY_HIT_BIT_KHR,
-                .definitions = definitions,
+                .definitions = groupDefinitions,
                 .executionStage = ShaderPackLoader::Stage::RayTracing,
                 .executionSet = executionSet,
             });
@@ -1007,7 +1044,7 @@ RayTracingModule::collectRayTracingPassShaderRequests(
             requests.push_back({
                 .path = *groupConfig.intersection,
                 .stage = VK_SHADER_STAGE_INTERSECTION_BIT_KHR,
-                .definitions = definitions,
+                .definitions = groupDefinitions,
                 .executionStage = ShaderPackLoader::Stage::RayTracing,
                 .executionSet = executionSet,
             });
@@ -1083,7 +1120,9 @@ void RayTracingModule::buildRayTracingPassPipelines(
     const std::vector<std::shared_ptr<vk::Shader>> &compiledShaders,
     size_t &shaderOffset) {
     auto framework = framework_.lock();
-    uint32_t frameCount = framework->swapchain()->imageCount();
+    // This method runs on compiler workers without the recording thread's scene scope.
+    // The owning module's descriptor slots are the authoritative, immutable view/frame layout.
+    const uint32_t frameCount = static_cast<uint32_t>(rayTracingDescriptorTables_.size());
 
     pass.rayGenUpdateShader = nullptr;
     pass.rayGenQueryShader = nullptr;
@@ -1289,8 +1328,12 @@ void RayTracingModule::uploadStaticRayTracingPassSbts(std::shared_ptr<vk::Device
             }
         }, passVariant);
     }
-    commandBuffer->end()->submitMainQueueIndividual(device);
-    vkQueueWaitIdle(device->mainVkQueue());
+    const VkResult result = commandBuffer->end()->submitMainQueueIndividual(device);
+    if (result != VK_SUCCESS) {
+        framework->recordFailure(result, "vkQueueSubmit(SBT upload)");
+        return;
+    }
+    if (framework->waitRenderQueueIdle() != VK_SUCCESS) { return; }
 }
 
 void RayTracingModule::renderFullScreenPass(
@@ -1352,7 +1395,7 @@ void RayTracingModule::renderRayTracingPass(
 
     context.worldPrepareContext->setupHitGroupSbt(
         pass.hitGroupNameToIndex, pass.fallbackHitGroupIndex, pass.shadowHitGroupIndex, worldCommandBuffer,
-        nullptr, pass.querySbts[frameIndex]);
+        nullptr, pass.querySbts.at(frameIndex));
 
     std::vector<vk::CommandBuffer::BufferMemoryBarrier> bufferBarriers;
     std::vector<vk::CommandBuffer::ImageMemoryBarrier> imageBarriers;
@@ -1388,7 +1431,7 @@ void RayTracingModule::renderRayTracingPass(
 
     worldCommandBuffer->bindDescriptorTable(context.rayTracingDescriptorTable, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR)
         ->bindRTPipeline(pass.queryPipeline)
-        ->raytracing(pass.querySbts[frameIndex], traceWidth, traceHeight, traceDepth);
+        ->raytracing(pass.querySbts.at(frameIndex), traceWidth, traceHeight, traceDepth);
 }
 
 void RayTracingModule::renderSharcUpdateAndResolve(
@@ -1408,7 +1451,7 @@ void RayTracingModule::renderSharcUpdateAndResolve(
 
     context.worldPrepareContext->setupHitGroupSbt(
         pass.hitGroupNameToIndex, pass.fallbackHitGroupIndex, pass.shadowHitGroupIndex, worldCommandBuffer,
-        pass.updateSbts[frameIndex], nullptr);
+        pass.updateSbts.at(frameIndex), nullptr);
 
     updateSharcConfig(frameIndex);
     context.rayTracingDescriptorTable->bindBuffer(sharcConfigBuffers_[frameIndex], 4, 0);
@@ -1440,7 +1483,7 @@ void RayTracingModule::renderSharcUpdateAndResolve(
 
     worldCommandBuffer->bindDescriptorTable(context.rayTracingDescriptorTable, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR)
         ->bindRTPipeline(pass.updatePipeline)
-        ->raytracing(pass.updateSbts[frameIndex], updateWidth, updateHeight, 1);
+        ->raytracing(pass.updateSbts.at(frameIndex), updateWidth, updateHeight, 1);
 
     worldCommandBuffer->barriersMemory({{
         .srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
@@ -1500,16 +1543,20 @@ void RayTracingModule::initPipelines() {
     auto tPhase = clock::now();
     auto printPhase = [&tPhase](const char *label) {
         auto now = clock::now();
-        std::cerr << "[RayTracing initPipelines] " << label << ": " << ms(now - tPhase).count() << " ms" << std::endl;
+        mcvr::log::debug("RayTracingModule") << "Initialize pipelines " << label << ": " << ms(now - tPhase).count() << " ms" << std::endl;
         tPhase = now;
     };
 #endif
 
     auto framework = framework_.lock();
     auto device = framework->device();
-    uint32_t frameCount = framework->swapchain()->imageCount();
+    uint32_t frameCount = framework->recordingContextCount();
     const auto &shaderPack = shaderPack_->shaderPack();
     size_t executionBufferSize = shaderPack.rayTracingExecution.variables.size() * sizeof(float);
+    // All passes bind one stable address. Inline updates carry each pass value in
+    // queue order; changing the shared descriptor would retarget earlier draws.
+    const auto stageExecutionBuffer =
+        ShaderPack::createPassExecutionBuffer(device, framework->vma(), executionBufferSize);
 
     passes_.clear();
     passNameToPass_.clear();
@@ -1541,8 +1588,7 @@ void RayTracingModule::initPipelines() {
 
                 auto pass = std::make_shared<FullScreenPass>();
                 pass->config = passConfig.fullScreen;
-                pass->executionBuffer =
-                    ShaderPack::createPassExecutionBuffer(device, framework->vma(), executionBufferSize);
+                pass->executionBuffer = stageExecutionBuffer;
                 initFullScreenPassTargets(*pass, device, frameCount);
 
                 passes_.push_back(pass);
@@ -1557,8 +1603,7 @@ void RayTracingModule::initPipelines() {
                 pass->config = passConfig.rayTracing;
                 pass->querySharcEnabled = hasSharcRuntime_ && passConfig.rayTracing.querySharc;
                 pass->isSharcUpdatePass = false;
-                pass->executionBuffer =
-                    ShaderPack::createPassExecutionBuffer(device, framework->vma(), executionBufferSize);
+                pass->executionBuffer = stageExecutionBuffer;
 
                 passes_.push_back(pass);
                 passNameToPass_.emplace(pass->config.name, pass);
@@ -1567,8 +1612,7 @@ void RayTracingModule::initPipelines() {
             case ShaderPackLoader::PassConfig::Type::Compute: {
                 auto pass = std::make_shared<ComputePass>();
                 pass->config = passConfig.compute;
-                pass->executionBuffer =
-                    ShaderPack::createPassExecutionBuffer(device, framework->vma(), executionBufferSize);
+                pass->executionBuffer = stageExecutionBuffer;
 
                 passes_.push_back(pass);
                 passNameToPass_.emplace(pass->config.name, pass);
@@ -1583,7 +1627,7 @@ void RayTracingModule::initPipelines() {
             case ShaderPackLoader::PassConfig::Type::Compute:    dbgName = passConfig.compute.name;    break;
             default: continue;
         }
-        std::cerr << "[RayTracing initPipelines]   create pass '" << dbgName << "': "
+        mcvr::log::debug("RayTracingModule") << "Create pass '" << dbgName << "': "
                   << ms(clock::now() - tPass).count() << " ms" << std::endl;
 #endif
     }
@@ -1683,11 +1727,11 @@ void RayTracingModule::initPipelines() {
 
     auto tSbtUpload = clock::now();
     uploadStaticRayTracingPassSbts(device);
-    std::cerr << "[RayTracing initPipelines] upload static sbts: "
+    mcvr::log::debug("RayTracingModule") << "Upload static SBTs: "
               << ms(clock::now() - tSbtUpload).count() << " ms" << std::endl;
 
     for (size_t i = 0; i < passes_.size(); ++i) {
-        std::cerr << "[RayTracing initPipelines]   build pass '" << passNames[i] << "': "
+        mcvr::log::debug("RayTracingModule") << "Build pass '" << passNames[i] << "': "
                   << passBuildTimes[i] << " ms" << std::endl;
     }
     printPhase("build all passes");
@@ -1704,7 +1748,7 @@ void RayTracingModule::initSBTs() {}
 void RayTracingModule::initContexts() {
     auto framework = framework_.lock();
     auto worldPipeline = worldPipeline_.lock();
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
     contexts_.resize(size);
 
     for (uint32_t i = 0; i < size; i++) {
@@ -1722,11 +1766,11 @@ void RayTracingModule::build() {
     auto t0 = clock::now();
     auto printStep = [&t0](const char *label) {
         auto now = clock::now();
-        std::cerr << "[RayTracing build] " << label << ": " << ms(now - t0).count() << " ms" << std::endl;
+        mcvr::log::debug("RayTracingModule") << "Build " << label << ": " << ms(now - t0).count() << " ms" << std::endl;
         t0 = now;
     };
 
-    std::cerr << "[RayTracing build] ====== start ======" << std::endl;
+    mcvr::log::debug("RayTracingModule") << "Build started" << std::endl;
 #endif
 
     auto framework = framework_.lock();
@@ -1783,7 +1827,7 @@ void RayTracingModule::build() {
 #ifdef DEBUG
     printStep("initContexts");
 
-    std::cerr << "[RayTracing build] ====== done ======" << std::endl;
+    mcvr::log::debug("RayTracingModule") << "Build completed" << std::endl;
 #endif
 }
 
@@ -1794,15 +1838,25 @@ std::vector<std::shared_ptr<WorldModuleContext>> &RayTracingModule::contexts() {
 void RayTracingModule::bindTexture(std::shared_ptr<vk::Sampler> sampler,
                                    std::shared_ptr<vk::DeviceLocalImage> image,
                                    int index) {
-    auto framework = framework_.lock();
+    textureBindings_.bind(index, {std::move(sampler), std::move(image)});
+}
 
-    uint32_t size = framework->swapchain()->imageCount();
-    for (uint32_t i = 0; i < size; i++) {
-        if (rayTracingDescriptorTables_[i] != nullptr) {
-            rayTracingDescriptorTables_[i]->bindSamplerImage(sampler, image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                                             0, 0, index);
-        }
-    }
+std::shared_ptr<vk::DescriptorTable> RayTracingModule::textureSnapshot() {
+    return textureBindings_.acquire([&](const auto &bindings) {
+        vk::DescriptorTableBuilder builder;
+        builder.beginDescriptorLayoutSet().beginDescriptorLayoutSetBinding()
+            .defineDescriptorLayoutSetBinding({0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096,
+                VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
+                VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
+                VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_VERTEX_BIT |
+                VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT})
+            .endDescriptorLayoutSetBinding().endDescriptorLayoutSet();
+        auto table = builder.build(framework_.lock()->device());
+        for (const auto &[slot, binding] : bindings)
+            table->bindSamplerImage(binding.first, binding.second, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                    0, 0, slot);
+        return table;
+    });
 }
 
 void RayTracingModule::preClose() {
@@ -1852,13 +1906,16 @@ void RayTracingModuleContext::render() {
 
     auto buffers = Renderer::instance().buffers();
     auto chunks = Renderer::instance().world()->chunks();
+    auto textureSnapshot = module->textureSnapshot();
+    rayTracingDescriptorTable->useExternalSet(0, textureSnapshot, 0);
+    framework->frameResourceRetainer().retain(textureSnapshot);
     module->refreshRuntimeBuffers(context->frameIndex);
 
     rayTracingDescriptorTable->bindBuffer(buffers->worldUniformBuffer(), 2, 0);
     rayTracingDescriptorTable->bindBuffer(buffers->lastWorldUniformBuffer(), 2, 1);
     rayTracingDescriptorTable->bindBuffer(buffers->skyUniformBuffer(), 2, 2);
 
-    worldPrepareContext->render();
+    mcvr::failure::runCheckedStage([&] { worldPrepareContext->render(); });
     if (Renderer::options.collectChunkEmission && chunks != nullptr && chunks->chunkPackedData() != nullptr) {
         rayTracingDescriptorTable->bindBuffer(chunks->chunkPackedData(), 1, 9);
     }
@@ -1872,6 +1929,7 @@ void RayTracingModuleContext::render() {
         rayTracingDescriptorTable->bindBuffer(worldPrepareContext->lastPositionBufferAddr, 1, 6);
         rayTracingDescriptorTable->bindBuffer(buffers->textureMappingBuffer(), 1, 7);
         rayTracingDescriptorTable->bindBuffer(worldPrepareContext->lastObjToWorldMat, 1, 8);
+        rayTracingDescriptorTable->bindBuffer(worldPrepareContext->instanceAppearanceBuffer, 1, 10);
     }
 
     RayTracingModule::ExecutionVariables variables;
@@ -1900,8 +1958,14 @@ void RayTracingModuleContext::render() {
     }
 
     auto executePass = [&](const std::string &passName, ShaderPack::ExecutionVariables &passVariables) {
+        mcvr::failure::throwIfFatal();
         auto passIter = module->passNameToPass_.find(passName);
         if (passIter == module->passNameToPass_.end()) { throw std::runtime_error("unknown pass: " + passName); }
+        framework->device()->checkpoint(context->worldCommandBuffer->vkCommandBuffer(), passName);
+
+        if (mcvr::diagnostics::device_loss::enabled())
+            mcvr::diagnostics::device_loss::note("rt-pass-record", VK_SUCCESS,
+                mcvr::diagnostics::device_loss::passFingerprint(passName), context->frameIndex);
 
         std::visit([&](auto &pass) {
             using T = std::decay_t<decltype(pass)>;

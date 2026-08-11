@@ -52,6 +52,8 @@ class FSRUpscalerModule : public WorldModule, public SharedObject<FSRUpscalerMod
     void
     bindTexture(std::shared_ptr<vk::Sampler> sampler, std::shared_ptr<vk::DeviceLocalImage> image, int index) override;
 
+    void onResourceReload() override;
+
     void preClose() override;
 
     static void getRenderResolution(uint32_t displayWidth, uint32_t displayHeight,
@@ -78,8 +80,17 @@ class FSRUpscalerModule : public WorldModule, public SharedObject<FSRUpscalerMod
     bool fsr3Enabled_ = true;
 
     // FSR3 implementation
-    std::shared_ptr<mcvr::FSR3Upscaler> fsr3_;
-    bool initialized_ = false;
+
+
+
+    struct ViewHistory {
+        std::shared_ptr<mcvr::FSR3Upscaler> fsr3_;
+        bool initialized_ = false;
+        glm::vec3 lastCameraPos_ = glm::vec3(0.0f);
+        glm::vec3 lastCameraDir_ = glm::vec3(0.0f, 0.0f, -1.0f);
+        bool firstFrame_ = true;
+    };
+    std::vector<ViewHistory> histories_;
 
     // Depth conversion resources
     std::vector<std::shared_ptr<vk::DeviceLocalImage>> deviceDepthImages_;
@@ -91,9 +102,9 @@ class FSRUpscalerModule : public WorldModule, public SharedObject<FSRUpscalerMod
     std::shared_ptr<vk::ComputePipeline> normalRoughnessUpscalePipeline_;
 
     // Camera state for reset detection
-    glm::vec3 lastCameraPos_ = glm::vec3(0.0f);
-    glm::vec3 lastCameraDir_ = glm::vec3(0.0f, 0.0f, -1.0f);
-    bool firstFrame_ = true;
+
+
+
 
     // Temporal storage for images during setOrCreate
     std::vector<std::array<std::shared_ptr<vk::DeviceLocalImage>, 5>> inputImages_;

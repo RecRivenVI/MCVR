@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -104,6 +105,7 @@ class ShaderPackLoader {
         std::optional<fs::path> closestHit;
         std::optional<fs::path> intersection;
         VkRayTracingShaderGroupTypeKHR type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+        std::unordered_map<std::string, std::string> definitions;
     };
 
     struct MissShaderConfig {
@@ -457,8 +459,6 @@ struct RenderPass {
         Weather,
         Particle,
         Text,
-        NameTag,
-        Star,
     };
 
     struct ShaderVariant {
@@ -469,7 +469,9 @@ struct RenderPass {
 
     ShaderPackLoader::RenderPassConfig config;
     Target target = Target::Particle;
+    std::string colorTarget;
     bool writesFirstHitDepth = false;
+    bool usesDepthAttachment = true;
     std::shared_ptr<vk::RenderPass> renderPass;
     std::vector<std::shared_ptr<vk::Framebuffer>> framebuffers;
     std::shared_ptr<vk::Shader> vertexShader;
@@ -602,6 +604,7 @@ class ShaderPack {
     uint32_t executionSet(uint32_t runtimeResourceSet) const;
     bool hasRuntimeResources() const;
     void preClose();
+    void restartRuntime();
 
     std::shared_ptr<vk::Shader> createShader(std::shared_ptr<vk::Device> device,
                                              const std::filesystem::path &path,
@@ -681,6 +684,10 @@ class ShaderPack {
     void initRuntimeTextures();
     void initRuntimeBuffers();
     void loadRuntimeResources();
+    std::string shaderObjectCacheKey(
+        const std::shared_ptr<vk::Device> &device,
+        const ShaderCreateInfo &request,
+        const std::string &executionSource) const;
 
   private:
     std::weak_ptr<Framework> framework_;
@@ -697,8 +704,16 @@ class ShaderPack {
     std::unordered_map<std::string, size_t> runtimeBufferIndices_;
     std::vector<ExpressionEvaluator::Variable> runtimeResourceExpressionVariables_;
 
-    uint32_t referenceWidth_ = 0;
-    uint32_t referenceHeight_ = 0;
+      uint32_t referenceWidth_ = 0;
+      uint32_t referenceHeight_ = 0;
+      uint32_t runtimeViewCount_ = 1;
+      uint32_t runtimeFramesPerView_ = 1;
+      uint32_t textureSlot(bool shared, uint32_t frameIndex) const {
+          return shared ? frameIndex / runtimeFramesPerView_ : frameIndex;
+      }
     bool runtimeResourcesReady_ = false;
     bool hasSharcRuntime_ = false;
+
+    mutable std::mutex shaderObjectCacheMutex_;
+    mutable std::unordered_map<std::string, std::shared_ptr<vk::Shader>> shaderObjectCache_;
 };

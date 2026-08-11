@@ -59,6 +59,7 @@
 
 #include "common/shared.hpp"
 #include "util/disney.glsl"
+#include "util/camera_ray.glsl"
 #include "util/labpbr.glsl"
 #include "util/random.glsl"
 #include "util/ray_cone.glsl"
@@ -182,6 +183,29 @@ void applyFog(vec3 radiance,
     foggedRadiance = radiance * transmittance + additiveRadiance;
 }
 
+void applyVanillaFog(vec3 radiance,
+                     float t,
+                     float fogStart,
+                     float fogEnd,
+                     vec4 fogColor,
+                     out vec3 foggedRadiance,
+                     out float transmittance,
+                     out vec3 additiveRadiance) {
+    float fogAmount = t <= fogStart ? 0.0
+        : (t >= fogEnd ? 1.0 : smoothstep(fogStart, fogEnd, t));
+    fogAmount = clamp(fogAmount * fogColor.a, 0.0, 1.0);
+    transmittance = 1.0 - fogAmount;
+    additiveRadiance = fogColor.rgb * fogAmount;
+    foggedRadiance = radiance * transmittance + additiveRadiance;
+}
+
+float vanillaFogDistance(float rayDistance, vec3 rayDirection) {
+    if (worldUBO.fogType == 0) {
+        return rayDistance;
+    }
+    return rayDistance * max(length(rayDirection.xz), abs(rayDirection.y));
+}
+
 bool finiteFloat(float value) {
     return !isnan(value) && !isinf(value);
 }
@@ -231,10 +255,10 @@ vec3 sampleVolumetricDirectionalLight(vec3 position, vec3 lightDir, bool insideB
     shadowRay.insideBoat = insideBoat ? 1u : 0u;
     shadowRay.pad0 = 0u;
 
-    uint shadowMask = WORLD_MASK | PLAYER_MASK;
+    uint shadowMask = WORLD_MASK | PLAYER_MASK | PRIORITY_MASK | PARTICLE_MASK;
     if (VPT_CLOUD_MODE == 1u) { shadowMask |= CLOUD_MASK; }
     vec3 origin = position + lightDir * 0.02;
-    traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, shadowMask, 0, 0, 0, origin, 0.001, lightDir, 1000.0, 1);
+    traceRayEXT(topLevelAS, gl_RayFlagsCullBackFacingTrianglesEXT, shadowMask, 0, 0, 0, origin, 0.001, lightDir, 1000.0, 1);
     vec3 radiance = applySampledLightChroma(shadowRay.radiance, lightDir) * (1.0 - skyUBO.rainGradient);
     vec3 absolutePosition = position + vec3(worldUBO.cameraPos.xyz);
     float cloudVisibility =
@@ -392,13 +416,19 @@ struct FirstHitPayload {
     vec3 worldPos;
 };
 
-void initMainRay(vec3 origin, vec3 direction, uint seed, float coneSpread, out MainRay ray) {
+void initMainRay(vec3 origin, vec3 direction, uint seed, float coneSpread, vec2 samplingResolution, out MainRay ray) {
     ray.origin = origin;
     ray.hitT = 0.0;
     ray.direction = direction;
     ray.seed = xxhash32(uvec3(gl_LaunchIDEXT.x, gl_LaunchIDEXT.y, seed));
     ray.radiance = vec3(0.0);
     ray.coneWidth = 0.0;
+    if (abs(worldUBO.cameraProjMat[3][3]) > 0.5) {
+        // SHARC dispatch is downsampled; the ray still samples the full input image.
+        ray.coneWidth = max(1.0 / (abs(worldUBO.cameraProjMat[0][0]) * samplingResolution.x),
+                            1.0 / (abs(worldUBO.cameraProjMat[1][1]) * samplingResolution.y));
+        coneSpread = 0.0;
+    }
     ray.throughput = vec3(1.0);
     ray.coneSpread = coneSpread;
     ray.stateBits = 0u;
@@ -433,22 +463,19 @@ void resetMainRay(inout MainRay ray, int bounce) {
 
 void preparePrimary(int step, int isHand, out float len, out uint mask, out uint missId) {
     if (isHand == 0) {
+        uint cameraEntityMask = worldUBO.isFirstPerson > 0 ? 0u : PLAYER_MASK;
         missId = step == 0 ? VPT_WORLD_MISS_INDEX : VPT_WORLD_NO_VOLUMETRIC_MISS_INDEX;
         if (step == 0) {
             len = 1000.0;
-            if (worldUBO.isFirstPerson > 0) {
-                mask = WORLD_MASK | FISHING_BOBBER_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK | BOAT_WATER_MASK;
-            } else {
-                mask = WORLD_MASK | PLAYER_MASK | FISHING_BOBBER_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK |
-                       BOAT_WATER_MASK;
-            }
+            mask = WORLD_MASK | cameraEntityMask | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK |
+                   BOAT_WATER_MASK;
         } else if (step <= 1) {
             len = 1000.0;
-            mask = WORLD_MASK | PLAYER_MASK | FISHING_BOBBER_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK |
+            mask = WORLD_MASK | cameraEntityMask | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK |
                    BOAT_WATER_MASK;
         } else {
             len = 384.0;
-            mask = WORLD_MASK | PLAYER_MASK | FISHING_BOBBER_MASK | BOAT_WATER_MASK;
+            mask = WORLD_MASK | cameraEntityMask | PARTICLE_MASK | BOAT_WATER_MASK;
         }
     } else {
         if (step == 0) {
@@ -457,34 +484,39 @@ void preparePrimary(int step, int isHand, out float len, out uint mask, out uint
             missId = VPT_HAND_MISS_INDEX;
         } else if (step <= 1) {
             len = 384.0;
-            mask = WORLD_MASK | FISHING_BOBBER_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK | BOAT_WATER_MASK;
+            mask = WORLD_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK | BOAT_WATER_MASK;
             missId = step == 1 ? VPT_WORLD_MISS_INDEX : VPT_WORLD_NO_VOLUMETRIC_MISS_INDEX;
         } else {
             len = 384.0;
-            mask = WORLD_MASK | FISHING_BOBBER_MASK | BOAT_WATER_MASK;
+            mask = WORLD_MASK | PARTICLE_MASK | BOAT_WATER_MASK;
             missId = VPT_WORLD_NO_VOLUMETRIC_MISS_INDEX;
         }
     }
 }
 
-void prepareSecondary(int bounce, int isHand, out float len, out uint mask) {
+void prepareSecondary(int bounce, bool hideFirstPersonPlayer, int isHand, out float len, out uint mask) {
     if (bounce == 0) {
         len = 1000.0;
         if (worldUBO.isFirstPerson > 0) {
-            mask = WORLD_MASK | FISHING_BOBBER_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK;
+            mask = WORLD_MASK | PRIORITY_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK;
         } else {
-            mask = WORLD_MASK | PLAYER_MASK | FISHING_BOBBER_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK;
+            mask = WORLD_MASK | PLAYER_MASK | PRIORITY_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK;
         }
     } else if (bounce <= 1) {
         len = 1000.0;
         if (isHand == 0) {
-            mask = WORLD_MASK | PLAYER_MASK | FISHING_BOBBER_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK;
+            mask = WORLD_MASK | PLAYER_MASK | PRIORITY_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK;
         } else {
-            mask = WORLD_MASK | FISHING_BOBBER_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK;
+            mask = WORLD_MASK | PRIORITY_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK;
         }
     } else {
         len = 384.0;
-        mask = WORLD_MASK | PLAYER_MASK | FISHING_BOBBER_MASK;
+        mask = WORLD_MASK | PLAYER_MASK | PRIORITY_MASK | PARTICLE_MASK;
+    }
+    // Only an unbroken transmission chain from the camera inherits primary first-person
+    // visibility. Once a path reflects or becomes indirect, the caller never enables this again.
+    if (worldUBO.isFirstPerson > 0 && hideFirstPersonPlayer) {
+        mask &= ~PLAYER_MASK;
     }
 }
 
@@ -517,7 +549,9 @@ void tracePrimary(vec3 eyePos,
         vec3 tracedOrigin = rayState.origin;
         vec3 tracedDirection = rayState.direction;
         mainRay = rayState;
+        mainRay.stateBits = uiPrimaryTraceState(mainRay.stateBits, uint(step));
         traceRayEXT(topLevelAS, rayFlags, mask, 1, 1, missId, mainRay.origin, 0.0001, mainRay.direction, len, 0);
+        mainRay.stateBits &= ~rayUiPrimaryBit;
         rayState = mainRay;
 
         if (!surfaceDepthSampled) {
@@ -601,6 +635,7 @@ bool initTransparent(MainRay rayState,
 void traceSecondary(inout MainRay rayState,
                    int startBounce,
                    int isHand,
+                   bool directCameraTransmissionPath,
 #if SHARC_QUERY && USE_SHARC
                    SharcParameters sharcParameters,
                    inout int sharcDebugBounceCount,
@@ -617,9 +652,11 @@ void traceSecondary(inout MainRay rayState,
 
         uint mask;
         float len;
-        uint firstBounceLobeType = b == startBounce ? rayLobeType(rayState) : 0u;
+        uint generatingLobe = rayLobeType(rayState);
+        directCameraTransmissionPath = directCameraTransmissionPath && generatingLobe == 2u;
+        uint firstBounceLobeType = b == startBounce ? generatingLobe : 0u;
         resetMainRay(rayState, b);
-        prepareSecondary(b, isHand, len, mask);
+        prepareSecondary(b, directCameraTransmissionPath, isHand, len, mask);
 
         vec3 tracedOrigin = rayState.origin;
         vec3 tracedDirection = rayState.direction;
@@ -677,6 +714,7 @@ void traceSecondary(inout MainRay rayState,
 void traceTransparent(inout MainRay transparentRay,
                       int startBounce,
                       int isHand,
+                      bool directCameraTransmissionPath,
 #if USE_SHARC && SHARC_QUERY
                       SharcParameters sharcParameters,
                       inout int sharcDebugBounceCount,
@@ -684,7 +722,7 @@ void traceTransparent(inout MainRay transparentRay,
 #endif
                       out bool hasTransparentSecondHit,
                       out float transparentSecondHitDistance) {
-    traceSecondary(transparentRay, startBounce, isHand,
+    traceSecondary(transparentRay, startBounce, isHand, directCameraTransmissionPath,
 #if USE_SHARC && SHARC_QUERY
                   sharcParameters, sharcDebugBounceCount, sharcDebugCacheHit,
 #endif
@@ -698,7 +736,7 @@ void traceSharcUpdate(
     SharcState sharcState;
     SharcInit(sharcState);
 
-    initMainRay(origin, direction, worldUBO.seed ^ sharcConfig.frameIndex, coneSpreadFromFov(fovY, fovX, resolution),
+    initMainRay(origin, direction, worldUBO.seed ^ sharcConfig.frameIndex, coneSpreadFromFov(fovY, fovX, resolution), resolution,
                     mainRay);
 
     for (int b = 0; b < VPT_NUM_RAY_BOUNCES; ++b) {
@@ -706,12 +744,13 @@ void traceSharcUpdate(
         mainRay.throughput = vec3(1.0);
         mainRay.radiance = vec3(0.0);
 
-        uint mask = WORLD_MASK | PLAYER_MASK | FISHING_BOBBER_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK;
+        uint mask = WORLD_MASK | PLAYER_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK;
         if (b > 1) {
-            mask = WORLD_MASK | PLAYER_MASK | FISHING_BOBBER_MASK | CLOUD_MASK;
+            mask = WORLD_MASK | PLAYER_MASK | PARTICLE_MASK | CLOUD_MASK;
         } else if (b == 0 && worldUBO.isFirstPerson > 0) {
-            mask = WORLD_MASK | FISHING_BOBBER_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK;
+            mask = WORLD_MASK | WEATHER_MASK | PARTICLE_MASK | CLOUD_MASK;
         }
+        if (b > 0) { mask |= PRIORITY_MASK; }
         float len = (b <= 1) ? 1000.0 : 384.0;
 
         vec3 tracedOrigin = mainRay.origin;
@@ -766,16 +805,10 @@ void main() {
     float fovY = fovYFromProj(worldUBO.cameraProjMat);
     float fovX = fovXFromProj(worldUBO.cameraProjMat);
 
-    vec2 ndc = pixelCenter / resolution * 2.0 - 1.0;
-
-    vec4 nearPoint = vec4(ndc, 0.0, 1.0);
-
-    vec4 viewNear = worldUBO.cameraProjMatInv * nearPoint;
-    viewNear /= viewNear.w;
-
-    vec3 origin = vec3(worldUBO.cameraEffectedViewMatInv * vec4(0, 0, 0, 1));
+    vec3 origin;
+    vec3 direction;
+    buildWorldCameraRay(worldUBO, pixelCenter, resolution, origin, direction);
     const vec3 eyePos = origin;
-    vec3 direction = normalize(vec3(worldUBO.cameraEffectedViewMatInv * vec4(viewNear.xyz, 0.0)));
     const vec3 orgDirection = direction;
 
     const uint rayFlags = VPT_RAY_FLAGS;
@@ -818,12 +851,12 @@ void main() {
 #    endif
 
     MainRay worldRay;
-    initMainRay(origin, direction, worldUBO.seed, coneSpreadFromFov(fovY, fovX, resolution), worldRay);
+    initMainRay(origin, direction, worldUBO.seed, coneSpreadFromFov(fovY, fovX, resolution), resolution, worldRay);
     FirstHitPayload worldFirstHit;
     tracePrimary(eyePos, orgDirection, rayFlags, 0, worldRay, worldFirstHit);
 
     MainRay handRay;
-    initMainRay(origin, direction, worldUBO.seed ^ 0x9E3779B9u, coneSpreadFromFov(fovY, fovX, resolution), handRay);
+    initMainRay(origin, direction, worldUBO.seed ^ 0x9E3779B9u, coneSpreadFromFov(fovY, fovX, resolution), resolution, handRay);
     FirstHitPayload handFirstHit;
     tracePrimary(eyePos, orgDirection, rayFlags, 1, handRay, handFirstHit);
 
@@ -933,7 +966,7 @@ void main() {
                     MainRay transparentReflectionRay;
                     if (initTransparent(mainRay, firstHitMat, firstHitIncomingDirection, firstHitNormal,
                                         firstHitWorldPos, 0x9E3779B9u, true, transparentReflectionRay)) {
-                        traceTransparent(transparentReflectionRay, startBounce, isHand,
+                        traceTransparent(transparentReflectionRay, startBounce, isHand, false,
 #    if SHARC_QUERY && USE_SHARC
                                          sharcParameters, sharcDebugBounceCount, sharcDebugCacheHit,
 #    endif
@@ -947,7 +980,7 @@ void main() {
                                         firstHitWorldPos, 0x3C6EF372u, false, transparentRefractionRay)) {
                         bool hasTransparentRefractionSecondHit = false;
                         float transparentRefractionSecondHitDistance = 0.0;
-                        traceTransparent(transparentRefractionRay, startBounce, isHand,
+                        traceTransparent(transparentRefractionRay, startBounce, isHand, true,
 #    if SHARC_QUERY && USE_SHARC
                                          sharcParameters, sharcDebugBounceCount, sharcDebugCacheHit,
 #    endif
@@ -959,14 +992,14 @@ void main() {
                     mainRay.radiance = transparentReflectionRadiance + transparentRefractionRadiance;
                     mainRay.directLightRadiance = vec3(0.0);
                 } else {
-                    traceSecondary(mainRay, startBounce, isHand,
+                    traceSecondary(mainRay, startBounce, isHand, rayLobeType(mainRay) == 2u,
 #    if SHARC_QUERY && USE_SHARC
                                   sharcParameters, sharcDebugBounceCount, sharcDebugCacheHit,
 #    endif
                                   hasSecondHit, distFirstToSecond);
                 }
             } else {
-                traceSecondary(mainRay, startBounce, isHand,
+                traceSecondary(mainRay, startBounce, isHand, rayLobeType(mainRay) == 2u,
 #    if SHARC_QUERY && USE_SHARC
                               sharcParameters, sharcDebugBounceCount, sharcDebugCacheHit,
 #    endif
@@ -975,7 +1008,7 @@ void main() {
                 if (isFirstHitDiffuse) { firstHitIndirectRadiance = mainRay.radiance - firstHitDirectRadiance; }
             }
         } else {
-            traceSecondary(mainRay, startBounce, isHand,
+            traceSecondary(mainRay, startBounce, isHand, rayLobeType(mainRay) == 2u,
 #    if SHARC_QUERY && USE_SHARC
                           sharcParameters, sharcDebugBounceCount, sharcDebugCacheHit,
 #    endif
@@ -988,24 +1021,23 @@ void main() {
     if (isnan(mainRay.radiance.b) || isinf(mainRay.radiance.b)) { mainRay.radiance = vec3(0.0, 0.0, 0.0); }
 
     float densityAir = 0.0000;
-    float densityFog = 2.0 / (worldUBO.fogEnd - worldUBO.fogStart);
+    float densityFog = 2.0 / max(worldUBO.fogEnd - worldUBO.fogStart, 0.0001);
     bool useVolumetricFog = VPT_VOLUMETRIC_LIGHT_MODE == VPT_VOLUMETRIC_LIGHT_MODE_VOLUMETRIC;
     float transparentFogTransmittance = 1.0;
     vec3 transparentFogAdditive = vec3(0.0);
     if (!raySkipFog(mainRay)) {
-        if (skyUBO.cameraSubmersionType == 1) {
-            vec3 waterColor = vec3(0.0, 0.48, 0.65);
-            vec3 preFogRadiance = mainRay.radiance * waterColor;
-
-            if (surfaceDepth == INF_DISTANCE) surfaceDepth = 0;
+        if (skyUBO.cameraSubmersionType != 3) {
+            float fluidFogDistance = vanillaFogDistance(surfaceDepth, orgDirection);
             if (useTransparentSplit) {
-                applyFog(preFogRadiance, surfaceDepth, worldUBO.fogStart, densityAir, densityFog, waterColor * 0.01,
-                         mainRay.radiance, transparentFogTransmittance, transparentFogAdditive);
-                transparentReflectionRadiance *= waterColor * transparentFogTransmittance;
-                transparentRefractionRadiance *= waterColor * transparentFogTransmittance;
+                applyVanillaFog(mainRay.radiance, fluidFogDistance, worldUBO.fogStart,
+                                worldUBO.fogEnd, worldUBO.fogColor, mainRay.radiance,
+                                transparentFogTransmittance, transparentFogAdditive);
+                transparentReflectionRadiance *= transparentFogTransmittance;
+                transparentRefractionRadiance *= transparentFogTransmittance;
             } else {
-                applyFog(preFogRadiance, surfaceDepth, worldUBO.fogStart, densityAir, densityFog, waterColor * 0.01,
-                         mainRay.radiance, composeFogTransmittance, composeFogAdditive);
+                applyVanillaFog(mainRay.radiance, fluidFogDistance, worldUBO.fogStart,
+                                worldUBO.fogEnd, worldUBO.fogColor, mainRay.radiance,
+                                composeFogTransmittance, composeFogAdditive);
             }
         } else {
             if (worldUBO.skyType == 0) {
@@ -1100,7 +1132,7 @@ void main() {
     }
     imageStore(firstHitBaseEmissionImage, ivec2(pixel), vec4(firstHitEmission, 1.0));
     bool applyVolumetricCompose =
-        useVolumetricFog && !raySkipFog(mainRay) && skyUBO.cameraSubmersionType != 1 && worldUBO.skyType == 1;
+        useVolumetricFog && !raySkipFog(mainRay) && skyUBO.cameraSubmersionType == 3 && worldUBO.skyType == 1;
     if (applyVolumetricCompose) {
         float volumetricDistance = psrHitSky ? volumetricMediumMaxDistance() : length(psrHitPosition - eyePos);
         vec3 volumetricTransmittance;

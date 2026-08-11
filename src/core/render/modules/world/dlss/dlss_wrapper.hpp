@@ -41,12 +41,14 @@
 
 #include "core/all_extern.hpp"
 
+#include "core/render/streamline_runtime.hpp"
 #include "nvsdk_ngx_vk.h"
 #include "nvsdk_ngx_defs_dlssd.h"
 
 #include <glm/glm.hpp>
 
 #include <array>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -81,12 +83,8 @@ class NgxContext : public SharedObject<NgxContext> {
         std::shared_ptr<vk::Instance> instance;
         std::shared_ptr<vk::PhysicalDevice> physicalDevice;
         std::shared_ptr<vk::Device> device;
-#ifdef NDEBUG
-        NVSDK_NGX_Logging_Level loggingLevel = NVSDK_NGX_LOGGING_LEVEL_OFF;
-#else
         NVSDK_NGX_Logging_Level loggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
-#endif
-        std::string applicationPath; // directory to store temporary files and logs in
+        std::filesystem::path applicationPath; // feature DLLs, temporary files and logs
     };
 
     // Initialize the NGX context on the given Vulkan device
@@ -97,6 +95,8 @@ class NgxContext : public SharedObject<NgxContext> {
 
     // Check if DLSS_RR is available and createDlssRR() can be called
     NVSDK_NGX_Result queryDlssRRAvailable();
+    NVSDK_NGX_Result queryDlssSRAvailable();
+    NVSDK_NGX_Result queryDlssFGAvailable();
 
     struct SupportedSizes {
         VkExtent2D minSize = {};
@@ -104,6 +104,7 @@ class NgxContext : public SharedObject<NgxContext> {
         VkExtent2D optimalSize = {};
     };
     struct QuerySizeInfo {
+        bool rayReconstruction = true;
         VkExtent2D outputSize;
         NVSDK_NGX_PerfQuality_Value quality = NVSDK_NGX_PerfQuality_Value_MaxQuality;
     };
@@ -111,6 +112,7 @@ class NgxContext : public SharedObject<NgxContext> {
     NVSDK_NGX_Result querySupportedDlssInputSizes(const QuerySizeInfo &outputSize, SupportedSizes &renderSizes);
 
     struct DlssRRInitInfo {
+        bool rayReconstruction = true;
         VkExtent2D inputSize = {};  // dimensions of the noisy input textures.
         VkExtent2D outputSize = {}; // dimensions of the output after denoising.
         NVSDK_NGX_PerfQuality_Value quality = NVSDK_NGX_PerfQuality_Value_MaxQuality;
@@ -121,12 +123,12 @@ class NgxContext : public SharedObject<NgxContext> {
     initDlssRR(const DlssRRInitInfo &initInfo, std::shared_ptr<vk::CommandPool> cmdPool, std::shared_ptr<DlssRR> dlssrr);
 
     // Append 'extensions' with the instance extensions that should be enabled for DLSS_RR
-    static NVSDK_NGX_Result getDlssRRRequiredInstanceExtensions(std::vector<VkExtensionProperties> &extensions);
+    static NVSDK_NGX_Result getDlssRRRequiredInstanceExtensions(std::vector<VkExtensionProperties> &extensions, NVSDK_NGX_Feature feature = NVSDK_NGX_Feature_RayReconstruction);
 
     // Append 'extensions' with the device extensions that should be enabled for DLSS_RR
     static NVSDK_NGX_Result getDlssRRRequiredDeviceExtensions(std::shared_ptr<vk::Instance> instance,
                                                               std::shared_ptr<vk::PhysicalDevice> physicalDevice,
-                                                              std::vector<VkExtensionProperties> &extensions);
+                                                              std::vector<VkExtensionProperties> &extensions, NVSDK_NGX_Feature feature = NVSDK_NGX_Feature_RayReconstruction);
 
   private:
     // We don't provide proper operators, so forbid copying & moving for now
@@ -138,6 +140,7 @@ class NgxContext : public SharedObject<NgxContext> {
     std::shared_ptr<vk::Device> device_;
     NVSDK_NGX_Parameter *ngxParams_ = nullptr;
     std::wstring applicationPath_;
+    std::array<const wchar_t *, 1> featureSearchPaths_{};
 };
 
 
@@ -171,6 +174,8 @@ class DlssRR : public SharedObject<DlssRR> {
     // Associate a DlssRR resource with a Vulkan texture
     void setResource(DlssResource resourceId, std::shared_ptr<vk::DeviceLocalImage> image);
     void resetResource(DlssResource resourceId);
+    void requestHistoryReset();
+    const std::string &lastFailure() const { return m_lastFailure; }
 
     // Perform the actual denoising.
     // 'renderSize' is the subrectangle ( [0,0] based) of the input textures that has been rendered to.
@@ -203,5 +208,18 @@ class DlssRR : public SharedObject<DlssRR> {
     NVSDK_NGX_Handle *m_dlssdHandle = nullptr;
     VkExtent2D m_inputSize;
     VkExtent2D m_outputSize;
-    std::array<NVSDK_NGX_Resource_VK, RESOURCE_NUM> m_resources;
+    std::array<std::shared_ptr<vk::DeviceLocalImage>, RESOURCE_NUM> m_images;
+    sl::DLSSDOptions m_rrOptions{};
+    uint32_t m_viewport = 0;
+    uint32_t m_lastFrame = UINT32_MAX;
+    glm::mat4 m_previousView{1}, m_previousProjection{1};
+    bool m_resetPending = true;
+    bool m_rayReconstruction = true;
+    bool m_featureEvaluated = false;
+    uint64_t m_ponderDiagnosticFrames = 0;
+    std::string m_lastFailure;
+    std::string m_lastFailureStage;
+    sl::Result m_lastFailureCode = sl::Result::eOk;
+
+    NVSDK_NGX_Result recordFailure(const char *stage, sl::Result result, uint32_t frame = UINT32_MAX);
 };

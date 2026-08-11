@@ -4,6 +4,7 @@
 
 #include "common/shared.hpp"
 #include "util/disney.glsl"
+#include "util/camera_ray.glsl"
 #include "util/random.glsl"
 #include "util/ray_cone.glsl"
 #include "util/ray.glsl"
@@ -278,13 +279,10 @@ void main() {
     float fovY = fovYFromProj(worldUBO.cameraProjMat);
     float fovX = fovXFromProj(worldUBO.cameraProjMat);
 
-    vec2 ndc = pixelCenter / resolution * 2.0 - 1.0;
-    vec4 nearPoint = vec4(ndc, 0.0, 1.0);
-    vec4 viewNear = worldUBO.cameraProjMatInv * nearPoint;
-    viewNear /= viewNear.w;
-
-    vec3 origin = vec3(worldUBO.cameraEffectedViewMatInv * vec4(0.0, 0.0, 0.0, 1.0));
-    vec3 direction = normalize(vec3(worldUBO.cameraEffectedViewMatInv * vec4(viewNear.xyz, 0.0)));
+    vec3 origin;
+    vec3 direction;
+    buildWorldCameraRay(worldUBO, pixelCenter, resolution, origin, direction);
+    const vec3 eyePos = origin;
     vec3 orgDirection = direction;
 
     MainRay worldRay;

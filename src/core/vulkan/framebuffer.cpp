@@ -1,17 +1,20 @@
 #include "core/vulkan/framebuffer.hpp"
 
+#include "core/logging.hpp"
+#include "core/failure_state.hpp"
+
 #include "core/vulkan/device.hpp"
 #include "core/vulkan/image.hpp"
 #include "core/vulkan/render_pass.hpp"
 
 #include <iostream>
 
-std::ostream &framebufferCout() {
-    return std::cout << "[Framebuffer] ";
+auto framebufferCout() {
+    return mcvr::log::info("Framebuffer");
 }
 
-std::ostream &framebufferCerr() {
-    return std::cerr << "[Framebuffer] ";
+auto framebufferCerr() {
+    return mcvr::log::error("Framebuffer");
 }
 
 vk::Framebuffer::Framebuffer(std::shared_ptr<Device> device, VkFramebuffer framebuffer)
@@ -45,7 +48,7 @@ vk::FramebufferBuilder::FramebufferAttachmentsBuilder::defineAttachment(std::sha
     } else {
         if (width != image->width()) {
             framebufferCerr() << "width is not consist" << std::endl;
-            exit(EXIT_FAILURE);
+            mcvr::failure::invariant("FramebufferBuilder::build", "attachment widths differ");
         }
     }
 
@@ -54,7 +57,7 @@ vk::FramebufferBuilder::FramebufferAttachmentsBuilder::defineAttachment(std::sha
     } else {
         if (height != image->height()) {
             framebufferCerr() << "height is not consist" << std::endl;
-            exit(EXIT_FAILURE);
+            mcvr::failure::invariant("FramebufferBuilder::build", "attachment heights differ");
         }
     }
 
@@ -83,9 +86,10 @@ std::shared_ptr<vk::Framebuffer> vk::FramebufferBuilder::build(std::shared_ptr<D
     createInfo.layers = 1;
 
     VkFramebuffer framebuffer;
-    if (vkCreateFramebuffer(device->vkDevice(), &createInfo, nullptr, &framebuffer) != VK_SUCCESS) {
+    if (const auto result = vkCreateFramebuffer(device->vkDevice(), &createInfo, nullptr, &framebuffer);
+        result != VK_SUCCESS) {
         framebufferCerr() << "failed to create framebuffer" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::raise(mcvr::failure::Kind::runtime, result, "vkCreateFramebuffer");
     }
 
     return std::make_shared<Framebuffer>(device, framebuffer);
@@ -98,16 +102,20 @@ std::shared_ptr<vk::Framebuffer> vk::FramebufferBuilder::build(std::shared_ptr<D
     VkFramebufferCreateInfo createInfo = {};
     createInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     createInfo.renderPass = renderPass->vkRenderPass();
-    createInfo.attachmentCount = 0;
-    createInfo.pAttachments = nullptr;
+    // Explicit dimensions are also used for populated offscreen framebuffers.
+    // Preserve their attachments; an empty builder still supports attachmentless passes.
+    createInfo.attachmentCount = static_cast<uint32_t>(framebufferAttachmentsBuilder_.attachments.size());
+    createInfo.pAttachments = framebufferAttachmentsBuilder_.attachments.empty()
+                                  ? nullptr : framebufferAttachmentsBuilder_.attachments.data();
     createInfo.width = width;
     createInfo.height = height;
     createInfo.layers = 1;
 
     VkFramebuffer framebuffer;
-    if (vkCreateFramebuffer(device->vkDevice(), &createInfo, nullptr, &framebuffer) != VK_SUCCESS) {
+    if (const auto result = vkCreateFramebuffer(device->vkDevice(), &createInfo, nullptr, &framebuffer);
+        result != VK_SUCCESS) {
         framebufferCerr() << "failed to create framebuffer" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::raise(mcvr::failure::Kind::runtime, result, "vkCreateFramebuffer(imageless)");
     }
 
     return std::make_shared<Framebuffer>(device, framebuffer);

@@ -1,6 +1,9 @@
+#include "util/surface_overlay.glsl"
 #include "common/parallax_trace.glsl"
 #include "common/constants.glsl"
 #include "common/parallax_condition.glsl"
+#include "util/glint_material.glsl"
+#include "util/text_mode.glsl"
 
 struct SampledSurface {
     vec2 uv;
@@ -13,6 +16,8 @@ struct SampledSurface {
     vec4 specularValue;
     vec4 normalValue;
     vec3 tint;
+    vec3 glintRadiance;
+    vec3 emissiveOverlayRadiance;
     LabPBRMat mat;
 };
 
@@ -86,6 +91,7 @@ void sampleSurfaceState(bool useTexture,
                         vec2 uv,
                         float lod,
                         uint alphaMode,
+                        bool colorLayerMix,
                         vec4 colorLayerValue,
                         vec3 colorLayer,
                         vec3 glint,
@@ -105,31 +111,51 @@ void sampleSurfaceState(bool useTexture,
     vec4 specularValue = vec4(0.0);
     vec4 normalValue = vec4(0.0);
     bool useFlatEdgeBand = false;
-
+    bool textSurface = isTextMode(alphaMode);
+    bool usePbr = !textSurface;
     if (useTexture) {
         albedoValue = sampleTexture(textures[nonuniformEXT(textureID)], uv, lod, false);
-        albedoValue.a = resolveSurfaceAlpha(albedoValue.a * colorLayerValue.a, alphaMode);
-        specularValue = textureMap.specular >= 0 ?
+        if (textSurface) {
+            albedoValue = resolveTextTextureColor(albedoValue, true, alphaMode);
+            albedoValue.a = 1.0;
+        } else {
+            float surfaceAlpha = colorLayerMix ? albedoValue.a : albedoValue.a * colorLayerValue.a;
+            albedoValue.a = resolveSurfaceAlpha(surfaceAlpha, alphaMode);
+            if (isCoverageAlphaMode(alphaMode) || isAdditiveAlphaMode(alphaMode)) {
+                albedoValue.a = 1.0;
+            }
+        }
+        specularValue = textureMap.specular >= 0 && usePbr ?
                             sampleTexture(textures[nonuniformEXT(textureMap.specular)], uv, lod, false) :
                             vec4(0.0);
-        normalValue = textureMap.normal >= 0 ?
+        normalValue = textureMap.normal >= 0 && usePbr ?
                           samplePBRTexture(textures[nonuniformEXT(textureMap.normal)], uv, atlasUvMin, atlasUvMax, lod,
                                            ADV_PBR_SAMPLING_MODE) :
                           vec4(0.0);
-        if (hasHeightMap && textureMap.normal >= 0) {
+        if (hasHeightMap && textureMap.normal >= 0 && usePbr) {
             ivec2 heightMapSize = textureSize(textures[nonuniformEXT(textureMap.normal)], 0);
             useFlatEdgeBand = isEdgeUV(uv, atlasUvMin, atlasUvMax, heightMapSize);
         }
     }
+    if (textSurface) {
+        normalValue = vec4(0.5, 0.5, 1.0, 0.0);
+    }
 
-    vec3 tint = albedoValue.rgb * colorLayer + glint;
+    vec3 baseTint = textSurface ?
+                        albedoValue.rgb * colorLayer :
+                        (colorLayerMix ?
+                             applySurfaceOverlay(albedoValue.rgb, colorLayer, colorLayerValue.a) :
+                             albedoValue.rgb * colorLayer);
+    vec3 tint = baseTint;
     if (useOverlay) {
         vec4 overlayColor = sampleTexture(textures[nonuniformEXT(worldUBO.overlayTextureID)], overlayUV, 0, false);
-        tint = mix(overlayColor.rgb, albedoValue.rgb * colorLayer, overlayColor.a) + glint;
+        tint = applySurfaceOverlay(baseTint, overlayColor.rgb, 1.0 - overlayColor.a);
     }
 
     albedoValue = vec4(tint, albedoValue.a);
-    LabPBRMat mat = convertLabPBRMaterial(albedoValue, specularValue, normalValue);
+    LabPBRMat mat = convertLabPBRMaterial(albedoValue, specularValue, normalValue,
+                                          isTransmissionAlphaMode(alphaMode));
+    vec3 glintRadiance = applyGlintMaterialLayer(mat, glint);
 
     vec3 geometricNormal = localHit.sideWall ? localHit.geometricNormal : baseGeoNormal;
     vec3 shadingNormal = geometricNormal;
@@ -153,13 +179,14 @@ void sampleSurfaceState(bool useTexture,
         shadingNormal = applyNormalMapToBasis(localWaterNormal, tangent, bitangent, baseGeoNormal, viewDir);
     } else {
         if (ADV_PBR_SAMPLING_MODE != 0u && hasHeightMap && !localHit.sideWall && textureMap.normal >= 0 &&
+            usePbr &&
             !useFlatEdgeBand) {
             geometricNormal = sampleNormal(textures[nonuniformEXT(textureMap.normal)], uv, atlasUvMin, atlasUvMax,
                                            dPduWorld, dPdvWorld, baseGeoNormal, 0, ADV_PBR_SAMPLING_MODE,
                                            maxDepthWorld, viewDir);
         }
 
-        if (!localHit.sideWall) {
+        if (!localHit.sideWall && usePbr) {
             vec3 tangent, bitangent;
             buildSurfaceBasis(dPduWorld, dPdvWorld, geometricNormal, tangent, bitangent);
             shadingNormal = applyNormalMapToBasis(mat.normal, tangent, bitangent, geometricNormal, viewDir);
@@ -176,6 +203,8 @@ void sampleSurfaceState(bool useTexture,
     surface.specularValue = specularValue;
     surface.normalValue = normalValue;
     surface.tint = tint;
+    surface.glintRadiance = glintRadiance;
+    surface.emissiveOverlayRadiance = vec3(0.0);
     surface.mat = mat;
 }
 
@@ -199,9 +228,9 @@ vec3 heightMapWorldPosAtUvDepth(vec2 uv,
            baseGeoNormal * depth;
 }
 
-bool isFlaggedWaterSurface(int flagTextureID, vec2 uv, float lod) {
-    if (flagTextureID < 0) { return false; }
-    ivec4 flags = ivec4(round(sampleTexture(textures[nonuniformEXT(flagTextureID)], uv, ceil(lod), false) * 255.0));
+bool isFlaggedWaterSurface(TextureMapEntry textureMap, vec2 uv, float lod) {
+    if (textureMap.flag < 0) { return false; }
+    ivec4 flags = ivec4(round(sampleTexture(textures[nonuniformEXT(textureMap.flag)], uv, ceil(lod), false) * 255.0));
     return (flags.r & 0x1) > 0;
 }
 

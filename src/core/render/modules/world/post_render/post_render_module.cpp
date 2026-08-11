@@ -1,3 +1,6 @@
+#include "core/logging.hpp"
+#include "core/render/scene_scope.hpp"
+#include "core/render/post_color_sync.hpp"
 #include "core/render/modules/world/post_render/post_render_module.hpp"
 
 #include "core/render/buffers.hpp"
@@ -16,6 +19,8 @@
 #include <limits>
 #include <random>
 #include <sstream>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 
 using json = nlohmann::json;
@@ -53,7 +58,7 @@ std::string findShaderVariantName(const RenderPass &pass, std::string_view conte
 //     std::lock_guard<std::mutex> lock(mutex);
 //     if (!loggedKeys.insert(key).second) { return; }
 
-//     std::cerr << "[PostVariant] pass=" << passName << " content=" << contentName << " variant=" << variantName
+//     mcvr::log::error("PostRenderModule") << "[PostVariant] pass=" << passName << " content=" << contentName << " variant=" << variantName
 //               << std::endl;
 // }
 
@@ -64,7 +69,7 @@ PostRenderModule::PostRenderModule() {}
 void PostRenderModule::init(std::shared_ptr<Framework> framework, std::shared_ptr<WorldPipeline> worldPipeline) {
     WorldModule::init(framework, worldPipeline);
 
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     ldrImages_.resize(size);
     firstHitDepthImages_.resize(size);
@@ -146,35 +151,8 @@ bool PostRenderModule::setOrCreateOutputImages(std::vector<std::shared_ptr<vk::D
 }
 
 void PostRenderModule::setAttributes(int attributeCount, std::vector<std::string> &attributeKVs) {
-    auto parseUint = [](const std::string &value, uint32_t fallback) {
-        try {
-            const long long parsed = std::stoll(value);
-            if (parsed < 0LL) { return fallback; }
-            return static_cast<uint32_t>(std::min<long long>(parsed, std::numeric_limits<uint32_t>::max()));
-        } catch (...) { return fallback; }
-    };
-    auto parseFloat = [](const std::string &value, float fallback) {
-        try {
-            return std::stof(value);
-        } catch (...) { return fallback; }
-    };
-
-    for (int i = 0; i < attributeCount; i++) {
-        const std::string &key = attributeKVs[2 * i];
-        const std::string &value = attributeKVs[2 * i + 1];
-
-        if (key == "render_pipeline.module.post_render.attribute.star_count") {
-            starCount_ = std::max(1u, parseUint(value, starCount_));
-        } else if (key == "render_pipeline.module.post_render.attribute.star_min_size") {
-            starSizeMin_ = std::max(0.001f, parseFloat(value, starSizeMin_));
-        } else if (key == "render_pipeline.module.post_render.attribute.star_max_size") {
-            starSizeMax_ = std::max(0.001f, parseFloat(value, starSizeMax_));
-        } else if (key == "render_pipeline.module.post_render.attribute.star_radius") {
-            starRadius_ = std::max(1.0f, parseFloat(value, starRadius_));
-        }
-    }
-
-    if (starSizeMin_ > starSizeMax_) { std::swap(starSizeMin_, starSizeMax_); }
+    (void)attributeCount;
+    (void)attributeKVs;
 }
 
 void PostRenderModule::initExecutionVariables() {
@@ -193,16 +171,16 @@ void PostRenderModule::build() {
     auto t0 = clock::now();
     auto printStep = [&t0](const char *label) {
         auto now = clock::now();
-        std::cerr << "[PostRender build] " << label << ": " << ms(now - t0).count() << " ms" << std::endl;
+        mcvr::log::debug("PostRenderModule") << "Build " << label << ": " << ms(now - t0).count() << " ms" << std::endl;
         t0 = now;
     };
 
-    std::cerr << "[PostRender build] ====== start ======" << std::endl;
+    mcvr::log::debug("PostRenderModule") << "Build started" << std::endl;
 #endif
 
     auto framework = framework_.lock();
     auto worldPipeline = worldPipeline_.lock();
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 #ifdef DEBUG
     printStep("lock framework");
 #endif
@@ -261,7 +239,7 @@ void PostRenderModule::build() {
 #ifdef DEBUG
     printStep("ensureDynamicPipelines");
 
-    std::cerr << "[PostRender build] ====== done ======" << std::endl;
+    mcvr::log::debug("PostRenderModule") << "Build completed" << std::endl;
 #endif
 }
 
@@ -274,8 +252,9 @@ void PostRenderModule::bindTexture(std::shared_ptr<vk::Sampler> sampler,
                                    int index) {
     auto framework = framework_.lock();
 
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
     for (int i = 0; i < size; i++) {
+        if (SceneRecordingScope::active() && i != framework->safeAcquireCurrentContext()->frameIndex) continue;
         if (descriptorTables_[i] != nullptr)
             descriptorTables_[i]->bindSamplerImage(sampler, image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 0,
                                                    index);
@@ -298,8 +277,6 @@ RenderPass::Target PostRenderModule::parseRenderContent(const std::string &conte
     if (lower == "weather") { return RenderPass::Target::Weather; }
     if (lower == "particle" || lower == "particles") { return RenderPass::Target::Particle; }
     if (lower == "text") { return RenderPass::Target::Text; }
-    if (lower == "name_tag" || lower == "nametag" || lower == "name-tag") { return RenderPass::Target::NameTag; }
-    if (lower == "star" || lower == "stars") { return RenderPass::Target::Star; }
     throw std::runtime_error("unsupported post_render render content: " + content);
 }
 
@@ -311,17 +288,12 @@ int PostRenderModule::renderTargetPostFlag(RenderPass::Target target) {
             return particlePostFlag;
         case RenderPass::Target::Text:
             return textPostFlag;
-        case RenderPass::Target::NameTag:
-            return nameTagPostFlag;
-        case RenderPass::Target::Star:
-            return 0;
     }
     return 0;
 }
 
 bool PostRenderModule::renderTargetDefaultDepthWrite(RenderPass::Target target) {
-    return target == RenderPass::Target::Text || target == RenderPass::Target::NameTag ||
-           target == RenderPass::Target::Star;
+    return target == RenderPass::Target::Text;
 }
 
 VkCompareOp PostRenderModule::parseDepthCompare(const std::string &value) {
@@ -339,7 +311,7 @@ VkCompareOp PostRenderModule::parseDepthCompare(const std::string &value) {
 
 void PostRenderModule::initDescriptorTables() {
     auto framework = framework_.lock();
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
     descriptorTables_.resize(size);
     samplers_.resize(size);
     postPassColorSamplers_.resize(size);
@@ -454,7 +426,7 @@ void PostRenderModule::initImages() {
     auto framework = framework_.lock();
     auto device = framework->device();
     auto vma = framework->vma();
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     worldPostDepthImages_.resize(size);
 
@@ -480,132 +452,7 @@ void PostRenderModule::initImages() {
     }
 }
 
-static inline float rand01(std::mt19937 &rng) {
-    static std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    return dist(rng);
-}
-
-static inline glm ::vec3 sampleUnitSphere(std::mt19937 &rng) {
-    float u = rand01(rng);
-    float v = rand01(rng);
-
-    float z = 1.0f - 2.0f * u;
-    float a = 2.0f * glm::pi<float>() * v;
-    float r = std::sqrt(std::max(0.0f, 1.0f - z * z));
-
-    float x = r * std::cos(a);
-    float y = r * std::sin(a);
-    return glm::vec3(x, y, z);
-}
-
-static inline vk::VertexFormat::PBRVertex makeStarVertex(const glm ::vec3 dir, const glm ::vec4 color) {
-    vk::VertexFormat::PBRVertex v{};
-    v.pos = dir;
-    v.useColorLayer = 1;
-    v.colorLayer = color;
-    v.coordinate = 2;
-    return v;
-}
-
-void PostRenderModule::initBuffers() {
-    auto framework = framework_.lock();
-    auto device = framework->device();
-    auto vma = framework->vma();
-
-    const float sunCone = 0.05f;
-    const float moonCone = 0.08f;
-    const float cosSun = std::cos(sunCone);
-    const float cosMoon = std::cos(moonCone);
-    uint32_t seed = 12345;
-    constexpr float starSizeReferenceHeight = 1440.0f;
-    const float starResolutionScale =
-        std::clamp(starSizeReferenceHeight / static_cast<float>(std::max(height_, 1u)), 0.25f, 8.0f);
-
-    const uint32_t starCount = std::max(1u, starCount_);
-    const float starSizeMin = std::max(0.001f, starSizeMin_ * starResolutionScale);
-    const float starSizeMax = std::max(starSizeMin, starSizeMax_ * starResolutionScale);
-    const float starRadius = std::max(1.0f, starRadius_);
-
-    std::mt19937 rng(seed);
-
-    std::vector<vk::VertexFormat::PBRVertex> verts;
-    verts.reserve((size_t)starCount * 6);
-
-    for (uint32_t i = 0; i < starCount; i++) {
-        glm ::vec3 dir{};
-        for (;;) {
-            dir = sampleUnitSphere(rng);
-            if (dir.x > cosSun) continue;
-            if (dir.x < -cosMoon) continue;
-            break;
-        }
-
-        float u = rand01(rng);
-        float brightness;
-        if (u < 0.35f) {
-            brightness = 0.75f + 0.25f * rand01(rng);
-        } else {
-            brightness = 0.02f + 0.35f * std::pow(rand01(rng), 3.0f);
-        }
-
-        float tint = rand01(rng);
-        glm::vec3 baseRGB;
-        if (tint < 0.75f)
-            baseRGB = glm::vec3(1.0f, 1.0f, 1.0f);
-        else if (tint < 0.9f)
-            baseRGB = glm::vec3(1.0f, 0.95f, 0.85f); // 暖
-        else
-            baseRGB = glm::vec3(0.85f, 0.9f, 1.0f); // 冷
-
-        glm::vec4 color(baseRGB * brightness, 1.0f);
-
-        glm::vec3 center = dir * starRadius;
-        const float half = 0.5f * (starSizeMin + rand01(rng) * (starSizeMax - starSizeMin));
-
-        glm::vec3 ref = (std::abs(dir.y) < 0.99f) ? glm::vec3(0, 1, 0) : glm::vec3(0, 0, 1);
-        glm::vec3 t1 = glm::normalize(glm::cross(ref, dir));
-        glm::vec3 t2 = glm::cross(dir, t1);
-
-        glm::vec3 dx = t1 * half;
-        glm::vec3 dy = t2 * half;
-
-        glm::vec3 p0 = center - dx - dy;
-        glm::vec3 p1 = center + dx - dy;
-        glm::vec3 p2 = center + dx + dy;
-        glm::vec3 p3 = center - dx + dy;
-
-        verts.push_back(makeStarVertex(p0, color));
-        verts.push_back(makeStarVertex(p1, color));
-        verts.push_back(makeStarVertex(p2, color));
-
-        verts.push_back(makeStarVertex(p2, color));
-        verts.push_back(makeStarVertex(p3, color));
-        verts.push_back(makeStarVertex(p0, color));
-    }
-
-    starFieldVertexBuffer = vk::DeviceLocalBuffer::create(
-        vma, device, verts.size() * sizeof(vk::VertexFormat::PBRVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-
-    starFieldVertexBuffer->uploadToStagingBuffer(verts.data());
-
-    std::shared_ptr<vk::Fence> fence = vk::Fence::create(device);
-    std::shared_ptr<vk::CommandBuffer> oneTimeBuffer = vk::CommandBuffer::create(device, framework->mainCommandPool());
-    oneTimeBuffer->begin();
-    starFieldVertexBuffer->uploadToBuffer(oneTimeBuffer);
-    oneTimeBuffer->end();
-
-    VkSubmitInfo vkSubmitInfo = {};
-    vkSubmitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    vkSubmitInfo.waitSemaphoreCount = 0;
-    vkSubmitInfo.pWaitSemaphores = nullptr;
-    vkSubmitInfo.pWaitDstStageMask = nullptr;
-    vkSubmitInfo.commandBufferCount = 1;
-    vkSubmitInfo.pCommandBuffers = &oneTimeBuffer->vkCommandBuffer();
-    vkSubmitInfo.signalSemaphoreCount = 0;
-    vkSubmitInfo.pSignalSemaphores = nullptr;
-    vkQueueSubmit(device->mainVkQueue(), 1, &vkSubmitInfo, fence->vkFence());
-    vkWaitForFences(device->vkDevice(), 1, &fence->vkFence(), true, UINT64_MAX);
-}
+void PostRenderModule::initBuffers() {}
 
 void PostRenderModule::initRenderPass() {
     auto device = framework_.lock()->device();
@@ -642,7 +489,7 @@ void PostRenderModule::initRenderPass() {
 void PostRenderModule::initFrameBuffers() {
     auto framework = framework_.lock();
     auto device = framework->device();
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     worldPostColorToDepthFramebuffers_.resize(size);
 
@@ -774,7 +621,7 @@ void PostRenderModule::ensureDynamicPipelines() {
     auto tPhase = clock::now();
     auto printPhase = [&tPhase](const char *label) {
         auto now = clock::now();
-        std::cerr << "[PostRender ensureDynamicPipelines] " << label << ": "
+        mcvr::log::debug("PostRenderModule") << "Dynamic pipelines " << label << ": "
                   << ms(now - tPhase).count() << " ms" << std::endl;
         tPhase = now;
     };
@@ -782,10 +629,14 @@ void PostRenderModule::ensureDynamicPipelines() {
 
     auto framework = framework_.lock();
     auto device = framework->device();
-    uint32_t frameCount = framework->swapchain()->imageCount();
+    uint32_t frameCount = framework->recordingContextCount();
     const auto &shaderPack = shaderPack_->shaderPack();
     const uint32_t executionSet = shaderPack_->executionSet(4u);
     const size_t executionBufferSize = shaderPack.postRenderExecution.variables.size() * sizeof(float);
+    // All passes bind one stable address. Inline updates carry each pass value in
+    // queue order; changing the shared descriptor would retarget earlier draws.
+    const auto stageExecutionBuffer =
+        ShaderPack::createPassExecutionBuffer(device, framework->vma(), executionBufferSize);
 
     fullScreenPasses_.clear();
     passNameToPass_.clear();
@@ -883,8 +734,7 @@ void PostRenderModule::ensureDynamicPipelines() {
                 auto pass = std::make_shared<FullScreenPass>();
                 pass->config = passConfig.fullScreen;
                 if (executionBufferSize > 0) {
-                    pass->executionBuffer =
-                        ShaderPack::createPassExecutionBuffer(device, framework->vma(), executionBufferSize);
+                    pass->executionBuffer = stageExecutionBuffer;
                 }
                 pass->renderPass = vk::RenderPassBuilder{}
                                        .beginAttachmentDescription()
@@ -935,31 +785,35 @@ void PostRenderModule::ensureDynamicPipelines() {
                 break;
             }
             case ShaderPackLoader::PassConfig::Type::Render: {
-                if (!hasOutputImage(passConfig.render.outputs, TARGET_LDR)) {
-                    throw std::runtime_error("post_render render pass must output out:ldr: " +
-                                             passConfig.render.name);
-                }
+                std::vector<std::string> colorOutputs;
                 for (const auto &output : passConfig.render.outputs.images) {
-                    if (output != TARGET_LDR && output != TARGET_FIRST_HIT_DEPTH) {
-                        throw std::runtime_error("post_render render pass only supports out:ldr and "
-                                                 "out:first_hit_depth outputs: " +
-                                                 passConfig.render.name);
-                    }
+                    if (output != TARGET_FIRST_HIT_DEPTH) { colorOutputs.push_back(output); }
+                }
+                if (colorOutputs.size() != 1) {
+                    throw std::runtime_error("post_render render pass must have exactly one color output: " +
+                                             passConfig.render.name);
                 }
 
                 auto pass = std::make_shared<RenderPass>();
                 pass->config = passConfig.render;
                 pass->target = parseRenderContent(pass->config.content);
+                pass->colorTarget = colorOutputs[0];
                 pass->writesFirstHitDepth = hasOutputImage(pass->config.outputs, TARGET_FIRST_HIT_DEPTH);
+                const bool depthTest = pass->config.depthTest.value_or(true);
+                const bool depthWrite = pass->config.depthWrite.value_or(renderTargetDefaultDepthWrite(pass->target));
+                pass->usesDepthAttachment = depthTest || depthWrite;
+                auto colorTargetImage = findTargetImage(pass->colorTarget, 0);
+                if (colorTargetImage == nullptr) {
+                    throw std::runtime_error("invalid post_render render color target: " + pass->colorTarget);
+                }
                 if (executionBufferSize > 0) {
-                    pass->executionBuffer =
-                        ShaderPack::createPassExecutionBuffer(device, framework->vma(), executionBufferSize);
+                    pass->executionBuffer = stageExecutionBuffer;
                 }
 
                 vk::RenderPassBuilder renderPassBuilder;
                 auto &attachmentBuilder = renderPassBuilder.beginAttachmentDescription();
                 attachmentBuilder.defineAttachmentDescription({
-                    .format = postRenderedImages_[0]->vkFormat(),
+                    .format = colorTargetImage->vkFormat(),
                     .samples = VK_SAMPLE_COUNT_1_BIT,
                     .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
                     .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
@@ -969,6 +823,11 @@ void PostRenderModule::ensureDynamicPipelines() {
                     .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 });
                 if (pass->writesFirstHitDepth) {
+                    if (colorTargetImage->width() != firstHitDepthImages_[0]->width() ||
+                        colorTargetImage->height() != firstHitDepthImages_[0]->height()) {
+                        throw std::runtime_error("post_render first-hit-depth output extent does not match color target: " +
+                                                 pass->config.name);
+                    }
                     attachmentBuilder.defineAttachmentDescription({
                         .format = firstHitDepthImages_[0]->vkFormat(),
                         .samples = VK_SAMPLE_COUNT_1_BIT,
@@ -980,16 +839,23 @@ void PostRenderModule::ensureDynamicPipelines() {
                         .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                     });
                 }
-                attachmentBuilder.defineAttachmentDescription({
-                    .format = worldPostDepthImages_[0]->vkFormat(),
-                    .samples = VK_SAMPLE_COUNT_1_BIT,
-                    .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
-                    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-                    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-                    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-                    .initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                    .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                });
+                if (pass->usesDepthAttachment) {
+                    if (colorTargetImage->width() != worldPostDepthImages_[0]->width() ||
+                        colorTargetImage->height() != worldPostDepthImages_[0]->height()) {
+                        throw std::runtime_error("post_render depth attachment extent does not match color target: " +
+                                                 pass->config.name);
+                    }
+                    attachmentBuilder.defineAttachmentDescription({
+                        .format = worldPostDepthImages_[0]->vkFormat(),
+                        .samples = VK_SAMPLE_COUNT_1_BIT,
+                        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+                        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                        .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                        .initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                        .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    });
+                }
                 attachmentBuilder.endAttachmentDescription();
                 auto &referenceBuilder = renderPassBuilder.beginAttachmentReference()
                                              .defineAttachmentReference({
@@ -1002,20 +868,22 @@ void PostRenderModule::ensureDynamicPipelines() {
                         .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                     });
                 }
-                const uint32_t depthAttachmentIndex = pass->writesFirstHitDepth ? 2u : 1u;
-                pass->renderPass =
-                    referenceBuilder
-                        .defineAttachmentReference({
+                uint32_t depthAttachmentReferenceIndex = static_cast<uint32_t>(-1);
+                if (pass->usesDepthAttachment) {
+                    const uint32_t depthAttachmentIndex = pass->writesFirstHitDepth ? 2u : 1u;
+                    depthAttachmentReferenceIndex = referenceBuilder.attachmentReferences.size();
+                    referenceBuilder.defineAttachmentReference({
                             .attachment = depthAttachmentIndex,
                             .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                        })
-                        .endAttachmentReference()
-                        .beginSubpassDescription()
+                        });
+                }
+                referenceBuilder.endAttachmentReference();
+                pass->renderPass = renderPassBuilder.beginSubpassDescription()
                         .defineSubpassDescription({
                             .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
                             .colorAttachmentIndices = pass->writesFirstHitDepth ? std::vector<uint32_t>{0, 1}
                                                                                 : std::vector<uint32_t>{0},
-                            .depthStencilAttachmentIndex = depthAttachmentIndex,
+                            .depthStencilAttachmentIndex = depthAttachmentReferenceIndex,
                         })
                         .endSubpassDescription()
                         .build(device);
@@ -1024,14 +892,14 @@ void PostRenderModule::ensureDynamicPipelines() {
                 for (uint32_t frameIndex = 0; frameIndex < frameCount; frameIndex++) {
                     vk::FramebufferBuilder framebufferBuilder;
                     auto &attachments = framebufferBuilder.beginAttachment()
-                                            .defineAttachment(postRenderedImages_[frameIndex]);
+                                            .defineAttachment(findTargetImage(pass->colorTarget, frameIndex));
                     if (pass->writesFirstHitDepth) {
                         attachments.defineAttachment(firstHitDepthImages_[frameIndex]);
                     }
-                    pass->framebuffers[frameIndex] =
-                        attachments.defineAttachment(worldPostDepthImages_[frameIndex])
-                            .endAttachment()
-                            .build(device, pass->renderPass);
+                    if (pass->usesDepthAttachment) {
+                        attachments.defineAttachment(worldPostDepthImages_[frameIndex]);
+                    }
+                    pass->framebuffers[frameIndex] = attachments.endAttachment().build(device, pass->renderPass);
                 }
 
                 for (const auto &[variantName, shaderConfig] : pass->config.shaderConfigs) {
@@ -1075,7 +943,7 @@ void PostRenderModule::ensureDynamicPipelines() {
             case ShaderPackLoader::PassConfig::Type::Render:     dbgName = passConfig.render.name;     break;
             default: continue;
         }
-        std::cerr << "[PostRender ensureDynamicPipelines]   create pass '" << dbgName << "': "
+        mcvr::log::debug("PostRenderModule") << "Create pass '" << dbgName << "': "
                   << ms(clock::now() - tPass).count() << " ms" << std::endl;
 #endif
     }
@@ -1202,10 +1070,7 @@ void PostRenderModule::ensureDynamicPipelines() {
         auto &pass = renderPasses_[passIndex];
         const bool depthTest = pass->config.depthTest.value_or(true);
         const bool depthWrite = pass->config.depthWrite.value_or(renderTargetDefaultDepthWrite(pass->target));
-        const VkCompareOp depthCompare =
-            parseDepthCompare(pass->config.depthCompare.value_or(pass->target == RenderPass::Target::NameTag ?
-                                                                     "always" :
-                                                                     "less"));
+        const VkCompareOp depthCompare = parseDepthCompare(pass->config.depthCompare.value_or("less"));
 
         for (auto &[variantName, variant] : pass->shaderVariants) {
             vk::GraphicsPipelineBuilder pipelineBuilder;
@@ -1221,16 +1086,16 @@ void PostRenderModule::ensureDynamicPipelines() {
                             {
                                 .x = 0.0f,
                                 .y = 0.0f,
-                                .width = static_cast<float>(postRenderedImages_[0]->width()),
-                                .height = static_cast<float>(postRenderedImages_[0]->height()),
+                                .width = static_cast<float>(findTargetImage(pass->colorTarget, 0)->width()),
+                                .height = static_cast<float>(findTargetImage(pass->colorTarget, 0)->height()),
                                 .minDepth = 0.0f,
                                 .maxDepth = 1.0f,
                             },
                         .scissor =
                             {
                                 .offset = {.x = 0, .y = 0},
-                                .extent = {.width = postRenderedImages_[0]->width(),
-                                           .height = postRenderedImages_[0]->height()},
+                                .extent = {.width = findTargetImage(pass->colorTarget, 0)->width(),
+                                           .height = findTargetImage(pass->colorTarget, 0)->height()},
                             },
                     })
                     .defineDepthStencilState({
@@ -1272,10 +1137,7 @@ void PostRenderModule::ensureDynamicPipelines() {
         auto &pass = renderPasses_[passIndex];
         const bool depthTest = pass->config.depthTest.value_or(true);
         const bool depthWrite = pass->config.depthWrite.value_or(renderTargetDefaultDepthWrite(pass->target));
-        const VkCompareOp depthCompare =
-            parseDepthCompare(pass->config.depthCompare.value_or(pass->target == RenderPass::Target::NameTag ?
-                                                                     "always" :
-                                                                     "less"));
+        const VkCompareOp depthCompare = parseDepthCompare(pass->config.depthCompare.value_or("less"));
         for (auto &[variantName, variant] : pass->shaderVariants) {
             vk::GraphicsPipelineBuilder pipelineBuilder;
             auto &colorBlendBuilder =
@@ -1290,16 +1152,16 @@ void PostRenderModule::ensureDynamicPipelines() {
                             {
                                 .x = 0.0f,
                                 .y = 0.0f,
-                                .width = static_cast<float>(postRenderedImages_[0]->width()),
-                                .height = static_cast<float>(postRenderedImages_[0]->height()),
+                                .width = static_cast<float>(findTargetImage(pass->colorTarget, 0)->width()),
+                                .height = static_cast<float>(findTargetImage(pass->colorTarget, 0)->height()),
                                 .minDepth = 0.0f,
                                 .maxDepth = 1.0f,
                             },
                         .scissor =
                             {
                                 .offset = {.x = 0, .y = 0},
-                                .extent = {.width = postRenderedImages_[0]->width(),
-                                           .height = postRenderedImages_[0]->height()},
+                                .extent = {.width = findTargetImage(pass->colorTarget, 0)->width(),
+                                           .height = findTargetImage(pass->colorTarget, 0)->height()},
                             },
                     })
                     .defineDepthStencilState({
@@ -1340,7 +1202,7 @@ void PostRenderModule::ensureDynamicPipelines() {
 #ifdef DEBUG
     for (size_t passIndex = 0; passIndex < fullScreenPasses_.size(); passIndex++) {
         auto &pass = fullScreenPasses_[passIndex];
-        std::cerr << "[PostRender ensureDynamicPipelines]   build full_screen pass '" << pass->config.name << "': "
+        mcvr::log::debug("PostRenderModule") << "Build full-screen pass '" << pass->config.name << "': "
                   << fullScreenBuildTimes[passIndex] << " ms" << std::endl;
         if (!passNameToPass_.emplace(pass->config.name, pass).second) {
             throw std::runtime_error("duplicate post_render pass name: " + pass->config.name);
@@ -1349,7 +1211,7 @@ void PostRenderModule::ensureDynamicPipelines() {
 
     for (size_t passIndex = 0; passIndex < renderPasses_.size(); passIndex++) {
         auto &pass = renderPasses_[passIndex];
-        std::cerr << "[PostRender ensureDynamicPipelines]   build render pass '" << pass->config.name << "': "
+        mcvr::log::debug("PostRenderModule") << "Build render pass '" << pass->config.name << "': "
                   << renderBuildTimes[passIndex] << " ms" << std::endl;
         if (!renderPassNameToPass_.emplace(pass->config.name, pass).second ||
             passNameToPass_.find(pass->config.name) != passNameToPass_.end()) {
@@ -1415,6 +1277,8 @@ void PostRenderModuleContext::render() {
             outStage = fallbackStage;
             outAccess = fallbackAccess;
         }
+        if (SceneRecordingScope::active() && oldLayout != VK_IMAGE_LAYOUT_UNDEFINED)
+            outStage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     };
 
     if (module && module->postRenderedInitialized_.size() > context->frameIndex &&
@@ -1423,7 +1287,7 @@ void PostRenderModuleContext::render() {
 #ifdef USE_AMD
             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 #else
-            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            (SceneRecordingScope::active() ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 #endif
         VkPipelineStageFlags2 dstStage =
 #ifdef USE_AMD
@@ -1479,7 +1343,7 @@ void PostRenderModuleContext::render() {
 #ifdef USE_AMD
                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 #else
-                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                 (SceneRecordingScope::active() ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
 #endif
                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
                  VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
@@ -1571,15 +1435,16 @@ void PostRenderModuleContext::render() {
         VkPipelineStageFlags2 srcStageLdr = 0;
         VkAccessFlags2 srcAccessLdr = 0;
         chooseSrc(ldrImage->imageLayout(),
-                  VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
-                      VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                  mcvr::postColorSourceStages(VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR |
+                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT),
                   VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
                   srcStageLdr, srcAccessLdr);
 
         VkPipelineStageFlags2 srcStagePost = 0;
         VkAccessFlags2 srcAccessPost = 0;
         chooseSrc(postRenderedImage->imageLayout(),
-                  VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                  mcvr::postColorSourceStages(VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR |
+                      VK_PIPELINE_STAGE_2_TRANSFER_BIT),
                   VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
                   srcStagePost, srcAccessPost);
 
@@ -1787,40 +1652,40 @@ void PostRenderModuleContext::render() {
 
             auto pass = renderPassIter->second;
             prepareInputs(pass->config.inputs);
-            addColorImageBarrier(postRenderedImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            auto colorTargetImage = module->findTargetImage(pass->colorTarget, frameIndex);
+            if (colorTargetImage == nullptr) {
+                throw std::runtime_error("invalid post_render render color target: " + pass->colorTarget);
+            }
+            addColorImageBarrier(colorTargetImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
             if (pass->writesFirstHitDepth) {
                 addColorImageBarrier(firstHitDepthImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
             }
-            addDepthImageBarrier(worldPostDepthImage, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+            if (pass->usesDepthAttachment) {
+                addDepthImageBarrier(worldPostDepthImage, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+            }
 
             if (pass->executionBuffer != nullptr) {
                 module->uploadExecutionBuffer(pass->executionBuffer, *this, passVariables);
             }
 
             bool hasWork = false;
-            if (pass->target == RenderPass::Target::Star) {
-                hasWork = module->starFieldVertexBuffer != nullptr && module->starFieldVertexBuffer->size() > 0;
-            } else {
-                auto entityPostRenderDataBatch = Renderer::instance().world()->entities()->entityPostBatch();
-                const int postRenderFlag = PostRenderModule::renderTargetPostFlag(pass->target);
-                if (entityPostRenderDataBatch != nullptr) {
-                    for (const auto &entity : entityPostRenderDataBatch->entities) {
-                        if (entity->postRenderFlag != postRenderFlag) { continue; }
+            auto entityPostRenderDataBatch = Renderer::instance().world()->entities()->entityPostBatch();
+            const int postRenderFlag = PostRenderModule::renderTargetPostFlag(pass->target);
+            if (entityPostRenderDataBatch != nullptr) {
+                for (const auto &entity : entityPostRenderDataBatch->entities) {
+                    if (entity->postRenderFlag != postRenderFlag) { continue; }
 
-                        for (uint32_t geometryIndex = 0; geometryIndex < entity->geometryCount; geometryIndex++) {
-                            const std::string &contentName =
-                                geometryIndex < entity->geometryContentNames.size() ?
-                                    entity->geometryContentNames[geometryIndex] :
-                                    std::string{};
-                            if (findShaderVariant(*pass, contentName) != nullptr) {
-                                hasWork = true;
-                                break;
-                            }
-                        }
-                        if (hasWork) {
+                    for (uint32_t geometryIndex = 0; geometryIndex < entity->geometryCount; geometryIndex++) {
+                        const std::string &contentName =
+                            geometryIndex < entity->geometryContentNames.size() ?
+                                entity->geometryContentNames[geometryIndex] :
+                                std::string{};
+                        if (findShaderVariant(*pass, contentName) != nullptr) {
+                            hasWork = true;
                             break;
                         }
                     }
+                    if (hasWork) { break; }
                 }
             }
             if (!hasWork) { return; }
@@ -1828,21 +1693,19 @@ void PostRenderModuleContext::render() {
             worldCommandBuffer->beginRenderPass({
                 .renderPass = pass->renderPass,
                 .framebuffer = pass->framebuffers[frameIndex],
-                .renderAreaExtent = {postRenderedImage->width(), postRenderedImage->height()},
+                .renderAreaExtent = {colorTargetImage->width(), colorTargetImage->height()},
                 .clearValues = {},
             });
-            postRenderedImage->imageLayout() = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            colorTargetImage->imageLayout() = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             if (pass->writesFirstHitDepth) {
                 firstHitDepthImage->imageLayout() = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             }
-            worldPostDepthImage->imageLayout() = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            if (pass->usesDepthAttachment) {
+                worldPostDepthImage->imageLayout() = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            }
 
             worldCommandBuffer->bindDescriptorTable(descriptorTable, VK_PIPELINE_BIND_POINT_GRAPHICS);
-            if (pass->target == RenderPass::Target::Star) {
-                worldCommandBuffer->bindGraphicsPipeline(pass->pipeline)
-                    ->bindVertexBuffers(module->starFieldVertexBuffer)
-                    ->draw(module->starFieldVertexBuffer->size() / sizeof(vk::VertexFormat::PBRVertex), 1);
-            } else {
+            {
                 auto entityPostRenderDataBatch = Renderer::instance().world()->entities()->entityPostBatch();
                 const int postRenderFlag = PostRenderModule::renderTargetPostFlag(pass->target);
                 const RenderPass::ShaderVariant *boundVariant = nullptr;
@@ -1877,7 +1740,9 @@ void PostRenderModuleContext::render() {
             if (pass->writesFirstHitDepth) {
                 firstHitDepthImage->imageLayout() = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             }
-            worldPostDepthImage->imageLayout() = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            if (pass->usesDepthAttachment) {
+                worldPostDepthImage->imageLayout() = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            }
         };
         module->shaderPack_->executeCommands(
             ShaderPackLoader::Stage::PostRender,
@@ -1893,7 +1758,7 @@ void PostRenderModuleContext::render() {
         VkPipelineStageFlags2 srcStagePost = 0;
         VkAccessFlags2 srcAccessPost = 0;
         chooseSrc(postRenderedImage->imageLayout(),
-                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                  mcvr::postColorSourceStages(VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT),
                   VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
                   srcStagePost, srcAccessPost);
 
@@ -1907,7 +1772,7 @@ void PostRenderModuleContext::render() {
 #ifdef USE_AMD
                      .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 #else
-                     .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                     .newLayout = (SceneRecordingScope::active() ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
 #endif
                      .srcQueueFamilyIndex = mainQueueIndex,
                      .dstQueueFamilyIndex = mainQueueIndex,
@@ -1917,8 +1782,12 @@ void PostRenderModuleContext::render() {
 #ifdef USE_AMD
         postRenderedImage->imageLayout() = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 #else
-        postRenderedImage->imageLayout() = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        postRenderedImage->imageLayout() = (SceneRecordingScope::active() ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 #endif
     };
     finalizePostRenderTarget();
+    // Stable producer/consumer boundary for MainTarget depth conversion. Overlay
+    // recording precedes world recording, while queue submission has world first.
+    ensureLayout(firstHitDepthImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 }

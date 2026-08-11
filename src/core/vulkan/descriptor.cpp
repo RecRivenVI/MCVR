@@ -1,20 +1,48 @@
 #include "core/vulkan/descriptor.hpp"
 
+#include "core/logging.hpp"
+#include "core/failure_state.hpp"
+#include "core/diagnostics/draw_state_trace.hpp"
+
 #include "core/vulkan/as.hpp"
 #include "core/vulkan/buffer.hpp"
 #include "core/vulkan/device.hpp"
 #include "core/vulkan/image.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <map>
 
-std::ostream &descriptorTableCout() {
-    return std::cout << "[DescriptorTable] ";
+auto descriptorTableCout() {
+    return mcvr::log::info("DescriptorTable");
 }
 
-std::ostream &descriptorTableCerr() {
-    return std::cerr << "[DescriptorTable] ";
+auto descriptorTableCerr() {
+    return mcvr::log::error("DescriptorTable");
 }
+
+namespace {
+// Owns the pipeline layout and the descriptor set layouts it was created from. A
+// DynamicGraphicsPipeline holds a shared_ptr to this token, so destroying a descriptor
+// table no longer frees a layout that a persistent pipeline still references.
+struct PipelineLayoutOwnership {
+    std::shared_ptr<vk::Device> device;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSetLayout> setLayouts;
+
+    ~PipelineLayoutOwnership() {
+        if (device == nullptr) { return; }
+        for (VkDescriptorSetLayout setLayout : setLayouts) {
+            if (setLayout != VK_NULL_HANDLE) {
+                vkDestroyDescriptorSetLayout(device->vkDevice(), setLayout, nullptr);
+            }
+        }
+        if (layout != VK_NULL_HANDLE) {
+            vkDestroyPipelineLayout(device->vkDevice(), layout, nullptr);
+        }
+    }
+};
+} // namespace
 
 vk::DescriptorTable::DescriptorTable(std::shared_ptr<Device> device,
                                      VkDescriptorPool descriptorPool,
@@ -35,14 +63,31 @@ vk::DescriptorTable::DescriptorTable(std::shared_ptr<Device> device,
     layoutCreateInfo.pushConstantRangeCount = pushConstantRanges_.size();
     layoutCreateInfo.pPushConstantRanges = pushConstantRanges_.data();
 
-    if (vkCreatePipelineLayout(device->vkDevice(), &layoutCreateInfo, nullptr, &pipelineLayout_) != VK_SUCCESS) {
+    if (const auto result = vkCreatePipelineLayout(device->vkDevice(), &layoutCreateInfo, nullptr, &pipelineLayout_);
+        result != VK_SUCCESS) {
         descriptorTableCerr() << "failed to create pipeline layout" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::raise(mcvr::failure::Kind::runtime, result, "vkCreatePipelineLayout");
     } else {
 #ifdef DEBUG
         descriptorTableCout() << "created pipeline layout" << std::endl;
 #endif
     }
+    auto layoutOwnership = std::make_shared<PipelineLayoutOwnership>();
+    layoutOwnership->device = device;
+    layoutOwnership->layout = pipelineLayout_;
+    layoutOwnership->setLayouts = tableLayout_;
+    pipelineLayoutKeepAlive_ = layoutOwnership;
+
+    mcvr::diagnostics::recordDescriptorLifecycle("create",
+        reinterpret_cast<uint64_t>(this), mcvr::diagnostics::handleValue(pipelineLayout_),
+        mcvr::diagnostics::handleValue(descriptorPool_));
+}
+
+void vk::DescriptorTable::useExternalSet(uint32_t set, std::shared_ptr<DescriptorTable> owner,
+                                          uint32_t sourceSet) {
+    if (externalSets_.size() < table_.size()) externalSets_.resize(table_.size());
+    table_.at(set) = owner->descriptorSet().at(sourceSet);
+    externalSets_.at(set) = std::move(owner);
 }
 
 std::shared_ptr<vk::DescriptorTable> vk::DescriptorTable::bindImage(
@@ -60,6 +105,7 @@ std::shared_ptr<vk::DescriptorTable> vk::DescriptorTable::bindImage(
     writeDescriptorSet.dstBinding = binding;
 
     vkUpdateDescriptorSets(device_->vkDevice(), 1, &writeDescriptorSet, 0, nullptr);
+    retainDescriptorResources(set, binding, 0, {image});
 
     return shared_from_this();
 }
@@ -86,6 +132,7 @@ std::shared_ptr<vk::DescriptorTable> vk::DescriptorTable::bindSamplerImage(std::
     writeDescriptorSet.dstArrayElement = index;
 
     vkUpdateDescriptorSets(device_->vkDevice(), 1, &writeDescriptorSet, 0, nullptr);
+    retainDescriptorResources(set, binding, index, {sampler, image});
 
     return shared_from_this();
 }
@@ -146,6 +193,7 @@ vk::DescriptorTable::bindBufferRange(std::shared_ptr<Buffer> buffer,
     writeDescriptorSet.dstArrayElement = index;
 
     vkUpdateDescriptorSets(device_->vkDevice(), 1, &writeDescriptorSet, 0, nullptr);
+    retainDescriptorResources(set, binding, index, {buffer});
     return shared_from_this();
 }
 
@@ -169,6 +217,9 @@ vk::DescriptorTable::bindBuffers(std::vector<std::shared_ptr<Buffer>> buffers, u
     writeDescriptorSet.dstBinding = binding;
 
     vkUpdateDescriptorSets(device_->vkDevice(), 1, &writeDescriptorSet, 0, nullptr);
+    for (uint32_t index = 0; index < buffers.size(); ++index) {
+        retainDescriptorResources(set, binding, index, {buffers[index]});
+    }
 
     return shared_from_this();
 }
@@ -189,8 +240,20 @@ vk::DescriptorTable::bindAS(std::shared_ptr<TLAS> tlas, uint32_t set, uint32_t b
     writeDescriptorSet.dstBinding = binding;
 
     vkUpdateDescriptorSets(device_->vkDevice(), 1, &writeDescriptorSet, 0, nullptr);
+    retainDescriptorResources(set, binding, 0, {tlas});
 
     return shared_from_this();
+}
+
+void vk::DescriptorTable::retainDescriptorResources(uint32_t set,
+                                                    uint32_t binding,
+                                                    uint32_t index,
+                                                    std::vector<std::shared_ptr<void>> resources) {
+    // A descriptor slot holds exactly one live resource set. Rebinding the slot (which
+    // happens every frame for per-frame buffers, acceleration structures and images) must
+    // release the previous resources, otherwise every generated buffer stays alive forever.
+    auto &retained = resourceKeepAlive_[ResourceBindingKey{set, binding, index}];
+    retained = std::move(resources);
 }
 
 uint32_t vk::DescriptorTable::setCount() {
@@ -222,6 +285,10 @@ VkPipelineLayout &vk::DescriptorTable::vkPipelineLayout() {
     return pipelineLayout_;
 }
 
+std::shared_ptr<void> vk::DescriptorTable::pipelineLayoutKeepAlive() {
+    return pipelineLayoutKeepAlive_;
+}
+
 vk::DescriptorTableBuilder::DescriptorLayoutSetBindingBuilder::DescriptorLayoutSetBindingBuilder(
     vk::DescriptorTableBuilder::DescriptorLayoutSetBuilder &parent)
     : parent(parent), bindings() {}
@@ -235,10 +302,9 @@ vk::DescriptorTableBuilder::DescriptorLayoutSetBindingBuilder::defineDescriptorL
 }
 
 vk::DescriptorTable::~DescriptorTable() {
-    for (VkDescriptorSetLayout layout : tableLayout_) {
-        vkDestroyDescriptorSetLayout(device_->vkDevice(), layout, nullptr);
-    }
-    vkDestroyPipelineLayout(device_->vkDevice(), pipelineLayout_, nullptr);
+    mcvr::diagnostics::recordDescriptorLifecycle("destroy_begin",
+        reinterpret_cast<uint64_t>(this), mcvr::diagnostics::handleValue(pipelineLayout_),
+        mcvr::diagnostics::handleValue(descriptorPool_));
     vkDestroyDescriptorPool(device_->vkDevice(), descriptorPool_, nullptr);
 
 #ifdef DEBUG
@@ -315,10 +381,10 @@ std::shared_ptr<vk::DescriptorTable> vk::DescriptorTableBuilder::build(std::shar
         descriptorLayoutCreateInfo.bindingCount = setBindingBuilder.bindings.size();
         descriptorLayoutCreateInfo.pBindings = setBindingBuilder.bindings.data();
 
-        if (vkCreateDescriptorSetLayout(device->vkDevice(), &descriptorLayoutCreateInfo, nullptr,
-                                        &descriptorSetLayout) != VK_SUCCESS) {
+        if (const auto result = vkCreateDescriptorSetLayout(device->vkDevice(), &descriptorLayoutCreateInfo, nullptr,
+                &descriptorSetLayout); result != VK_SUCCESS) {
             descriptorTableCerr() << "failed to create descriptor layout" << std::endl;
-            exit(EXIT_FAILURE);
+            mcvr::failure::raise(mcvr::failure::Kind::runtime, result, "vkCreateDescriptorSetLayout");
         } else {
 #ifdef DEBUG
             descriptorTableCout() << "created descriptor layout" << std::endl;
@@ -353,9 +419,10 @@ std::shared_ptr<vk::DescriptorTable> vk::DescriptorTableBuilder::build(std::shar
     createInfo.pPoolSizes = poolSizes.data();
     createInfo.maxSets = descriptorSetLayouts.size();
 
-    if (vkCreateDescriptorPool(device->vkDevice(), &createInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
+    if (const auto result = vkCreateDescriptorPool(device->vkDevice(), &createInfo, nullptr, &descriptorPool);
+        result != VK_SUCCESS) {
         descriptorTableCerr() << "failed to create descriptor pool" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::raise(mcvr::failure::Kind::runtime, result, "vkCreateDescriptorPool");
     } else {
 #ifdef DEBUG
         descriptorTableCout() << "created descriptor pool" << std::endl;
@@ -370,9 +437,10 @@ std::shared_ptr<vk::DescriptorTable> vk::DescriptorTableBuilder::build(std::shar
     allocInfo.descriptorSetCount = descriptorSetLayouts.size();
     allocInfo.pSetLayouts = descriptorSetLayouts.data();
 
-    if (vkAllocateDescriptorSets(device->vkDevice(), &allocInfo, descriptorSets.data()) != VK_SUCCESS) {
+    if (const auto result = vkAllocateDescriptorSets(device->vkDevice(), &allocInfo, descriptorSets.data());
+        result != VK_SUCCESS) {
         descriptorTableCerr() << "failed to create descriptor set" << std::endl;
-        exit(1);
+        mcvr::failure::raise(mcvr::failure::Kind::runtime, result, "vkAllocateDescriptorSets");
     } else {
 #ifdef DEBUG
         descriptorTableCout() << "created descriptor set" << std::endl;

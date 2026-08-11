@@ -15,6 +15,7 @@ class FrameworkContext;
 class RayTracingModule;
 struct RayTracingModuleContext;
 struct Entity;
+struct Chunk1;
 
 struct WorldPrepareContext;
 
@@ -32,13 +33,23 @@ class WorldPrepare : public SharedObject<WorldPrepare> {
 
   private:
     using EntityRenderDataBatch = std::map<int, std::pair<std::shared_ptr<Entity>, VkTransformMatrixKHR>>;
+    using ChunkTransformBatch =
+        std::map<std::shared_ptr<Chunk1>, glm::dmat4, std::owner_less<std::shared_ptr<Chunk1>>>;
 
     std::weak_ptr<Framework> framework_;
     std::weak_ptr<RayTracingModule> rayTracingModule_;
 
-    std::queue<EntityRenderDataBatch> previousEntityRenderDataBatches_;
+    std::map<uint32_t, std::queue<EntityRenderDataBatch>> previousEntityRenderDataBatches_;
     EntityRenderDataBatch emptyEntityRenderDataBatch_;
     std::recursive_mutex entityRenderDataBatchesMtx_;
+
+    std::map<uint32_t, std::queue<ChunkTransformBatch>> previousChunkTransformBatches_;
+    ChunkTransformBatch emptyChunkTransformBatch_;
+    std::recursive_mutex chunkTransformBatchesMtx_;
+
+    using FlywheelInstanceKey = std::pair<uint64_t, uint64_t>;
+    std::map<uint32_t, std::map<FlywheelInstanceKey, glm::mat4>> previousFlywheelTransforms_;
+    std::recursive_mutex flywheelTransformMtx_;
 
     std::vector<std::shared_ptr<WorldPrepareContext>> contexts_;
 };
@@ -58,6 +69,7 @@ struct WorldPrepareContext : public SharedObject<WorldPrepareContext> {
     std::shared_ptr<vk::DeviceLocalBuffer> lastIndexBufferAddr;
     std::shared_ptr<vk::DeviceLocalBuffer> lastPositionBufferAddr;
     std::shared_ptr<vk::DeviceLocalBuffer> lastObjToWorldMat;
+    std::shared_ptr<vk::DeviceLocalBuffer> instanceAppearanceBuffer;
     std::vector<std::string> hitGroupNames;
 
     WorldPrepareContext(std::shared_ptr<FrameworkContext> frameworkContext, std::shared_ptr<WorldPrepare> worldprepare);
@@ -68,7 +80,8 @@ struct WorldPrepareContext : public SharedObject<WorldPrepareContext> {
                       std::vector<uint64_t> &materialBufferAddrs,
                       std::vector<uint64_t> &lastIndexBufferAddrs,
                       std::vector<uint64_t> &lastPositionBufferAddrs,
-                      std::vector<glm::mat4> &lastObjToWorldMats);
+                      std::vector<glm::mat4> &lastObjToWorldMats,
+                      std::vector<vk::VertexFormat::InstanceAppearance> &instanceAppearances);
     void setupHitGroupSbt(const std::unordered_map<std::string, uint32_t> &hitGroupNameToIndex,
                           uint32_t fallbackHitGroupIndex,
                           uint32_t shadowHitGroupIndex,

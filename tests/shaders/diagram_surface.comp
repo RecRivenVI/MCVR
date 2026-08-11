@@ -1,0 +1,22 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "util/diagram_math.glsl"
+#include "util/surface_overlay.glsl"
+#include "util/priority_coverage.glsl"
+layout(local_size_x=64) in;
+layout(set=0,binding=0,std430) buffer Output { vec4 values[]; } result;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= 257u * 32u * 32u) return;
+    float coverage = float(i / 1024u) / 256.0;
+    vec2 pixel = vec2(i % 32u, (i / 32u) % 32u) + 0.5;
+    float alpha = ditherMask(coverage, pixel);
+    vec3 albedo = vec3(0.2, 0.6, 0.9), red = vec3(1, 0, 0);
+    vec3 stress = applySurfaceOverlay(albedo, red, coverage);
+    vec3 hurt = applySurfaceOverlay(albedo, red, 1.0 - (1.0 - coverage));
+    vec2 p = diagramLogicalPixel(vec2(20.5, 40.5), vec4(20, 40, 544, 460), vec2(272, 230));
+    float priorityError = abs(resolvePriorityAlpha(coverage, ALPHA_MODE_CUTOUT_LOW) - (coverage >= .1 ? 1.0 : 0.0));
+    priorityError = max(priorityError, abs(resolvePriorityAlpha(.1, ALPHA_MODE_CUTOUT_LOW) - 1.0));
+    priorityError = max(priorityError, abs(resolvePriorityAlpha(coverage, POST_TEXT_MODE_RGBA_SEE_THROUGH) - coverage));
+    result.values[i] = vec4(alpha, stress.r, max(priorityError, max(max(abs(stress-hurt).r, abs(stress-hurt).g), abs(stress-hurt).b)), p.y);
+}

@@ -34,6 +34,7 @@ layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Ind
 indexBuffer;
 
 #include "util/vertex.glsl"
+#include "util/material_faces.glsl"
 
 layout(location = 0) rayPayloadInEXT MainRay mainRay;
 hitAttributeEXT vec2 attribs;
@@ -42,6 +43,17 @@ void main() {
     uint instanceID = gl_InstanceCustomIndexEXT;
     uint geometryID = gl_GeometryIndexEXT;
     uint geometryBufferIndex = getGeometryBufferIndex(instanceID, geometryID);
+    if (!acceptsMaterialFace(instanceAppearances.values[geometryBufferIndex].materialFlags,
+                             gl_HitKindEXT == gl_HitKindFrontFacingTriangleEXT)) {
+        ignoreIntersectionEXT;
+        return;
+    }
+    if (!acceptsUiOwner(instanceAppearances.values[geometryBufferIndex].materialFlags,
+            ubo.uiPrimaryOwner, mainRay.stateBits)) {
+        ignoreIntersectionEXT;
+        return;
+    }
+
 
     uint i0, i1, i2;
     MaterialVertex m0, m1, m2;
@@ -71,5 +83,10 @@ void main() {
     }
 
     float alpha = resolveTextCoverage(textureColor, useTexture, colorLayerAlpha, textMode);
-    if (alpha < 0.05) { ignoreIntersectionEXT; }
+    // Text glyphs are coverage masks, not dielectric/transmission materials.
+    // Stochastic acceptance preserves anti-aliased coverage for primary,
+    // secondary and shadow rays while still allowing deeper layers to be hit.
+    if (alpha <= 0.0 || (alpha < 1.0 && rand(mainRay.seed) >= alpha)) {
+        ignoreIntersectionEXT;
+    }
 }

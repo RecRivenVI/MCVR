@@ -6,6 +6,7 @@
 #include "core/vulkan/all_core_vulkan.hpp"
 
 #include "core/render/modules/world/dlss/dlss_wrapper.hpp"
+#include "core/render/modules/world/dlss/dlss_evaluate_state.hpp"
 #include "core/render/modules/world/world_module.hpp"
 
 class Framework;
@@ -24,11 +25,15 @@ class DLSSModule : public WorldModule, public SharedObject<DLSSModule> {
     constexpr static uint32_t outputImageNum = 4;
 
     static bool initNGXContext();
+    static bool rrAvailable;
+    static bool srAvailable;
+    static bool fgAvailable;
+    constexpr static std::string_view SR_NAME = "render_pipeline.module.dlss_sr.name";
     static void deinitNGXContext();
 
     DLSSModule();
 
-    void init(std::shared_ptr<Framework> framework, std::shared_ptr<WorldPipeline> worldPipeline);
+    void init(std::shared_ptr<Framework> framework, std::shared_ptr<WorldPipeline> worldPipeline, bool rayReconstruction = true);
 
     bool setOrCreateInputImages(std::vector<std::shared_ptr<vk::DeviceLocalImage>> &images,
                                 std::vector<VkFormat> &formats,
@@ -46,10 +51,16 @@ class DLSSModule : public WorldModule, public SharedObject<DLSSModule> {
     void
     bindTexture(std::shared_ptr<vk::Sampler> sampler, std::shared_ptr<vk::DeviceLocalImage> image, int index) override;
 
+    void onResourceReload() override;
+
     void preClose() override;
 
   private:
     static std::shared_ptr<NgxContext> ngxContext_;
+    bool rayReconstruction_ = true;
+    std::vector<std::shared_ptr<vk::DeviceLocalImage>> srDepthImages_;
+    std::vector<std::shared_ptr<vk::DescriptorTable>> srDepthTables_;
+    std::shared_ptr<vk::ComputePipeline> srDepthPipeline_;
 
     // input
     std::vector<std::shared_ptr<vk::DeviceLocalImage>> hdrImages_;
@@ -62,7 +73,7 @@ class DLSSModule : public WorldModule, public SharedObject<DLSSModule> {
     std::vector<std::shared_ptr<vk::DeviceLocalImage>> firstHitDepthImages_;
 
     // dlss
-    std::shared_ptr<DlssRR> dlss_;
+    std::vector<std::shared_ptr<DlssRR>> dlssViews_;
     NgxContext::SupportedSizes supportedSizes_{};
     NVSDK_NGX_PerfQuality_Value mode_ = NVSDK_NGX_PerfQuality_Value_Balanced;
 
@@ -102,6 +113,8 @@ struct DLSSModuleContext : public WorldModuleContext, SharedObject<DLSSModuleCon
     std::shared_ptr<vk::DeviceLocalImage> upscaledMotionVectorImage;
     std::shared_ptr<vk::DeviceLocalImage> upscaledNormalRoughnessImage;
     std::shared_ptr<vk::DescriptorTable> motionDescriptorTable;
+    DlssEvaluateState evaluateState;
+    bool dlssFailureReported = false;
 
     DLSSModuleContext(std::shared_ptr<FrameworkContext> frameworkContext,
                       std::shared_ptr<WorldPipelineContext> worldPipelineContext,

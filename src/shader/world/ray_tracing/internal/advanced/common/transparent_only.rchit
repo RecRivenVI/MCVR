@@ -7,6 +7,7 @@
 
 #include "util/ray_cone.glsl"
 #include "util/ray.glsl"
+#include "util/alpha_mode.glsl"
 #include "util/color_space.glsl"
 #include "common/shared.hpp"
 #include "common/chunk_lookup.glsl"
@@ -89,6 +90,12 @@ void main() {
     vec4 colorLayer = hasColorLayer(m0.packedData) ?
                           (bary.x * m0.colorLayer + bary.y * m1.colorLayer + bary.z * m2.colorLayer) :
                           vec4(1.0);
+    vec3 flywheelLocalPosition = bary.x * p0.pos + bary.y * p1.pos + bary.z * p2.pos;
+    vec3 flywheelLocalNormal = normalize(bary.x * m0.norm + bary.y * m1.norm + bary.z * m2.norm);
+    ivec2 flywheelLightUv = ivec2(round(bary.x * vec2(m0.lightUV)
+        + bary.y * vec2(m1.lightUV) + bary.z * vec2(m2.lightUV)));
+    applyFlywheelFragmentLighting(geometryBufferIndex, flywheelLocalPosition,
+        flywheelLocalNormal, colorLayer, flywheelLightUv);
 
     vec4 albedo = vec4(1.0);
     float pbrEmission = 0.0;
@@ -104,24 +111,49 @@ void main() {
         }
     }
 
-    vec4 shaded = albedo * colorLayer;
-    float alpha = clamp(shaded.a, 0.0, 1.0);
+    vec3 radianceLayeredRgb = hasColorLayerMix(m0.packedData) ?
+                                 mix(albedo.rgb, colorLayer.rgb, clamp(colorLayer.a, 0.0, 1.0)) :
+                                 albedo.rgb * colorLayer.rgb;
+    float radianceLayeredAlpha = hasColorLayerMix(m0.packedData) ? albedo.a : albedo.a * colorLayer.a;
+    vec4 shaded = vec4(radianceLayeredRgb, radianceLayeredAlpha);
+    uint alphaMode = getAlphaMode(m0.packedData);
+    float alpha = resolveSurfaceAlpha(shaded.a, alphaMode);
     vec3 shadedRgb = clamp(shaded.rgb, vec3(0.0), vec3(1.0));
-    vec3 transmittance = vec3(clamp(albedo.a, 0.0, 1.0));
+    float albedoEmission =
+        bary.x * m0.albedoEmission + bary.y * m1.albedoEmission + bary.z * m2.albedoEmission;
 
     float factor = rayBounce(mainRay) == 0u ? ADV_DIRECT_LIGHT_STRENGTH : ADV_INDIRECT_LIGHT_STRENGTH;
     mainRay.radiance += factor * shadedRgb * alpha * pbrEmission * mainRay.throughput;
-    mainRay.throughput *= transmittance;
+    mainRay.radiance += shadedRgb * alpha * albedoEmission * mainRay.throughput;
+    if (alphaMode == ALPHA_MODE_ADDITIVE) {
+        mainRay.radiance += shadedRgb * mainRay.throughput;
+    } else if (alphaMode == ALPHA_MODE_FLYWHEEL_LIGHTNING) {
+        mainRay.radiance += shadedRgb * alpha * mainRay.throughput;
+    } else if (alphaMode == ALPHA_MODE_FLYWHEEL_GLINT) {
+        mainRay.radiance += shadedRgb * shadedRgb * mainRay.throughput;
+    } else if (alphaMode == ALPHA_MODE_FLYWHEEL_CRUMBLING) {
+        mainRay.throughput *= 2.0 * shadedRgb;
+    } else if (alphaMode == ALPHA_MODE_FLYWHEEL_TRANSLUCENT) {
+        mainRay.radiance += shadedRgb * alpha * mainRay.throughput;
+        mainRay.throughput *= vec3(1.0 - alpha);
+    } else if (alphaMode == ALPHA_MODE_ORDERED_OPAQUE) {
+        // Unlit overlay stroke: write the overlay colour and stop so nothing bleeds through,
+        // matching the vanilla opaque outline pass.
+        mainRay.radiance += shadedRgb * mainRay.throughput;
+        mainRay.throughput = vec3(0.0);
+    } else {
+        mainRay.throughput *= vec3(1.0 - alpha);
+    }
 
     vec3 worldPos = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
     vec3 geoNormalObj = normalize(cross(p1.pos - p0.pos, p2.pos - p0.pos));
-    mat3 normalMatrix = transpose(mat3(gl_WorldToObject3x4EXT));
+    mat3 normalMatrix = mat3(gl_WorldToObject3x4EXT);
     vec3 normal = normalize(normalMatrix * geoNormalObj);
     if (dot(normal, -mainRay.direction) < 0.0) { normal = -normal; }
     float defaultF0 = 0.02;
     float sqrtF0 = sqrt(defaultF0);
     float ior = (1.0 + sqrtF0) / max(1.0 - sqrtF0, 1e-6);
-    float payloadTransmission = alpha < 0.999999 ? 1.0 : 0.0;
+    float payloadTransmission = alpha < 0.999999 || isAdditiveAlphaMode(alphaMode) ? 1.0 : 0.0;
 
     mainRay.normal = normal;
     rayStoreMaterial(mainRay, vec4(shadedRgb, alpha), vec3(defaultF0), 1.0, 0.0, payloadTransmission, ior, 0.0);

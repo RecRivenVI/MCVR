@@ -1,5 +1,10 @@
+#include "core/render/chunk_trace.hpp"
+#include "core/render/material_faces.hpp"
+#include "core/render/chunk_scheduling.hpp"
 #include "core/render/chunks.hpp"
+#include "core/failure_state.hpp"
 
+#include "core/diagnostics/device_loss_trace.hpp"
 #include "core/render/buffers.hpp"
 #include "core/render/render_framework.hpp"
 #include "core/render/renderer.hpp"
@@ -10,8 +15,31 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
+
+namespace {
+struct ChunkPerformanceStats {
+    std::atomic<uint64_t> buildInputCount{0};
+    std::atomic<uint64_t> buildInputCpuNs{0};
+    std::atomic<uint64_t> batchBuildCount{0};
+    std::atomic<uint64_t> batchBuildCpuNs{0};
+    std::atomic<uint64_t> batchSubmitCount{0};
+    std::atomic<uint64_t> batchSubmitCpuNs{0};
+    std::atomic<uint64_t> batchCompleteCount{0};
+    std::atomic<uint64_t> batchQueueGpuWallNs{0};
+};
+
+ChunkPerformanceStats chunkPerformance;
+const bool chunkPerformanceEnabled = std::getenv("RADIANCE_CHUNK_PERF") != nullptr;
+
+uint64_t elapsedNs(std::chrono::steady_clock::time_point start) {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count());
+}
+}
 
 struct LightData {
     glm::vec4 p0Area;
@@ -304,6 +332,7 @@ ChunkBuildData::ChunkBuildData(int64_t id,
                                uint32_t geometryCount,
                                std::vector<World::GeometryTypes> &&geometryTypes,
                                std::vector<std::string> &&geometryGroupNames,
+                               std::vector<uint32_t> &&geometryMaterialFlags,
                                std::vector<std::vector<vk::VertexFormat::PBRVertex>> &&vertices,
                                std::vector<std::vector<uint32_t>> &&indices)
     : id(id),
@@ -317,6 +346,7 @@ ChunkBuildData::ChunkBuildData(int64_t id,
       geometryCount(geometryCount),
       geometryTypes(std::move(geometryTypes)),
       geometryGroupNames(std::move(geometryGroupNames)),
+      geometryMaterialFlags(std::move(geometryMaterialFlags)),
       vertices(std::move(vertices)),
       indices(std::move(indices)),
       indexBufferAddresses(),
@@ -559,7 +589,7 @@ void ChunkBuildData::build(bool persistStaging) {
 
         blasGeometryBuilder->defineTriangleGeomrtry<vk::VertexFormat::PositionVertex>(
             geometryPositionAddress, vertices[i].size(), geometryIndexAddress, indices[i].size(),
-            geometryTypes[i] == World::WORLD_SOLID);
+            geometryTypes[i] == World::WORLD_SOLID && !mcvr::faces::needsAnyHit(geometryMaterialFlags[i], geometryMaterialFlags));
     }
 
     positionBuffer->flushStagingBuffer();
@@ -580,9 +610,7 @@ ChunkBuildDataBatch::ChunkBuildDataBatch(uint32_t maxBatchSize,
                                          std::set<int64_t> &queuedIndexSet,
                                          std::vector<std::shared_ptr<Chunk1>> &chunks,
                                          std::vector<std::shared_ptr<ChunkBuildData>> &chunkBuildDatas,
-                                         glm::vec3 cameraPos) {
-    std::vector<int64_t> queuedIndices;
-    std::copy(queuedIndexSet.begin(), queuedIndexSet.end(), std::back_inserter(queuedIndices));
+                                         glm::vec3 cameraPos, uint64_t inFlightBytes, uint64_t admissionSequence) {
     auto currentTime = std::chrono::steady_clock::now();
     auto queuedChunkPos = [&](int64_t id) -> glm::vec3 {
         const auto &chunkBuildData = chunkBuildDatas[id];
@@ -600,21 +628,22 @@ ChunkBuildDataBatch::ChunkBuildDataBatch(uint32_t maxBatchSize,
             static_cast<float>(chunks[id]->z),
         };
     };
-    std::sort(queuedIndices.begin(), queuedIndices.end(), [&](int64_t a, int64_t b) -> bool {
-        return chunks[a]->buildFactor(currentTime, cameraPos, queuedChunkPos(a)) >
-               chunks[b]->buildFactor(currentTime, cameraPos, queuedChunkPos(b));
-    });
-
-    for (int i = 0; i < std::min((size_t)maxBatchSize, queuedIndices.size()); i++) {
-        auto iter = queuedIndexSet.find(queuedIndices[i]);
-        if (iter != queuedIndexSet.end()) { queuedIndexSet.erase(iter); }
-
-        auto data = chunkBuildDatas[queuedIndices[i]];
-        if (data == nullptr) {
-            continue;
-        }
-        chunkBuildDatas[queuedIndices[i]] = nullptr;
-        batchData.push_back(data);
+    auto key = [&](int64_t id) {
+        const auto &data = chunkBuildDatas[id];
+        return mcvr::chunkScheduling::Key{data->priority, data->queuedAt,
+            glm::distance(cameraPos, queuedChunkPos(id))};
+    };
+    auto bytesOf = [&](int64_t id) {
+        const auto &data = chunkBuildDatas[id];
+        return uint64_t(data->allVertexCount)*sizeof(vk::VertexFormat::PBRVertex)
+            + uint64_t(data->allIndexCount)*sizeof(uint32_t)
+            + uint64_t(data->lightCount)*sizeof(LightInfo);
+    };
+    auto selected = mcvr::chunkScheduling::selectBatch(queuedIndexSet, maxBatchSize,
+        currentTime, key, bytesOf, inFlightBytes, admissionSequence);
+    for (auto id : selected) {
+        queuedIndexSet.erase(id);
+        batchData.push_back(std::exchange(chunkBuildDatas[id], nullptr));
     }
 }
 
@@ -756,7 +785,7 @@ void ChunkBuildDataBatch::build() {
 
             blasGeometryBuilder->defineTriangleGeomrtry<vk::VertexFormat::PositionVertex>(
                 geometryPositionAddress, data->vertices[i].size(), geometryIndexAddress, data->indices[i].size(),
-                data->geometryTypes[i] == World::WORLD_SOLID);
+                data->geometryTypes[i] == World::WORLD_SOLID && !mcvr::faces::needsAnyHit(data->geometryMaterialFlags[i], data->geometryMaterialFlags));
         }
 
         blasGeometryBuilder->endGeometries();
@@ -781,6 +810,7 @@ ChunkBuildScheduler::ChunkBuildScheduler(std::set<int64_t> &queuedIndex,
                                          std::vector<std::shared_ptr<ChunkBuildData>> &chunkBuildDatas,
                                          std::recursive_mutex &mutex,
                                          std::vector<ChunkPackedData> &chunkPackedData,
+                                         mcvr::ExternalChunkHandleTable &externalHandles,
                                          uint32_t chunkBuildingBatchSize,
                                          uint32_t chunkBuildingTotalBatches)
     : queuedIndex_(queuedIndex),
@@ -788,6 +818,7 @@ ChunkBuildScheduler::ChunkBuildScheduler(std::set<int64_t> &queuedIndex,
       chunkBuildDatas_(chunkBuildDatas),
       mutex_(mutex),
       chunkPackedData_(chunkPackedData),
+      externalHandles_(externalHandles),
       chunkBuildingBatchSize_(chunkBuildingBatchSize),
       chunkBuildingTotalBatches_(chunkBuildingTotalBatches) {
     auto framework = Renderer::instance().framework();
@@ -813,13 +844,94 @@ void ChunkBuildScheduler::tryCheckBatchesFinish() {
     auto iterBatch = buildingBatches_.begin();
     for (; iterFence != buildingFences_.end() && iterCommandBuffer != buildingCommandBuffers_.end() &&
            iterBatch != buildingBatches_.end();) {
-        if (vkWaitForFences(device->vkDevice(), 1, &(*iterFence)->vkFence(), true, 0) == VK_SUCCESS) {
-            vkResetFences(device->vkDevice(), 1, &(*iterFence)->vkFence());
-            vkResetCommandBuffer((*iterCommandBuffer)->vkCommandBuffer(), 0);
+        const VkResult waitResult = vkWaitForFences(device->vkDevice(), 1, &(*iterFence)->vkFence(), true, 0);
+        if (waitResult == VK_SUCCESS) {
+            if (chunkPerformanceEnabled) {
+                chunkPerformance.batchCompleteCount.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (chunkPerformanceEnabled && (*iterBatch)->submittedAt.time_since_epoch().count() != 0) {
+                chunkPerformance.batchQueueGpuWallNs.fetch_add(
+                    elapsedNs((*iterBatch)->submittedAt), std::memory_order_relaxed);
+            }
+            const VkResult resetFenceResult = vkResetFences(device->vkDevice(), 1, &(*iterFence)->vkFence());
+            if (resetFenceResult != VK_SUCCESS) {
+                framework->recordFailure(resetFenceResult, "vkResetFences(chunk poll)");
+                return;
+            }
+            const VkResult resetCommandResult = vkResetCommandBuffer((*iterCommandBuffer)->vkCommandBuffer(), 0);
+            if (resetCommandResult != VK_SUCCESS) {
+                framework->recordFailure(resetCommandResult, "vkResetCommandBuffer(chunk poll)");
+                return;
+            }
             freeFences_.push(*iterFence);
             freeCommandBuffers_.push(*iterCommandBuffer);
 
             for (auto chunkBuildData : (*iterBatch)->batchData) {
+                mcvr::chunkTrace::note("gpu-complete",chunkBuildData->id,chunkBuildData->version,0,chunkBuildData->slotGeneration);
+                if (!externalHandles_.isCurrent(static_cast<uint32_t>(chunkBuildData->id),
+                                                chunkBuildData->slotGeneration)) {
+                    releaseChunkBuildDataStaging(chunkBuildData);
+                    continue;
+                }
+                bool wasEnqueued = chunks_[chunkBuildData->id]->enqueue(chunkBuildData);
+                releaseChunkBuildDataStaging(chunkBuildData);
+                if (!wasEnqueued) {
+                    continue;
+                }
+
+                storeChunkPackedData(
+                    chunkPackedData_, chunkBuildData->id, chunkBuildData->x, chunkBuildData->y, chunkBuildData->z,
+                    chunkBuildData->geometryCount, chunkBuildData->lightCount,
+                    chunkBuildData->lightBuffer != nullptr ? chunkBuildData->lightBuffer->bufferAddress() : 0);
+            }
+
+            iterFence = buildingFences_.erase(iterFence);
+            iterCommandBuffer = buildingCommandBuffers_.erase(iterCommandBuffer);
+            iterBatch = buildingBatches_.erase(iterBatch);
+        } else if (waitResult == VK_TIMEOUT || waitResult == VK_NOT_READY) {
+            ++iterFence;
+            ++iterCommandBuffer;
+            ++iterBatch;
+        } else {
+            framework->recordFailure(waitResult, "vkWaitForFences(chunk poll)");
+            return;
+        }
+    }
+}
+
+void ChunkBuildScheduler::waitAllBatchesFinish() {
+    auto framework = Renderer::instance().framework();
+    auto device = framework->device();
+
+    std::unique_lock<std::recursive_mutex> lock(mutex_);
+    auto iterFence = buildingFences_.begin();
+    auto iterCommandBuffer = buildingCommandBuffers_.begin();
+    auto iterBatch = buildingBatches_.begin();
+    for (; iterFence != buildingFences_.end() && iterCommandBuffer != buildingCommandBuffers_.end() &&
+           iterBatch != buildingBatches_.end();) {
+        const VkResult waitResult =
+            vkWaitForFences(device->vkDevice(), 1, &(*iterFence)->vkFence(), true, UINT64_MAX);
+        if (waitResult == VK_SUCCESS) {
+            const VkResult resetFenceResult = vkResetFences(device->vkDevice(), 1, &(*iterFence)->vkFence());
+            if (resetFenceResult != VK_SUCCESS) {
+                framework->recordFailure(resetFenceResult, "vkResetFences(chunk wait)");
+                return;
+            }
+            const VkResult resetCommandResult = vkResetCommandBuffer((*iterCommandBuffer)->vkCommandBuffer(), 0);
+            if (resetCommandResult != VK_SUCCESS) {
+                framework->recordFailure(resetCommandResult, "vkResetCommandBuffer(chunk wait)");
+                return;
+            }
+            freeFences_.push(*iterFence);
+            freeCommandBuffers_.push(*iterCommandBuffer);
+
+            for (auto chunkBuildData : (*iterBatch)->batchData) {
+                mcvr::chunkTrace::note("gpu-complete",chunkBuildData->id,chunkBuildData->version,0,chunkBuildData->slotGeneration);
+                if (!externalHandles_.isCurrent(static_cast<uint32_t>(chunkBuildData->id),
+                                                chunkBuildData->slotGeneration)) {
+                    releaseChunkBuildDataStaging(chunkBuildData);
+                    continue;
+                }
                 bool wasEnqueued = chunks_[chunkBuildData->id]->enqueue(chunkBuildData);
                 releaseChunkBuildDataStaging(chunkBuildData);
                 if (!wasEnqueued) {
@@ -836,100 +948,76 @@ void ChunkBuildScheduler::tryCheckBatchesFinish() {
             iterCommandBuffer = buildingCommandBuffers_.erase(iterCommandBuffer);
             iterBatch = buildingBatches_.erase(iterBatch);
         } else {
-            ++iterFence;
-            ++iterCommandBuffer;
-            ++iterBatch;
-        }
-    }
-}
-
-void ChunkBuildScheduler::waitAllBatchesFinish() {
-    auto framework = Renderer::instance().framework();
-    auto device = framework->device();
-
-    std::unique_lock<std::recursive_mutex> lock(mutex_);
-    auto iterFence = buildingFences_.begin();
-    auto iterCommandBuffer = buildingCommandBuffers_.begin();
-    auto iterBatch = buildingBatches_.begin();
-    for (; iterFence != buildingFences_.end() && iterCommandBuffer != buildingCommandBuffers_.end() &&
-           iterBatch != buildingBatches_.end();) {
-        if (vkWaitForFences(device->vkDevice(), 1, &(*iterFence)->vkFence(), true, UINT64_MAX) == VK_SUCCESS) {
-            vkResetFences(device->vkDevice(), 1, &(*iterFence)->vkFence());
-            vkResetCommandBuffer((*iterCommandBuffer)->vkCommandBuffer(), 0);
-            freeFences_.push(*iterFence);
-            freeCommandBuffers_.push(*iterCommandBuffer);
-
-            for (auto chunkBuildData : (*iterBatch)->batchData) {
-                bool wasEnqueued = chunks_[chunkBuildData->id]->enqueue(chunkBuildData);
-                releaseChunkBuildDataStaging(chunkBuildData);
-                if (!wasEnqueued) {
-                    continue;
-                }
-
-                storeChunkPackedData(
-                    chunkPackedData_, chunkBuildData->id, chunkBuildData->x, chunkBuildData->y, chunkBuildData->z,
-                    chunkBuildData->geometryCount, chunkBuildData->lightCount,
-                    chunkBuildData->lightBuffer != nullptr ? chunkBuildData->lightBuffer->bufferAddress() : 0);
-            }
-
-            iterFence = buildingFences_.erase(iterFence);
-            iterCommandBuffer = buildingCommandBuffers_.erase(iterCommandBuffer);
-            iterBatch = buildingBatches_.erase(iterBatch);
+            framework->recordFailure(waitResult, "vkWaitForFences(chunk wait)");
+            return;
         }
     }
 
-    for (const auto &chunkBuildData : pendingBatchData_) {
-        if (chunkBuildData == nullptr) {
-            continue;
-        }
-        queuedIndex_.insert(chunkBuildData->id);
-        chunkBuildDatas_[chunkBuildData->id] = chunkBuildData;
-    }
-    pendingBatchData_.clear();
-    pendingBatchFrames_ = 0;
+
 }
 
 void ChunkBuildScheduler::tryScheduleBatches(uint32_t maxBatchSize) {
     if (!Renderer::instance().framework()->isRunning()) return;
-    while (true) {
+    uint32_t submittedThisFrame = 0;
+    uint64_t submittedBytes = 0;
+    const auto roundStart = mcvr::chunkScheduling::Clock::now();
+    while (mcvr::chunkScheduling::withinBudget(submittedThisFrame, submittedBytes,
+               mcvr::chunkScheduling::Clock::now()-roundStart)) {
         std::shared_ptr<vk::Fence> fence;
         std::shared_ptr<vk::CommandBuffer> commandBuffer;
         std::shared_ptr<ChunkBuildDataBatch> chunkBuildDataBatch;
-
         {
             std::unique_lock<std::recursive_mutex> lock(mutex_);
-            if (freeFences_.empty() || freeCommandBuffers_.empty()) { return; }
-
-            if (pendingBatchData_.size() < maxBatchSize && !queuedIndex_.empty()) {
-                const uint32_t remainingCapacity = maxBatchSize - static_cast<uint32_t>(pendingBatchData_.size());
-                glm::vec3 cameraPos = Renderer::instance().world()->getCameraPos();
-                auto supplementBatch =
-                    ChunkBuildDataBatch::create(remainingCapacity, queuedIndex_, chunks_, chunkBuildDatas_, cameraPos);
-                pendingBatchData_.insert(pendingBatchData_.end(), supplementBatch->batchData.begin(),
-                                         supplementBatch->batchData.end());
+            if (freeFences_.empty() || freeCommandBuffers_.empty()) return;
+            // Reject stale work before packing or reserving GPU storage. A slot generation and
+            // its latest requested mesh revision must both still match.
+            for (auto it=queuedIndex_.begin();it!=queuedIndex_.end();) {
+                auto &data=chunkBuildDatas_[*it];
+                if (!data || !externalHandles_.isCurrent(uint32_t(*it),data->slotGeneration)
+                    || data->version!=chunks_[*it]->desiredVersion) {
+                    data=nullptr;it=queuedIndex_.erase(it);
+                } else ++it;
             }
-
-            if (pendingBatchData_.empty()) { return; }
-
-            const bool isFullBatch = pendingBatchData_.size() >= maxBatchSize;
-            if (!isFullBatch) {
-                pendingBatchFrames_ = pendingBatchFrames_ == 0 ? 1 : pendingBatchFrames_ + 1;
-                if (pendingBatchFrames_ < maxPendingBatchFrames_) { return; }
-            } else {
-                pendingBatchFrames_ = 0;
+            if (queuedIndex_.empty()) return;
+            bool interactive=false;
+            auto oldest=mcvr::chunkScheduling::Clock::now();
+            for (auto id:queuedIndex_) {
+                interactive |= chunkBuildDatas_[id]->priority>0;
+                oldest=std::min(oldest,chunkBuildDatas_[id]->queuedAt);
             }
-
-            fence = freeFences_.front();
-            freeFences_.pop();
-            commandBuffer = freeCommandBuffers_.front();
-            freeCommandBuffers_.pop();
-
-            chunkBuildDataBatch = ChunkBuildDataBatch::create(std::move(pendingBatchData_));
-            pendingBatchData_.clear();
-            pendingBatchFrames_ = 0;
+            if (!mcvr::chunkScheduling::ready(interactive,uint32_t(queuedIndex_.size()),maxBatchSize,
+                    mcvr::chunkScheduling::Clock::now()-oldest)) return;
+            // Small interactive batches do not wait to fill. Weighted admission keeps old
+            // background owners progressing without placing the entire old queue before interaction.
+            uint64_t inFlightBytes = 0;
+            for (const auto &batch : buildingBatches_) for (const auto &data : batch->batchData)
+                inFlightBytes += uint64_t(data->allVertexCount)*sizeof(vk::VertexFormat::PBRVertex)
+                    + uint64_t(data->allIndexCount)*sizeof(uint32_t)
+                    + uint64_t(data->lightCount)*sizeof(LightInfo);
+            chunkBuildDataBatch=ChunkBuildDataBatch::create(interactive?std::min(4u,maxBatchSize):maxBatchSize,
+                queuedIndex_,chunks_,chunkBuildDatas_,Renderer::instance().world()->getCameraPos(),inFlightBytes,admissionSequence_);
+            if (chunkBuildDataBatch->batchData.empty()) return;
+            admissionSequence_ += chunkBuildDataBatch->batchData.size();
+            for (const auto &data:chunkBuildDataBatch->batchData)
+                submittedBytes+=uint64_t(data->allVertexCount)*sizeof(vk::VertexFormat::PBRVertex)
+                    +uint64_t(data->allIndexCount)*sizeof(uint32_t)
+                    +uint64_t(data->lightCount)*sizeof(LightInfo);
+            fence=freeFences_.front();freeFences_.pop();
+            commandBuffer=freeCommandBuffers_.front();freeCommandBuffers_.pop();
         }
 
+        const auto batchBuildStart = std::chrono::steady_clock::now();
+        // Admission includes CPU batch assembly as well as GPU submission. This keeps a burst of
+        // light-only or otherwise upload-free batches from consuming an unbounded frame budget.
+        submittedThisFrame++;
+        for (const auto& data:chunkBuildDataBatch->batchData)
+            mcvr::chunkTrace::note("build-prepare",data->id,data->version,0,data->slotGeneration);
         chunkBuildDataBatch->build();
+        if (chunkPerformanceEnabled) {
+            chunkPerformance.batchBuildCount.fetch_add(1, std::memory_order_relaxed);
+            chunkPerformance.batchBuildCpuNs.fetch_add(elapsedNs(batchBuildStart),
+                                                        std::memory_order_relaxed);
+        }
 
         bool hasLightUploads = false;
         for (const auto &chunkBuildData : chunkBuildDataBatch->batchData) {
@@ -945,6 +1033,10 @@ void ChunkBuildScheduler::tryScheduleBatches(uint32_t maxBatchSize) {
             freeCommandBuffers_.push(commandBuffer);
 
             for (auto &chunkBuildData : chunkBuildDataBatch->batchData) {
+                if (!externalHandles_.isCurrent(static_cast<uint32_t>(chunkBuildData->id),
+                                                chunkBuildData->slotGeneration)) {
+                    continue;
+                }
                 if (!chunks_[chunkBuildData->id]->enqueue(chunkBuildData)) {
                     continue;
                 }
@@ -1032,8 +1124,10 @@ void ChunkBuildScheduler::tryScheduleBatches(uint32_t maxBatchSize) {
         }
 
         if (chunkBuildDataBatch->blasBatchBuilder != nullptr) {
+            device->checkpoint(commandBuffer->vkCommandBuffer(), "chunk.BLAS.build");
             chunkBuildDataBatch->blasBatchBuilder->submit(commandBuffer);
         }
+        device->checkpoint(commandBuffer->vkCommandBuffer(), "chunk.batch.end");
         commandBuffer->end();
 
         VkSubmitInfo vkSubmitInfo = {};
@@ -1041,12 +1135,42 @@ void ChunkBuildScheduler::tryScheduleBatches(uint32_t maxBatchSize) {
         vkSubmitInfo.commandBufferCount = 1;
         vkSubmitInfo.pCommandBuffers = &commandBuffer->vkCommandBuffer();
 
-        if (useSecondaryQueue_) {
-            vkQueueSubmit(device->secondaryQueue(), 1, &vkSubmitInfo, fence->vkFence());
-        } else {
-            vkQueueSubmit(device->mainVkQueue(), 1, &vkSubmitInfo, fence->vkFence());
+        const auto submitStart = std::chrono::steady_clock::now();
+        const VkResult submitResult =
+            useSecondaryQueue_ ? vkQueueSubmit(device->secondaryQueue(), 1, &vkSubmitInfo, fence->vkFence()) :
+                                 vkQueueSubmit(device->mainVkQueue(), 1, &vkSubmitInfo, fence->vkFence());
+        mcvr::diagnostics::device_loss::note("chunk-queue-submit", submitResult,
+            static_cast<uint32_t>(chunkBuildDataBatch->batchData.size()));
+        if (chunkPerformanceEnabled) {
+            chunkPerformance.batchSubmitCount.fetch_add(1, std::memory_order_relaxed);
+            chunkPerformance.batchSubmitCpuNs.fetch_add(elapsedNs(submitStart),
+                                                         std::memory_order_relaxed);
+        }
+        if (submitResult != VK_SUCCESS) {
+            framework->recordFailure(submitResult, "vkQueueSubmit(chunk build)");
+            commandBuffer->reset();
+            std::unique_lock<std::recursive_mutex> lock(mutex_);
+            freeFences_.push(fence);
+            freeCommandBuffers_.push(commandBuffer);
+            for (const auto &chunkBuildData : chunkBuildDataBatch->batchData) {
+                releaseChunkBuildDataStaging(chunkBuildData);
+            }
+            return;
         }
 
+        for (const auto &data:chunkBuildDataBatch->batchData)
+            mcvr::chunkTrace::note("build-submit",data->id,data->version,0,data->slotGeneration);
+        if (mcvr::chunkTrace::enabled) {
+            uint64_t bytes = 0;
+            for (const auto &buffer : {chunkBuildDataBatch->positionBuffer, chunkBuildDataBatch->materialBuffer,
+                                      chunkBuildDataBatch->indexBuffer})
+                if (buffer) bytes += buffer->size();
+            for (const auto &data : chunkBuildDataBatch->batchData)
+                if (data->lightBuffer) bytes += data->lightBuffer->size();
+            // Payload buffers submitted by this chunk batch; excludes AS scratch/output, TLAS and SDK memory.
+            mcvr::chunkTrace::note("upload-bytes",int64_t(bytes),int64_t(chunkBuildDataBatch->batchData.size()));
+        }
+        if (chunkPerformanceEnabled) chunkBuildDataBatch->submittedAt = std::chrono::steady_clock::now();
         std::unique_lock<std::recursive_mutex> lock(mutex_);
         buildingFences_.push_back(fence);
         buildingCommandBuffers_.push_back(commandBuffer);
@@ -1060,6 +1184,14 @@ uint32_t ChunkBuildScheduler::chunkBuildingBatchSize() {
 
 uint32_t ChunkBuildScheduler::chunkBuildingTotalBatches() {
     return chunkBuildingTotalBatches_;
+}
+
+size_t ChunkBuildScheduler::pendingBuildCount() const {
+    return 0; // Unsubmitted requests stay in queuedIndex_; there is no hidden partial batch.
+}
+
+size_t ChunkBuildScheduler::activeBatchCount() const {
+    return buildingBatches_.size();
 }
 
 float Chunk1::buildFactor(std::chrono::steady_clock::time_point currentTime, glm::vec3 cameraPos, glm::vec3 chunkPos) {
@@ -1080,8 +1212,9 @@ bool Chunk1::enqueue(std::shared_ptr<ChunkBuildData> chunkBuildData) {
 
     lastUpdate = std::chrono::steady_clock::now();
 
-    if (chunkBuildData->version > blasVersion) {
+    if (chunkBuildData->version == desiredVersion && chunkBuildData->version > blasVersion) {
         blasVersion = chunkBuildData->version;
+        mcvr::chunkTrace::note("publish",chunkBuildData->id,blasVersion,0,chunkBuildData->slotGeneration);
         x = chunkBuildData->x;
         y = chunkBuildData->y;
         z = chunkBuildData->z;
@@ -1121,6 +1254,10 @@ bool Chunk1::enqueue(std::shared_ptr<ChunkBuildData> chunkBuildData) {
 
         frr.retain(geometryGroupNames);
         geometryGroupNames = std::make_shared<std::vector<std::string>>(std::move(chunkBuildData->geometryGroupNames));
+
+        frr.retain(geometryMaterialFlags);
+        geometryMaterialFlags =
+            std::make_shared<std::vector<uint32_t>>(std::move(chunkBuildData->geometryMaterialFlags));
         return true;
     } else {
         frr.retain(chunkBuildData->blas);
@@ -1132,13 +1269,26 @@ bool Chunk1::enqueue(std::shared_ptr<ChunkBuildData> chunkBuildData) {
     }
 }
 
-void Chunk1::invalidate() {
+void Chunk1::markDirty(int64_t generation) {
+    if (generation >= 0) {
+        desiredVersion = std::max(desiredVersion, generation);
+        latestVersion = std::max(latestVersion, generation + 1);
+    }
+    lastUpdate = std::chrono::steady_clock::now();
+}
+
+void Chunk1::invalidate(int64_t generation) {
     auto framework = Renderer::instance().framework();
     auto &frr = framework->frameResourceRetainer();
 
     lastUpdate = std::chrono::steady_clock::now();
 
-    blasVersion = latestVersion++;
+    if (generation >= 0) {
+        markDirty(generation);
+    } else {
+        blasVersion = latestVersion++;
+        desiredVersion = blasVersion;
+    }
 
     frr.retain(blas);
     blas = nullptr;
@@ -1172,6 +1322,9 @@ void Chunk1::invalidate() {
 
     frr.retain(geometryGroupNames);
     geometryGroupNames = nullptr;
+
+    frr.retain(geometryMaterialFlags);
+    geometryMaterialFlags = nullptr;
 }
 
 void Chunk1::retainResources(FrameResourceRetainer &frr) {
@@ -1213,6 +1366,7 @@ std::shared_ptr<ChunkRenderData> Chunk1::tryGetValid() {
     ret->lightCount = lightCount;
     ret->geometryCount = geometryCount;
     ret->geometryGroupNames = geometryGroupNames;
+    ret->geometryMaterialFlags = geometryMaterialFlags;
 
     return ret;
 }
@@ -1276,13 +1430,14 @@ void Chunks::reset(uint32_t numChunks,
 
     auto framework = Renderer::instance().framework();
     auto device = framework->device();
-    vkQueueWaitIdle(device->mainVkQueue());
-    vkQueueWaitIdle(device->secondaryQueue());
+    if (framework->waitRenderQueueIdle() != VK_SUCCESS || framework->waitBackendQueueIdle() != VK_SUCCESS) { return; }
 
     sizeX_ = static_cast<int32_t>(sizeX);
     sizeY_ = static_cast<int32_t>(sizeY);
     sizeZ_ = static_cast<int32_t>(sizeZ);
     bottomSectionCoord_ = bottomSectionCoord;
+    primaryChunkCount_ = numChunks;
+    externalHandles_.reset(numChunks);
     chunkStorageSectionPos_ = glm::ivec3(0, bottomSectionCoord, 0);
 
     importantBLASBuilders_ = std::make_shared<std::vector<std::shared_ptr<vk::BLASBuilder>>>();
@@ -1306,7 +1461,7 @@ void Chunks::reset(uint32_t numChunks,
     uint32_t chunkBuildingBatchSize = Renderer::instance().options.chunkBuildingBatchSize;
     uint32_t chunkBuildingTotalBatches = Renderer::instance().options.chunkBuildingTotalBatches;
     chunkBuildScheduler_ =
-        ChunkBuildScheduler::create(queuedIndex_, chunks_, chunkBuildDatas_, mutex_, chunkPackedData_,
+        ChunkBuildScheduler::create(queuedIndex_, chunks_, chunkBuildDatas_, mutex_, chunkPackedData_, externalHandles_,
                                     chunkBuildingBatchSize, chunkBuildingTotalBatches);
 }
 
@@ -1315,12 +1470,12 @@ void Chunks::resetScheduler() {
 
     if (chunkBuildScheduler_ == nullptr) return;
 
-    chunkBuildScheduler_->waitAllBatchesFinish();
+    mcvr::failure::runCheckedStage([&] { chunkBuildScheduler_->waitAllBatchesFinish(); });
 
     uint32_t chunkBuildingBatchSize = Renderer::instance().options.chunkBuildingBatchSize;
     uint32_t chunkBuildingTotalBatches = Renderer::instance().options.chunkBuildingTotalBatches;
     chunkBuildScheduler_ =
-        ChunkBuildScheduler::create(queuedIndex_, chunks_, chunkBuildDatas_, mutex_, chunkPackedData_,
+        ChunkBuildScheduler::create(queuedIndex_, chunks_, chunkBuildDatas_, mutex_, chunkPackedData_, externalHandles_,
                                     chunkBuildingBatchSize, chunkBuildingTotalBatches);
 }
 
@@ -1328,7 +1483,7 @@ void Chunks::setCollectChunkEmission(bool collect) {
     std::unique_lock<std::recursive_mutex> lock(mutex_);
 
     if (chunkBuildScheduler_ != nullptr) {
-        chunkBuildScheduler_->waitAllBatchesFinish();
+        mcvr::failure::runCheckedStage([&] { chunkBuildScheduler_->waitAllBatchesFinish(); });
     }
 
     auto textures = Renderer::instance().textures();
@@ -1378,8 +1533,25 @@ void Chunks::resetFrame() {
     }
 }
 
-void Chunks::invalidateChunk(int id) {
+void Chunks::markChunkDirty(int64_t handle, int64_t generation) {
     std::unique_lock<std::recursive_mutex> lock(mutex_);
+    auto resolved = externalHandles_.resolve(handle);
+    if (!resolved) return;
+    const uint32_t id = *resolved;
+    chunks_[id]->markDirty(generation);
+    if (chunkBuildDatas_[id] != nullptr && chunkBuildDatas_[id]->version < generation) {
+        auto &frr = Renderer::instance().framework()->frameResourceRetainer();
+        frr.retain(chunkBuildDatas_[id]);
+        chunkBuildDatas_[id] = nullptr;
+        queuedIndex_.erase(id);
+    }
+}
+
+void Chunks::invalidateChunk(int64_t handle, int64_t generation) {
+    std::unique_lock<std::recursive_mutex> lock(mutex_);
+    auto resolved = externalHandles_.resolve(handle);
+    if (!resolved) return;
+    const uint32_t id = *resolved;
     auto framework = Renderer::instance().framework();
     auto &frr = framework->frameResourceRetainer();
 
@@ -1388,13 +1560,16 @@ void Chunks::invalidateChunk(int id) {
     frr.retain(chunkBuildDatas_[id]);
     chunkBuildDatas_[id] = nullptr;
 
-    chunks_[id]->invalidate();
+    chunks_[id]->invalidate(generation);
 
     storeChunkPackedData(chunkPackedData_, id, chunks_[id]->x, chunks_[id]->y, chunks_[id]->z, 0, 0, 0);
 }
 
-void Chunks::relocateChunk(int id, int x, int y, int z) {
+void Chunks::relocateChunk(int64_t handle, int x, int y, int z, int64_t generation) {
     std::unique_lock<std::recursive_mutex> lock(mutex_);
+    auto resolved = externalHandles_.resolve(handle);
+    if (!resolved) return;
+    const uint32_t id = *resolved;
     auto framework = Renderer::instance().framework();
     auto &frr = framework->frameResourceRetainer();
 
@@ -1406,15 +1581,32 @@ void Chunks::relocateChunk(int id, int x, int y, int z) {
     chunks_[id]->x = x;
     chunks_[id]->y = y;
     chunks_[id]->z = z;
-    chunks_[id]->invalidate();
+    chunks_[id]->invalidate(generation);
 
     storeChunkPackedData(chunkPackedData_, id, x, y, z, 0, 0, 0);
 }
 
 void Chunks::queueChunkBuild(ChunkBuildTask task) {
+    const auto inputStart = std::chrono::steady_clock::now();
+    const auto recordInputTiming = [&]() {
+        if (!chunkPerformanceEnabled) return;
+        chunkPerformance.buildInputCount.fetch_add(1, std::memory_order_relaxed);
+        chunkPerformance.buildInputCpuNs.fetch_add(elapsedNs(inputStart), std::memory_order_relaxed);
+    };
+    uint32_t slotGeneration = 0;
+    {
+        std::unique_lock<std::recursive_mutex> lock(mutex_);
+        auto resolved = externalHandles_.resolve(task.id);
+        if (!resolved) return;
+        task.id = *resolved;
+        slotGeneration = externalHandles_.generation(*resolved);
+        if (task.generation >= 0 && task.generation < chunks_[task.id]->desiredVersion) return;
+    }
+
     uint32_t allVertexCount = 0, allIndexCount = 0;
     std::vector<World::GeometryTypes> geometryTypes;
     std::vector<std::string> geometryGroupNames;
+    std::vector<uint32_t> geometryMaterialFlags;
     std::vector<std::vector<vk::VertexFormat::PBRVertex>> vertices;
     std::vector<std::vector<uint32_t>> indices;
 
@@ -1448,19 +1640,35 @@ void Chunks::queueChunkBuild(ChunkBuildTask task) {
         } else {
             geometryGroupNames.emplace_back("default");
         }
+        geometryMaterialFlags.push_back(task.geometryMaterialFlags == nullptr
+                                            ? 0u
+                                            : static_cast<uint32_t>(task.geometryMaterialFlags[i]));
 
         allVertexCount += geometryVertices.size();
         allIndexCount += geometryIndices.size();
     }
 
     std::unique_lock<std::recursive_mutex> lock(mutex_);
+    if (!externalHandles_.isCurrent(static_cast<uint32_t>(task.id), slotGeneration)
+        || (task.generation >= 0 && task.generation < chunks_[task.id]->desiredVersion)) {
+        recordInputTiming();
+        return;
+    }
 
-    const bool collectChunkEmission = Renderer::options.collectChunkEmission;
+    const bool collectChunkEmission = Renderer::options.collectChunkEmission && task.collectEmission;
+    const int64_t buildVersion = task.generation >= 0
+        ? task.generation
+        : chunks_[task.id]->latestVersion++;
+    chunks_[task.id]->desiredVersion = std::max(chunks_[task.id]->desiredVersion, buildVersion);
     std::shared_ptr<ChunkBuildData> chunkBuildData =
-        ChunkBuildData::create(task.id, task.x, task.y, task.z, chunks_[task.id]->latestVersion++,
+        ChunkBuildData::create(task.id, task.x, task.y, task.z, buildVersion,
                                collectChunkEmission, allVertexCount, allIndexCount,
                                static_cast<uint32_t>(vertices.size()), std::move(geometryTypes),
-                               std::move(geometryGroupNames), std::move(vertices), std::move(indices));
+                               std::move(geometryGroupNames), std::move(geometryMaterialFlags),
+                               std::move(vertices), std::move(indices));
+    chunkBuildData->slotGeneration = slotGeneration;
+    chunkBuildData->priority = task.priority;
+    mcvr::chunkTrace::note("native-enqueue",task.id,buildVersion,0,slotGeneration);
 
     if (collectChunkEmission && (Renderer::instance().textures() != nullptr)) {
         auto textures = Renderer::instance().textures();
@@ -1487,6 +1695,7 @@ void Chunks::queueChunkBuild(ChunkBuildTask task) {
         if (chunkBuildData->blasBuilder != nullptr) { importantBLASBuilders_->push_back(chunkBuildData->blasBuilder); }
 
         if (!chunks_[task.id]->enqueue(chunkBuildData)) {
+            recordInputTiming();
             return;
         }
 
@@ -1498,12 +1707,104 @@ void Chunks::queueChunkBuild(ChunkBuildTask task) {
         queuedIndex_.insert(task.id);
         chunkBuildDatas_[task.id] = chunkBuildData;
     }
+    recordInputTiming();
 }
 
-bool Chunks::isChunkReady(int64_t id) {
+int64_t Chunks::allocateExternalChunk() {
     std::unique_lock<std::recursive_mutex> lock(mutex_);
+
+    const auto allocation = externalHandles_.allocate(static_cast<uint32_t>(chunks_.size()));
+    const uint32_t id = allocation.slot;
+    if (allocation.reused) {
+        chunks_[id] = Chunk1::create();
+        chunkBuildDatas_[id] = nullptr;
+        chunkPackedData_[id] = ChunkPackedData{};
+    } else {
+        chunks_.push_back(Chunk1::create());
+        chunkBuildDatas_.push_back(nullptr);
+        chunkPackedData_.emplace_back();
+    }
+
+    if (!allocation.reused && Renderer::options.collectChunkEmission
+        && !chunkPackedDataBuffers_.empty()) {
+        auto &frr = Renderer::instance().framework()->frameResourceRetainer();
+        for (auto &buffer : chunkPackedDataBuffers_) {
+            frr.retain(buffer);
+        }
+        allocateChunkPackedDataBuffers();
+    }
+
+    return allocation.handle;
+}
+
+void Chunks::updateExternalChunkTransform(int64_t handle, const glm::dmat4 &transform) {
+    std::unique_lock<std::recursive_mutex> lock(mutex_);
+    auto resolved = externalHandles_.resolve(handle);
+    if (!resolved || *resolved < primaryChunkCount_) return;
+    const uint32_t id = *resolved;
+
+    chunks_[id]->hasCustomTransform = true;
+    chunks_[id]->customTransform = transform;
+}
+
+void Chunks::releaseExternalChunk(int64_t handle) {
+    std::unique_lock<std::recursive_mutex> lock(mutex_);
+    auto resolved = externalHandles_.resolve(handle);
+    if (!resolved || *resolved < primaryChunkCount_) return;
+    const uint32_t id = *resolved;
+
+    queuedIndex_.erase(id);
+    auto &frr = Renderer::instance().framework()->frameResourceRetainer();
+    frr.retain(chunkBuildDatas_[id]);
+    chunkBuildDatas_[id] = nullptr;
+    chunks_[id]->invalidate();
+    chunks_[id]->hasCustomTransform = false;
+    chunkPackedData_[id] = ChunkPackedData{};
+    externalHandles_.release(handle);
+}
+
+bool Chunks::isChunkReady(int64_t handle) {
+    std::unique_lock<std::recursive_mutex> lock(mutex_);
+    auto resolved = externalHandles_.resolve(handle);
+    if (!resolved) return false;
+    const uint32_t id = *resolved;
     auto chunkRenderData = chunks_[id]->tryGetValid();
     return chunkRenderData->blas != nullptr;
+}
+
+uint32_t Chunks::countReadyPrimaryChunks() {
+    std::unique_lock<std::recursive_mutex> lock(mutex_);
+    uint32_t ready = 0;
+    const size_t count = std::min(static_cast<size_t>(primaryChunkCount_), chunks_.size());
+    for (size_t i = 0; i < count; i++) {
+        if (chunks_[i] != nullptr && chunks_[i]->tryGetValid()->blas != nullptr) {
+            ready++;
+        }
+    }
+    return ready;
+}
+
+std::string Chunks::performanceSnapshot() {
+    if (!chunkPerformanceEnabled) return "disabled (set RADIANCE_CHUNK_PERF=1)";
+    std::unique_lock<std::recursive_mutex> lock(mutex_);
+    auto take = [](std::atomic<uint64_t> &value) {
+        return value.exchange(0, std::memory_order_relaxed);
+    };
+    std::ostringstream result;
+    result << "build_input_count=" << take(chunkPerformance.buildInputCount)
+           << "; build_input_cpu_ns=" << take(chunkPerformance.buildInputCpuNs)
+           << "; batch_build_count=" << take(chunkPerformance.batchBuildCount)
+           << "; batch_build_cpu_ns=" << take(chunkPerformance.batchBuildCpuNs)
+           << "; batch_submit_count=" << take(chunkPerformance.batchSubmitCount)
+           << "; batch_submit_cpu_ns=" << take(chunkPerformance.batchSubmitCpuNs)
+           << "; batch_complete_count=" << take(chunkPerformance.batchCompleteCount)
+           << "; batch_queue_gpu_wall_ns=" << take(chunkPerformance.batchQueueGpuWallNs)
+           << "; queued_builds=" << queuedIndex_.size()
+           << "; pending_batch_builds="
+           << (chunkBuildScheduler_ == nullptr ? 0 : chunkBuildScheduler_->pendingBuildCount())
+           << "; active_gpu_batches="
+           << (chunkBuildScheduler_ == nullptr ? 0 : chunkBuildScheduler_->activeBatchCount());
+    return result.str();
 }
 
 void Chunks::close() {
@@ -1524,6 +1825,8 @@ void Chunks::close() {
     sizeZ_ = 0;
     bottomSectionCoord_ = 0;
     chunkStorageSectionPos_ = glm::ivec3(0);
+    primaryChunkCount_ = 0;
+    externalHandles_.reset(0);
 }
 
 std::recursive_mutex &Chunks::mutex() {

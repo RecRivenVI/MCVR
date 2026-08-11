@@ -55,7 +55,6 @@ class PostRenderModule : public WorldModule, public SharedObject<PostRenderModul
     static constexpr int weatherPostFlag = 0b0001;
     static constexpr int particlePostFlag = 0b0010;
     static constexpr int textPostFlag = 0b0100;
-    static constexpr int nameTagPostFlag = 0b1000;
 
     static constexpr std::string_view TARGET_LDR = "out:ldr";
     static constexpr std::string_view TARGET_FIRST_HIT_DEPTH = "out:first_hit_depth";
@@ -109,8 +108,6 @@ class PostRenderModule : public WorldModule, public SharedObject<PostRenderModul
     std::vector<std::shared_ptr<vk::Framebuffer>> worldPostColorToDepthFramebuffers_;
     std::shared_ptr<vk::GraphicsPipeline> worldPostColorToDepthPipeline_;
 
-    // world star field
-    std::shared_ptr<vk::DeviceLocalBuffer> starFieldVertexBuffer;
     std::shared_ptr<vk::Shader> fullScreenVertexShader_;
 
     std::shared_ptr<ShaderPack> shaderPack_;
@@ -127,11 +124,6 @@ class PostRenderModule : public WorldModule, public SharedObject<PostRenderModul
     std::vector<uint8_t> postRenderedInitialized_;
 
     std::vector<std::shared_ptr<WorldModuleContext>> contexts_;
-
-    uint32_t starCount_ = 3000;
-    float starSizeMin_ = 0.5f;
-    float starSizeMax_ = 0.7f;
-    float starRadius_ = 400.0f;
 
     uint32_t width_, height_;
 };

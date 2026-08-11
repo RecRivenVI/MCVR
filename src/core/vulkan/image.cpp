@@ -1,6 +1,11 @@
 #define STB_IMAGE_IMPLEMENTATION
-#include "core/vulkan/image.hpp"
 
+#include "core/logging.hpp"
+#include "core/failure_state.hpp"
+#include "core/vulkan/image.hpp"
+#include "core/vulkan/image_format.hpp"
+
+#include "core/diagnostics/alloc_trace.hpp"
 #include "core/vulkan/buffer.hpp"
 #include "core/vulkan/command.hpp"
 #include "core/vulkan/device.hpp"
@@ -9,14 +14,29 @@
 #include <cstring>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 
-std::ostream &imageCout() {
-    return std::cout << "[Image] ";
+auto imageCout() {
+    return mcvr::log::info("Image");
 }
 
-std::ostream &imageCerr() {
-    return std::cerr << "[Image] ";
+auto imageCerr() {
+    return mcvr::log::error("Image");
 }
+
+namespace {
+// Diagnostics must never throw, especially from destructors: formats without a known
+// byte size simply contribute zero bytes.
+size_t tracedImageBytes(uint32_t width, uint32_t height, uint32_t depth, uint32_t layer,
+                        VkFormat format) noexcept {
+    try {
+        return static_cast<size_t>(width) * static_cast<size_t>(height) * static_cast<size_t>(depth) *
+               static_cast<size_t>(layer) * vk::formatToByte(format);
+    } catch (...) {
+        return 0;
+    }
+}
+} // namespace
 
 VkImageAspectFlags vk::DeviceLocalImage::imageAspectMask(VkImageUsageFlags usage) {
     return (usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0 ? VK_IMAGE_ASPECT_DEPTH_BIT :
@@ -56,14 +76,17 @@ vk::SwapchainImage::SwapchainImage(
     createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
     createInfo.subresourceRange = wholeColorSubresourceRange;
 
-    if (vkCreateImageView(device_->vkDevice(), &createInfo, nullptr, &imageViews_[0]) != VK_SUCCESS) {
+    if (const auto result = vkCreateImageView(device_->vkDevice(), &createInfo, nullptr, &imageViews_[0]);
+        result != VK_SUCCESS) {
         imageCerr() << "failed to create image view for image" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::raise(mcvr::failure::Kind::runtime, result, "vkCreateImageView(swapchain)");
     }
 }
 
 vk::SwapchainImage::~SwapchainImage() {
-    for (int i = 0; i < imageViews_.size(); i++) { vkDestroyImageView(device_->vkDevice(), imageViews_[0], nullptr); }
+    for (const auto imageView : imageViews_) {
+        if (imageView != VK_NULL_HANDLE) { vkDestroyImageView(device_->vkDevice(), imageView, nullptr); }
+    }
 }
 
 uint32_t vk::SwapchainImage::width() {
@@ -392,18 +415,18 @@ vk::DeviceLocalImage::DeviceLocalImage(std::shared_ptr<Device> device,
       ,
       debugName(debugName)
 #endif
-{
+    {
     if (depth_ == 0) {
         imageCerr() << "image depth must be at least 1" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::invariant("DeviceLocalImage::DeviceLocalImage", "image depth must be at least one");
     }
     if (depth_ > 1 && layer_ != 1) {
         imageCerr() << "3d images do not support array layers in DeviceLocalImage" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::invariant("DeviceLocalImage::DeviceLocalImage", "3D image has array layers");
     }
     if (depth_ > 1 && (imageCreateFlags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) != 0) {
         imageCerr() << "3d images cannot be cube compatible" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::invariant("DeviceLocalImage::DeviceLocalImage", "3D image is cube compatible");
     }
 
 #ifdef DEBUG
@@ -425,10 +448,10 @@ vk::DeviceLocalImage::DeviceLocalImage(std::shared_ptr<Device> device,
         allocationInfo.flags =
             VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
 
-        if (vmaCreateBuffer(vma_->allocator(), &bufferInfo, &allocationInfo, &stagingBuffer_, &stagingAllocation_,
-                            &stagingAllocationInfo_) != VK_SUCCESS) {
+        if (const auto result = vmaCreateBuffer(vma_->allocator(), &bufferInfo, &allocationInfo, &stagingBuffer_,
+                &stagingAllocation_, &stagingAllocationInfo_); result != VK_SUCCESS) {
             imageCerr() << "failed to create staging buffer" << std::endl;
-            exit(EXIT_FAILURE);
+            mcvr::failure::raise(mcvr::failure::Kind::runtime, result, "vmaCreateBuffer(image staging)");
         }
         mappedPtr_ = stagingAllocationInfo_.pMappedData;
     }
@@ -450,11 +473,12 @@ vk::DeviceLocalImage::DeviceLocalImage(std::shared_ptr<Device> device,
     VmaAllocationCreateInfo allocationInfo{};
     allocationInfo.flags = allocationFlags_;
     allocationInfo.usage = vmaUsage;
-    if (vmaCreateImage(vma_->allocator(), &imageInfo, &allocationInfo, &image_, &allocation_, &allocationInfo_) !=
-        VK_SUCCESS) {
+    if (const auto result = vmaCreateImage(vma_->allocator(), &imageInfo, &allocationInfo, &image_, &allocation_,
+            &allocationInfo_); result != VK_SUCCESS) {
         imageCerr() << "failed to create image" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::raise(mcvr::failure::Kind::runtime, result, "vmaCreateImage");
     }
+    allocTraceTag_ = mcvr::diag::recordAllocCreate("image", tracedImageBytes(width_, height_, depth_, layer_, format_));
 
     VkImageViewCreateInfo createInfo = {};
     auto makeDefaultImageViewType = [](uint32_t depth, uint32_t layer) {
@@ -471,9 +495,10 @@ vk::DeviceLocalImage::DeviceLocalImage(std::shared_ptr<Device> device,
     createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
     createInfo.subresourceRange = makeImageSubresourceRange(imageAspectMask(usage_), mipLevels_, depth_, layer_);
 
-    if (vkCreateImageView(device_->vkDevice(), &createInfo, nullptr, &imageViews_[0]) != VK_SUCCESS) {
+    if (const auto result = vkCreateImageView(device_->vkDevice(), &createInfo, nullptr, &imageViews_[0]);
+        result != VK_SUCCESS) {
         imageCerr() << "failed to create image view for image" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::raise(mcvr::failure::Kind::runtime, result, "vkCreateImageView");
     }
 
 #ifdef DEBUG
@@ -482,9 +507,16 @@ vk::DeviceLocalImage::DeviceLocalImage(std::shared_ptr<Device> device,
 }
 
 vk::DeviceLocalImage::~DeviceLocalImage() {
-    for (int i = 0; i < imageViews_.size(); i++) { vkDestroyImageView(device_->vkDevice(), imageViews_[i], nullptr); }
-    vmaDestroyBuffer(vma_->allocator(), stagingBuffer_, stagingAllocation_);
-    vmaDestroyImage(vma_->allocator(), image_, allocation_);
+    mcvr::diag::recordAllocDestroy("image", tracedImageBytes(width_, height_, depth_, layer_, format_), allocTraceTag_);
+    for (const auto imageView : imageViews_) {
+        if (imageView != VK_NULL_HANDLE) { vkDestroyImageView(device_->vkDevice(), imageView, nullptr); }
+    }
+    if (stagingBuffer_ != VK_NULL_HANDLE || stagingAllocation_ != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(vma_->allocator(), stagingBuffer_, stagingAllocation_);
+    }
+    if (image_ != VK_NULL_HANDLE || allocation_ != VK_NULL_HANDLE) {
+        vmaDestroyImage(vma_->allocator(), image_, allocation_);
+    }
 
 #ifdef DEBUG
     imageCout() << "device local image (" << debugName << ") deconstructed" << std::endl;
@@ -495,7 +527,8 @@ void vk::DeviceLocalImage::uploadToStagingBuffer(void *src) {
     if (!persistStaging_) {
         if (stagingBuffer_ != VK_NULL_HANDLE || stagingAllocation_ != VK_NULL_HANDLE || mappedPtr_ != nullptr) {
             imageCerr() << "if not persist staging, the staging buffer should not exist!" << std::endl;
-            exit(EXIT_FAILURE);
+            mcvr::failure::invariant("DeviceLocalImage::uploadToStagingBuffer",
+                                     "non-persistent staging state is already allocated");
         }
 
         // staging buffer
@@ -508,10 +541,10 @@ void vk::DeviceLocalImage::uploadToStagingBuffer(void *src) {
         allocationInfo.flags =
             VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
 
-        if (vmaCreateBuffer(vma_->allocator(), &bufferInfo, &allocationInfo, &stagingBuffer_, &stagingAllocation_,
-                            &stagingAllocationInfo_) != VK_SUCCESS) {
+        if (const auto result = vmaCreateBuffer(vma_->allocator(), &bufferInfo, &allocationInfo, &stagingBuffer_,
+                &stagingAllocation_, &stagingAllocationInfo_); result != VK_SUCCESS) {
             imageCerr() << "failed to create staging buffer" << std::endl;
-            exit(EXIT_FAILURE);
+            mcvr::failure::raise(mcvr::failure::Kind::runtime, result, "vmaCreateBuffer(image upload staging)");
         }
         mappedPtr_ = stagingAllocationInfo_.pMappedData;
     }
@@ -574,6 +607,10 @@ uint32_t vk::DeviceLocalImage::layer() {
     return layer_;
 }
 
+uint32_t vk::DeviceLocalImage::mipLevels() const {
+    return mipLevels_;
+}
+
 VkFormat &vk::DeviceLocalImage::vkFormat() {
     return format_;
 }
@@ -599,14 +636,15 @@ void *vk::DeviceLocalImage::mappedPtr() {
 }
 
 VkImageSubresourceRange vk::DeviceLocalImage::fullSubresourceRange() const {
-    return makeImageSubresourceRange(imageAspectMask(usage_), mipLevels_, depth_, layer_);
+    return formatSubresourceRange(format_, mipLevels_, depth_, layer_);
 }
 
 void vk::DeviceLocalImage::addImageView(VkImageViewCreateInfo info) {
     VkImageView vkImageView{};
-    if (vkCreateImageView(device_->vkDevice(), &info, nullptr, &vkImageView) != VK_SUCCESS) {
+    if (const auto result = vkCreateImageView(device_->vkDevice(), &info, nullptr, &vkImageView);
+        result != VK_SUCCESS) {
         imageCerr() << "failed to create image view for image" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::raise(mcvr::failure::Kind::runtime, result, "vkCreateImageView(additional)");
     }
     imageViews_.push_back(vkImageView);
 }
@@ -662,12 +700,12 @@ VkSamplerAddressMode vk::Sampler::vkAddressMode() {
     return addressMode_;
 }
 
-std::ostream &imageLoaderCout() {
-    return std::cout << "[ImageLoader] ";
+auto imageLoaderCout() {
+    return mcvr::log::info("ImageLoader");
 }
 
-std::ostream &imageLoaderCerr() {
-    return std::cerr << "[ImageLoader] ";
+auto imageLoaderCerr() {
+    return mcvr::log::error("ImageLoader");
 }
 
 // 0~1 float
@@ -709,7 +747,7 @@ vk::ImageLoader::ImageLoader(std::vector<std::string> imagePaths, uint32_t force
                 imageLoaderCerr() << "current: [width=" << currentWidth << ", height=" << currentHeight << "]"
                                   << std::endl;
                 imageLoaderCerr() << "existing: [width=" << width_ << ", height=" << height_ << "]" << std::endl;
-                exit(EXIT_FAILURE);
+                mcvr::failure::invariant("ImageLoader::load", "images have different dimensions");
             }
 #ifdef DEBUG
             imageLoaderCout() << "Loaded image from " << imagePaths_[i] << " with width: " << currentWidth
@@ -719,7 +757,7 @@ vk::ImageLoader::ImageLoader(std::vector<std::string> imagePaths, uint32_t force
 
         if (forceChannel < channel) {
             imageLoaderCerr() << "Cannot compress image" << std::endl;
-            exit(EXIT_FAILURE);
+            mcvr::failure::invariant("ImageLoader::load", "requested channel compression is unsupported");
         }
 
         for (int h = 0; h < height_; h++) {
@@ -744,7 +782,7 @@ vk::ImageLoader::ImageLoader(std::vector<std::string> imagePaths, uint32_t force
                 } else {
                     imageLoaderCerr() << "Force channel of " << forceChannel << " is not support for channel "
                                       << channel << std::endl;
-                    exit(EXIT_FAILURE);
+                    mcvr::failure::invariant("ImageLoader::load", "requested forced channel count is unsupported");
                 }
             }
         }

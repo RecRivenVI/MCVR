@@ -6,7 +6,7 @@
 #endif
 
 const int VPT_PRIMARY_TRACE_STEP_LIMIT = 2;
-const uint VPT_RAY_FLAGS = gl_RayFlagsNoneEXT;
+const uint VPT_RAY_FLAGS = gl_RayFlagsCullBackFacingTrianglesEXT;
 const uint VPT_TRANSPARENT_SPLIT_MODE_DETERMINISTIC = 0u;
 const float VPT_FFT_WATER_ORIGIN_BIAS = 0.0006;
 const float VPT_PARALLAX_MIN_VIEW_DOT = 0.001;

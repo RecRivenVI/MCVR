@@ -12,7 +12,16 @@
 layout(location = 0) rayPayloadInEXT MainRay mainRay;
 hitAttributeEXT vec2 attribs;
 
+layout(set=1,binding=1) readonly buffer FaceOffsets { uint offsets[]; } blasOffsets;
+layout(set=1,binding=10) readonly buffer FaceAppearances { InstanceAppearance values[]; } instanceAppearances;
+#include "util/material_faces.glsl"
 void main() {
+    if (!acceptsMaterialFace(instanceAppearances.values[blasOffsets.offsets[gl_InstanceCustomIndexEXT] + gl_GeometryIndexEXT].materialFlags,
+                             gl_HitKindEXT == gl_HitKindFrontFacingTriangleEXT)) {
+        ignoreIntersectionEXT;
+        return;
+    }
+
     if (VPT_CLOUD_MODE != 1u) {
         ignoreIntersectionEXT;
         return;

@@ -5,11 +5,13 @@
 #include "core/render/buffers.hpp"
 #include "core/render/chunks.hpp"
 #include "core/render/entities.hpp"
+#include "core/render/instancing.hpp"
 #include "core/render/render_framework.hpp"
 #include "core/render/renderer.hpp"
 
 World::World(std::shared_ptr<Framework> framework)
-    : chunks_(Chunks::create(framework)), entities_(Entities::create(framework)) {}
+    : chunks_(Chunks::create(framework)), entities_(Entities::create(framework)),
+      instancing_(Instancing::create(framework)) {}
 
 void World::resetFrame() {}
 
@@ -25,6 +27,8 @@ std::shared_ptr<Entities> World::entities() {
     return entities_;
 }
 
+std::shared_ptr<Instancing> World::instancing() { return instancing_; }
+
 void World::setCameraPos(glm::dvec3 cameraPos) {
     cameraPos_ = cameraPos;
 }
@@ -37,4 +41,5 @@ void World::close() {
     shouldRenderWorld_ = false;
     chunks_->close();
     entities_->close();
+    instancing_->close();
 }

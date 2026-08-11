@@ -5,6 +5,7 @@
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
+#include "util/surface_overlay.glsl"
 #include "util/disney.glsl"
 #include "util/alpha_mode.glsl"
 #include "util/random.glsl"
@@ -15,6 +16,8 @@
 #include "common/shared.hpp"
 
 layout(set = 0, binding = 0) uniform sampler2D textures[];
+
+#include "util/emissive_overlay.glsl"
 
 layout(set = 1, binding = 0) uniform accelerationStructureEXT topLevelAS;
 
@@ -66,6 +69,7 @@ layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Ind
 indexBuffer;
 
 #include "util/vertex.glsl"
+#include "util/glint_material.glsl"
 
 layout(location = 0) rayPayloadInEXT MainRay mainRay;
 hitAttributeEXT vec2 attribs;
@@ -100,6 +104,7 @@ void main() {
     }
 
     bool useColorLayer = hasColorLayer(m0.packedData);
+    bool colorLayerMix = hasColorLayerMix(m0.packedData);
     vec4 colorLayerValue;
     if (useColorLayer) {
         colorLayerValue = baryCoords.x * m0.colorLayer + baryCoords.y * m1.colorLayer + baryCoords.z * m2.colorLayer;
@@ -116,7 +121,8 @@ void main() {
     vec4 albedoValue;
     vec4 specularValue;
     vec4 normalValue;
-    vec2 textureUV;
+    vec2 textureUV = vec2(0.0);
+    float lod = 0.0;
     if (useTexture) {
         int specularTextureID = mapping.entries[textureID].specular;
         int normalTextureID = mapping.entries[textureID].normal;
@@ -128,10 +134,13 @@ void main() {
         float coneRadiusWorld = mainRay.coneWidth + gl_HitTEXT * mainRay.coneSpread;
         vec3 dposdu, dposdv;
         computedposduDv(p0.pos, p1.pos, p2.pos, m0.textureUV, m1.textureUV, m2.textureUV, dposdu, dposdv);
-        float lod = lodWithCone(textures[nonuniformEXT(textureID)], textureUV, coneRadiusWorld, dposdu, dposdv);
-
+        lod = lodWithCone(textures[nonuniformEXT(textureID)], textureUV, coneRadiusWorld, dposdu, dposdv);
         albedoValue = sampleTexture(textures[nonuniformEXT(textureID)], textureUV, lod, false);
-        albedoValue.a = resolveSurfaceAlpha(albedoValue.a * colorLayerValue.a, alphaMode);
+        float surfaceAlpha = colorLayerMix ? albedoValue.a : albedoValue.a * colorLayerValue.a;
+        albedoValue.a = resolveSurfaceAlpha(surfaceAlpha, alphaMode);
+        if (isCoverageAlphaMode(alphaMode) || isAdditiveAlphaMode(alphaMode)) {
+            albedoValue.a = 1.0;
+        }
         if (specularTextureID >= 0) {
             specularValue = sampleTexture(textures[nonuniformEXT(specularTextureID)], textureUV, lod, false);
         } else {
@@ -152,23 +161,31 @@ void main() {
     bool useGlint = hasGlint(m0.packedData);
     uint glintTexture = m0.glintTexture;
     vec2 glintUV = baryCoords.x * m0.glintUV + baryCoords.y * m1.glintUV + baryCoords.z * m2.glintUV;
-    glintUV = (worldUBO.textureMat * vec4(glintUV, 0.0, 1.0)).xy;
+    glintUV = transformGlintUv(worldUBO.textureMat, glintUV, m0.packedData);
     vec3 glint = useGlint ? sampleTexture(textures[nonuniformEXT(glintTexture)], glintUV, false).rgb : vec3(0.0);
     glint = glint * glint;
 
     bool useOverlay = hasOverlay(m0.packedData);
-    vec3 tint = albedoValue.rgb * colorLayer + glint;
+    vec3 baseTint = colorLayerMix ?
+                        applySurfaceOverlay(albedoValue.rgb, colorLayer, colorLayerValue.a) :
+                        albedoValue.rgb * colorLayer;
+    vec3 tint = baseTint;
     if (useOverlay) {
         ivec2 overlayUV = m0.overlayUV;
         vec4 overlayColor = sampleTexture(textures[nonuniformEXT(worldUBO.overlayTextureID)], overlayUV, 0, false);
-        tint = mix(overlayColor.rgb, albedoValue.rgb * colorLayer, overlayColor.a) + glint;
+        tint = applySurfaceOverlay(baseTint, overlayColor.rgb, 1.0 - overlayColor.a);
     }
 
     albedoValue = vec4(tint, albedoValue.a);
-    LabPBRMat mat = convertLabPBRMaterial(albedoValue, specularValue, normalValue);
+    LabPBRMat mat = convertLabPBRMaterial(albedoValue, specularValue, normalValue,
+                                          isTransmissionAlphaMode(alphaMode));
+    vec3 glintRadiance = applyGlintMaterialLayer(mat, glint);
 
     // add glowing radiance
     mainRay.radiance += 12 * tint * mat.emission * mainRay.throughput;
+    mainRay.radiance += tint * albedoEmission * mainRay.throughput;
+    mainRay.radiance += sampleEmissiveOverlay(m0.emissiveOverlayTextureID, textureUV, lod) * mainRay.throughput;
+    mainRay.radiance += glintRadiance * mainRay.throughput;
     mainRay.hitT = gl_HitTEXT;
     mainRay.normal = vec3(0.0);
     rayStoreMaterial(mainRay, albedoValue, mat.f0, mat.roughness, mat.metallic, mat.transmission, mat.ior, mat.emission);

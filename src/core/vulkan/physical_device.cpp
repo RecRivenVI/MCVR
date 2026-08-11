@@ -1,17 +1,20 @@
 #include "core/vulkan/physical_device.hpp"
 
+#include "core/logging.hpp"
+#include "core/failure_state.hpp"
+
 #include "core/vulkan/instance.hpp"
 #include "core/vulkan/window.hpp"
 
 #include <iostream>
 #include <vector>
 
-std::ostream &physicalDeviceCout() {
-    return std::cout << "[PhysicalDevice] ";
+auto physicalDeviceCout() {
+    return mcvr::log::info("PhysicalDevice");
 }
 
-std::ostream &physicalDeviceCerr() {
-    return std::cerr << "[PhysicalDevice] ";
+auto physicalDeviceCerr() {
+    return mcvr::log::error("PhysicalDevice");
 }
 
 bool isDeviceSuitable(VkPhysicalDevice device) {
@@ -62,15 +65,20 @@ bool isDeviceSuitable(VkPhysicalDevice device) {
 
 void vk::PhysicalDevice::findPhysicalDevice() {
     uint32_t deviceCount = 0;
-    if (vkEnumeratePhysicalDevices(instance_->vkInstance(), &deviceCount, nullptr) != VK_SUCCESS || deviceCount == 0) {
+    const auto countResult = vkEnumeratePhysicalDevices(instance_->vkInstance(), &deviceCount, nullptr);
+    if (countResult != VK_SUCCESS || deviceCount == 0) {
         physicalDeviceCerr() << "failed to get number of physical devices" << std::endl;
-        exit(1);
+        mcvr::failure::raise(mcvr::failure::Kind::initialization,
+                             countResult == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : countResult,
+                             "vkEnumeratePhysicalDevices(count)");
     }
 
     std::vector<VkPhysicalDevice> devices(deviceCount);
-    if (vkEnumeratePhysicalDevices(instance_->vkInstance(), &deviceCount, devices.data()) != VK_SUCCESS) {
+    if (const auto result = vkEnumeratePhysicalDevices(instance_->vkInstance(), &deviceCount, devices.data());
+        result != VK_SUCCESS) {
         physicalDeviceCerr() << "failed to retrieve physical devices" << std::endl;
-        exit(1);
+        mcvr::failure::raise(mcvr::failure::Kind::initialization, result,
+                             "vkEnumeratePhysicalDevices(list)");
     }
 
     // find the first supported physical device
@@ -103,7 +111,8 @@ void vk::PhysicalDevice::findPhysicalDevice() {
 
     // if no supported physical device is found
     physicalDeviceCerr() << "No suitable physical device found!" << std::endl;
-    exit(EXIT_FAILURE);
+    mcvr::failure::raise(mcvr::failure::Kind::initialization, VK_ERROR_FEATURE_NOT_PRESENT,
+                         "selectPhysicalDevice");
 }
 
 vk::PhysicalDevice::PhysicalDevice(std::shared_ptr<Instance> instance, std::shared_ptr<Window> window)
@@ -152,7 +161,8 @@ void vk::PhysicalDevice::findQueueFamilies() {
 
     if (queueFamilyCount == 0) {
         physicalDeviceCerr() << "Physical device has no queue families!" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::raise(mcvr::failure::Kind::initialization, VK_ERROR_INITIALIZATION_FAILED,
+                             "vkGetPhysicalDeviceQueueFamilyProperties(no queues)");
     }
 
     std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
@@ -218,12 +228,14 @@ void vk::PhysicalDevice::findQueueFamilies() {
 
     if (mainQueueIndex_ == -1) {
         physicalDeviceCerr() << "No queue family that supports graphics, compute and transfer found." << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::raise(mcvr::failure::Kind::initialization, VK_ERROR_FEATURE_NOT_PRESENT,
+                             "selectMainQueueFamily");
     }
 
     if (secondaryQueueIndex_ == -1) {
         physicalDeviceCerr() << "No queue family that supports graphics, compute and transfer found." << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::raise(mcvr::failure::Kind::initialization, VK_ERROR_FEATURE_NOT_PRESENT,
+                             "selectSecondaryQueueFamily");
     }
 }
 

@@ -1,3 +1,5 @@
+#include "core/logging.hpp"
+#include "core/failure_state.hpp"
 #include "core/vulkan/sbt.hpp"
 
 #include "core/vulkan/buffer.hpp"
@@ -27,7 +29,7 @@ vk::SBT::SBT(std::shared_ptr<PhysicalDevice> physicalDevice,
     uint32_t handleAlignment = rayTracingProperties.shaderGroupHandleAlignment;
     baseAlignment_ = rayTracingProperties.shaderGroupBaseAlignment;
     #ifdef DEBUG
-    std::cout << "handleSize: " << handleSize_ << " handleAlignment: " << handleAlignment
+    mcvr::log::info("Sbt") << "handleSize: " << handleSize_ << " handleAlignment: " << handleAlignment
               << " baseAlignment: " << baseAlignment_ << std::endl;
               #endif
     uint32_t groupCount = 1 + missCount + hitCount; // RayGen(1) + Miss + HitGroup
@@ -87,8 +89,8 @@ void vk::SBT::uploadStaticSBT(std::shared_ptr<CommandBuffer> commandBuffer) {
 void vk::SBT::setupHitSBT(std::vector<uint32_t> &hitGroupIndices, std::shared_ptr<CommandBuffer> commandBuffer) {
     VkDeviceSize rhitSBTSize = hitGroupIndices.size() * alignedHandleSize_;
     if (rhitSBTSize == 0) {
-        std::cerr << "Hit group should contains something!" << std::endl;
-        exit(1);
+        mcvr::log::error("Sbt") << "Hit group should contains something!" << std::endl;
+        mcvr::failure::invariant("SBT::setupHitSBT", "hit group list is empty");
     }
 
     std::vector<uint8_t> cachedRhitSBT(rhitSBTSize, 0);

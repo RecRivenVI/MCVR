@@ -145,8 +145,8 @@ void main() {
     shadowRay.throughput = vec3(1.0);
     shadowRay.insideBoat = 0u;
     shadowRay.pad0 = 0u;
-    traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT,
-                WORLD_MASK, // masks
+    traceRayEXT(topLevelAS, gl_RayFlagsCullBackFacingTrianglesEXT,
+                WORLD_MASK | PRIORITY_MASK, // masks
                 0,          // sbtRecordOffset
                 0,          // sbtRecordStride
                 0,          // missIndex

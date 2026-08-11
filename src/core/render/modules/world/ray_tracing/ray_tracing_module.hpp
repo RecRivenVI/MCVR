@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/render/texture_binding_snapshots.hpp"
+
 #include "common/shared.hpp"
 #include "common/singleton.hpp"
 #include "core/all_extern.hpp"
@@ -73,6 +75,8 @@ class RayTracingModule : public WorldModule, public SharedObject<RayTracingModul
     void
     bindTexture(std::shared_ptr<vk::Sampler> sampler, std::shared_ptr<vk::DeviceLocalImage> image, int index) override;
 
+    void onResourceReload() override;
+
     void preClose() override;
 
   private:
@@ -121,6 +125,7 @@ class RayTracingModule : public WorldModule, public SharedObject<RayTracingModul
     void refreshRuntimeBuffers(uint32_t frameIndex);
     void loadRuntimeResources();
     void initSharc();
+    VkResult clearSharcStorage();
     void initPipelines();
     void initSBTs();
     void initContexts();
@@ -197,6 +202,9 @@ class RayTracingModule : public WorldModule, public SharedObject<RayTracingModul
     std::shared_ptr<vk::Shader> fullScreenVertexShader_;
 
     std::vector<std::shared_ptr<vk::DescriptorTable>> rayTracingDescriptorTables_;
+    mcvr::TextureBindingSnapshots<std::pair<std::shared_ptr<vk::Sampler>, std::shared_ptr<vk::Image>>,
+                                  vk::DescriptorTable> textureBindings_;
+    std::shared_ptr<vk::DescriptorTable> textureSnapshot();
 
     std::shared_ptr<ShaderPack> shaderPack_;
     std::vector<PassVariant> passes_;

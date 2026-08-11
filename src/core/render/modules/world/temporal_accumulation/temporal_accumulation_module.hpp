@@ -46,6 +46,8 @@ class TemporalAccumulationModule : public WorldModule, public SharedObject<Tempo
     void
     bindTexture(std::shared_ptr<vk::Sampler> sampler, std::shared_ptr<vk::DeviceLocalImage> image, int index) override;
 
+    void onResourceReload() override;
+
     void preClose() override;
 
   private:
@@ -69,8 +71,8 @@ class TemporalAccumulationModule : public WorldModule, public SharedObject<Tempo
     std::vector<std::shared_ptr<vk::Framebuffer>> framebuffers_;
     std::shared_ptr<vk::GraphicsPipeline> pipeline_;
 
-    std::shared_ptr<vk::DeviceLocalImage> accumulatedRadianceImage_;
-    std::shared_ptr<vk::DeviceLocalImage> accumulatedNormalImage_;
+    std::vector<std::shared_ptr<vk::DeviceLocalImage>> accumulatedRadianceImages_;
+    std::vector<std::shared_ptr<vk::DeviceLocalImage>> accumulatedNormalImages_;
     std::shared_ptr<vk::Sampler> sampler_;
 
     std::vector<std::shared_ptr<vk::DeviceLocalImage>> accumulatedNormalOutImages_;
@@ -84,6 +86,7 @@ class TemporalAccumulationModule : public WorldModule, public SharedObject<Tempo
 
     float alpha_ = 0.12;
     float threshold_ = 0.9;
+    std::vector<uint8_t> resetHistoryPending_;
 };
 
 struct TemporalAccumulationModuleContext : public WorldModuleContext, SharedObject<TemporalAccumulationModuleContext> {

@@ -5,6 +5,7 @@
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
+#include "util/surface_overlay.glsl"
 #include "common/shared.hpp"
 #include "common/chunk_lookup.glsl"
 #include "util/disney.glsl"
@@ -17,8 +18,11 @@
 #include "util/ray.glsl"
 #include "util/sampling_helpers.glsl"
 #include "util/util.glsl"
+#include "util/text_mode.glsl"
 
 layout(set = 0, binding = 0) uniform sampler2D textures[];
+
+#include "util/emissive_overlay.glsl"
 layout(set = 5, binding = 0) uniform sampler2D transLUT;
 layout(set = 5, binding = 2) uniform samplerCube skyFull;
 
@@ -69,6 +73,7 @@ layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Ind
 indexBuffer;
 
 #include "util/vertex.glsl"
+#include "util/glint_material.glsl"
 #include "common/constants.glsl"
 #include "common/parallax_condition.glsl"
 
@@ -87,6 +92,7 @@ struct SampledSurface {
     vec4 specularValue;
     vec4 normalValue;
     vec3 tint;
+    vec3 glintRadiance;
     LabPBRMat mat;
 };
 
@@ -166,6 +172,7 @@ void sampleSurfaceState(bool useTexture,
                         vec2 uv,
                         float lod,
                         uint alphaMode,
+                        bool colorLayerMix,
                         vec4 colorLayerValue,
                         vec3 colorLayer,
                         vec3 glint,
@@ -185,31 +192,51 @@ void sampleSurfaceState(bool useTexture,
     vec4 specularValue = vec4(0.0);
     vec4 normalValue = vec4(0.0);
     bool useFlatEdgeBand = false;
-
+    bool textSurface = isTextMode(alphaMode);
+    bool usePbr = !textSurface;
     if (useTexture) {
         albedoValue = sampleTexture(textures[nonuniformEXT(textureID)], uv, lod, false);
-        albedoValue.a = resolveSurfaceAlpha(albedoValue.a * colorLayerValue.a, alphaMode);
-        specularValue = textureMap.specular >= 0 ?
+        if (textSurface) {
+            albedoValue = resolveTextTextureColor(albedoValue, true, alphaMode);
+            albedoValue.a = 1.0;
+        } else {
+            float surfaceAlpha = colorLayerMix ? albedoValue.a : albedoValue.a * colorLayerValue.a;
+            albedoValue.a = resolveSurfaceAlpha(surfaceAlpha, alphaMode);
+            if (isCoverageAlphaMode(alphaMode) || isAdditiveAlphaMode(alphaMode)) {
+                albedoValue.a = 1.0;
+            }
+        }
+        specularValue = textureMap.specular >= 0 && usePbr ?
                             sampleTexture(textures[nonuniformEXT(textureMap.specular)], uv, lod, false) :
                             vec4(0.0);
-        normalValue = textureMap.normal >= 0 ?
+        normalValue = textureMap.normal >= 0 && usePbr ?
                           samplePBRTexture(textures[nonuniformEXT(textureMap.normal)], uv, atlasUvMin, atlasUvMax, lod,
                                            ADV_PBR_SAMPLING_MODE) :
                           vec4(0.0);
-        if (hasHeightMap && textureMap.normal >= 0) {
+        if (hasHeightMap && textureMap.normal >= 0 && usePbr) {
             ivec2 heightMapSize = textureSize(textures[nonuniformEXT(textureMap.normal)], 0);
             useFlatEdgeBand = isEdgeUV(uv, atlasUvMin, atlasUvMax, heightMapSize);
         }
     }
+    if (textSurface) {
+        normalValue = vec4(0.5, 0.5, 1.0, 0.0);
+    }
 
-    vec3 tint = albedoValue.rgb * colorLayer + glint;
+    vec3 baseTint = textSurface ?
+                        albedoValue.rgb * colorLayer :
+                        (colorLayerMix ?
+                             applySurfaceOverlay(albedoValue.rgb, colorLayer, colorLayerValue.a) :
+                             albedoValue.rgb * colorLayer);
+    vec3 tint = baseTint;
     if (useOverlay) {
         vec4 overlayColor = sampleTexture(textures[nonuniformEXT(worldUBO.overlayTextureID)], overlayUV, 0, false);
-        tint = mix(overlayColor.rgb, albedoValue.rgb * colorLayer, overlayColor.a) + glint;
+        tint = applySurfaceOverlay(baseTint, overlayColor.rgb, 1.0 - overlayColor.a);
     }
 
     albedoValue = vec4(tint, albedoValue.a);
-    LabPBRMat mat = convertLabPBRMaterial(albedoValue, specularValue, normalValue);
+    LabPBRMat mat = convertLabPBRMaterial(albedoValue, specularValue, normalValue,
+                                          isTransmissionAlphaMode(alphaMode));
+    vec3 glintRadiance = applyGlintMaterialLayer(mat, glint);
 
     vec3 geometricNormal = localHit.sideWall ? localHit.geometricNormal : baseGeoNormal;
     vec3 shadingNormal = geometricNormal;
@@ -233,13 +260,14 @@ void sampleSurfaceState(bool useTexture,
         shadingNormal = applyNormalMapToBasis(localWaterNormal, tangent, bitangent, baseGeoNormal, viewDir);
     } else {
         if (ADV_PBR_SAMPLING_MODE != 0u && hasHeightMap && !localHit.sideWall && textureMap.normal >= 0 &&
+            usePbr &&
             !useFlatEdgeBand) {
             geometricNormal = sampleNormal(textures[nonuniformEXT(textureMap.normal)], uv, atlasUvMin, atlasUvMax,
                                            dPduWorld, dPdvWorld, baseGeoNormal, 0, ADV_PBR_SAMPLING_MODE,
                                            maxDepthWorld, viewDir);
         }
 
-        if (!localHit.sideWall) {
+        if (!localHit.sideWall && usePbr) {
             vec3 tangent, bitangent;
             buildSurfaceBasis(dPduWorld, dPdvWorld, geometricNormal, tangent, bitangent);
             shadingNormal = applyNormalMapToBasis(mat.normal, tangent, bitangent, geometricNormal, viewDir);
@@ -256,6 +284,7 @@ void sampleSurfaceState(bool useTexture,
     surface.specularValue = specularValue;
     surface.normalValue = normalValue;
     surface.tint = tint;
+    surface.glintRadiance = glintRadiance;
     surface.mat = mat;
 }
 
@@ -414,9 +443,9 @@ vec3 sampleSurfaceDirectionalLight(SampledSurface surface,
     }
     float shadowLength = max(1000.0 - shadowOriginDistance, 0.0001);
     if (!isFiniteVec3(shadowOrigin) || !isFiniteFloat(shadowLength)) { return vec3(0.0); }
-    uint shadowMask = WORLD_MASK | PLAYER_MASK;
+    uint shadowMask = WORLD_MASK | PLAYER_MASK | PRIORITY_MASK | PARTICLE_MASK;
     if (ADV_CLOUD_MODE != 2u) { shadowMask |= CLOUD_MASK; }
-    traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, shadowMask, 0, 0, 0, shadowOrigin, 0.0001, sampledLightDir,
+    traceRayEXT(topLevelAS, gl_RayFlagsCullBackFacingTrianglesEXT, shadowMask, 0, 0, 0, shadowOrigin, 0.0001, sampledLightDir,
                 shadowLength, 1);
 
     float progress = skyUBO.rainGradient;
@@ -464,10 +493,9 @@ void main() {
 
     uint i0, i1, i2;
     MaterialVertex m0, m1, m2;
-    loadTriangleIndices(geometryBufferIndex, gl_PrimitiveID, i0, i1, i2);
-    loadTriangleMaterial(geometryBufferIndex, i0, i1, i2, m0, m1, m2);
     PositionVertex p0, p1, p2;
-    loadTrianglePositions(geometryBufferIndex, i0, i1, i2, p0, p1, p2);
+    loadTriangle(geometryBufferIndex, gl_PrimitiveID, i0, i1, i2,
+        p0, p1, p2, m0, m1, m2);
 
     vec3 baryCoords = vec3(1.0 - (attribs.x + attribs.y), attribs.x, attribs.y);
     vec3 planeHitWorldPos = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
@@ -475,12 +503,20 @@ void main() {
 
     uint packedData = m0.packedData;
     bool useColorLayer = hasColorLayer(packedData);
+    bool colorLayerMix = hasColorLayerMix(packedData);
     bool useTexture = hasTexture(packedData);
     bool useGlint = hasGlint(packedData);
     bool useOverlay = hasOverlay(packedData);
     vec4 colorLayerValue = useColorLayer ?
                                baryCoords.x * m0.colorLayer + baryCoords.y * m1.colorLayer + baryCoords.z * m2.colorLayer :
                                vec4(1.0);
+    vec3 flywheelLocalPosition = baryCoords.x * p0.pos + baryCoords.y * p1.pos + baryCoords.z * p2.pos;
+    vec3 flywheelLocalNormal = normalize(baryCoords.x * m0.norm + baryCoords.y * m1.norm
+        + baryCoords.z * m2.norm);
+    ivec2 flywheelLightUv = ivec2(round(baryCoords.x * vec2(m0.lightUV)
+        + baryCoords.y * vec2(m1.lightUV) + baryCoords.z * vec2(m2.lightUV)));
+    applyFlywheelFragmentLighting(geometryBufferIndex, flywheelLocalPosition,
+        flywheelLocalNormal, colorLayerValue, flywheelLightUv);
     vec3 colorLayer = colorLayerValue.rgb;
     uint bounce = rayBounce(mainRay);
 
@@ -488,6 +524,7 @@ void main() {
         baryCoords.x * m0.albedoEmission + baryCoords.y * m1.albedoEmission + baryCoords.z * m2.albedoEmission;
     uint textureID = m0.textureID;
     uint alphaMode = getAlphaMode(packedData);
+    bool textSurface = isTextMode(alphaMode);
     uint coordinate = getCoordinate(packedData);
 
     vec2 textureUV = vec2(0.0);
@@ -499,8 +536,8 @@ void main() {
     vec3 dposdv = vec3(0.0, 1.0, 0.0);
     bool hasHeightMapSurface = false;
     float maxDepthWorld = 0.0;
-    mat3 objectToWorld = mat3(gl_ObjectToWorld3x4EXT);
-    mat3 normalMatrix = transpose(mat3(gl_WorldToObject3x4EXT));
+    mat3 objectToWorld = mat3(gl_ObjectToWorldEXT);
+    mat3 normalMatrix = mat3(gl_WorldToObject3x4EXT);
     vec3 baseGeoNormal =
         normalizeF(normalMatrix * cross(p1.pos - p0.pos, p2.pos - p0.pos), vec3(0.0, 1.0, 0.0));
     vec3 planeGeoNormal = baseGeoNormal;
@@ -520,7 +557,6 @@ void main() {
         float coneRadiusWorld = mainRay.coneWidth + gl_HitTEXT * mainRay.coneSpread;
         computedposduDv(p0.pos, p1.pos, p2.pos, m0.textureUV, m1.textureUV, m2.textureUV, dposdu, dposdv);
         lod = lodWithCone(textures[nonuniformEXT(textureID)], textureUV, coneRadiusWorld, dposdu, dposdv);
-
         dPduWorld = objectToWorld * dposdu;
         dPdvWorld = objectToWorld * dposdv;
         planeGeoNormal = normalizeF(cross(dPduWorld, dPdvWorld), baseGeoNormal);
@@ -533,7 +569,7 @@ void main() {
         }
         hasFftWaterSurface = isWaterMaterial && abs(planeGeoNormal.y) > 0.75;
 
-        if (parallaxEnabled && textureMap.normal >= 0 && coordinate != 1u) {
+        if (parallaxEnabled && textureMap.normal >= 0 && coordinate != 1u && !textSurface) {
             maxDepthWorld = heightMapMaxDepthWorld(atlasUvMin, atlasUvMax, dPduWorld, dPdvWorld);
             hasHeightMapSurface =
                 maxDepthWorld > heightMapMinWorldDepth && dot(baseViewDir, baseGeoNormal) > ADV_PARALLAX_MIN_VIEW_DOT;
@@ -581,7 +617,7 @@ void main() {
     vec3 glint = vec3(0.0);
     if (useGlint) {
         vec2 glintUV = baryCoords.x * m0.glintUV + baryCoords.y * m1.glintUV + baryCoords.z * m2.glintUV;
-        glintUV = (worldUBO.textureMat * vec4(glintUV, 0.0, 1.0)).xy;
+        glintUV = transformGlintUv(worldUBO.textureMat, glintUV, m0.packedData);
         glint = sampleTexture(textures[nonuniformEXT(m0.glintTexture)], glintUV, false).rgb;
     }
     glint *= glint;
@@ -590,7 +626,7 @@ void main() {
 
     SampledSurface surface;
     sampleSurfaceState(useTexture, textureID, textureMap, atlasUvMin, atlasUvMax, initialHit.uv, lod, alphaMode,
-                       colorLayerValue, colorLayer, glint, useOverlay, m0.overlayUV, dPduWorld, dPdvWorld,
+                       colorLayerMix, colorLayerValue, colorLayer, glint, useOverlay, m0.overlayUV, dPduWorld, dPdvWorld,
                        baseGeoNormal, hasHeightMapSurface, maxDepthWorld, initialHit, hitWorldPos, viewDir,
                        hasFftWaterSurface, surface);
 
@@ -601,6 +637,7 @@ void main() {
     rayStoreAux(mainRay, hasFftWaterSurface ? vec2(ADV_FFT_WATER_ORIGIN_BIAS, 1.0) : vec2(0.0));
 
     SampledSurface currentSurface = surface;
+    vec3 emissiveOverlay = sampleEmissiveOverlay(m0.emissiveOverlayTextureID, initialHit.uv, lod);
     vec3 currentViewDir = viewDir;
     bool storedLobeType = false;
     for (int localBounce = 0; localBounce < 1; ++localBounce) {
@@ -608,6 +645,8 @@ void main() {
             (bounce == 0u && localBounce == 0) ? ADV_DIRECT_LIGHT_STRENGTH : ADV_INDIRECT_LIGHT_STRENGTH;
         vec3 emissionRadiance = emissionFactor * currentSurface.tint * currentSurface.mat.emission * mainRay.throughput;
         emissionRadiance += currentSurface.tint * albedoEmission * mainRay.throughput;
+        emissionRadiance += emissiveOverlay * mainRay.throughput;
+        emissionRadiance += currentSurface.glintRadiance * mainRay.throughput;
         mainRay.radiance += emissionRadiance;
 
         vec3 directLight =
@@ -712,7 +751,8 @@ void main() {
 
         vec3 nextWorldPos = currentSurface.worldPos + sampleDir * localBounceHit.t;
         sampleSurfaceState(useTexture, textureID, textureMap, atlasUvMin, atlasUvMax, localBounceHit.uv, lod, alphaMode,
-                           colorLayerValue, colorLayer, glint, useOverlay, m0.overlayUV, dPduWorld, dPdvWorld,
+                           colorLayerMix, colorLayerValue, colorLayer, glint, useOverlay, m0.overlayUV, dPduWorld,
+                           dPdvWorld,
                            baseGeoNormal, hasHeightMapSurface, maxDepthWorld, localBounceHit, nextWorldPos, -sampleDir,
                            hasFftWaterSurface, currentSurface);
         currentViewDir = -sampleDir;

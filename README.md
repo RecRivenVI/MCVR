@@ -28,7 +28,10 @@ cmake --install build
 
 ## Windows
 
-Use `cmake` to configure the project.
+Use a Visual Studio generator to configure the project. The complete Windows
+build enables FidelityFX and NRD; Ninja is not supported for that combination
+because FidelityFX's platform selection is incompatible with NRD's nested
+ShaderMake configure.
 
 ```
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DJAVA_PROJECT_ROOT_DIR=${PATH_TO_RADIANCE_JAVA_PROJECT} -DMCVR_ENABLE_NRD=ON -DUSE_AMD=ON
@@ -41,3 +44,7 @@ cmake --build build -j --config Release
 cmake --install build --config Release
 ```
 
+Radiance's `prepareRuntime` task selects the default installed Visual Studio
+generator automatically. Override it only when necessary with
+`-Pmcvr.cmakeGenerator="Visual Studio 17 2022"`, and use a fresh MCVR build
+directory when changing generators.

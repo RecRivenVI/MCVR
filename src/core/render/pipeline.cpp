@@ -1,3 +1,6 @@
+#include "core/logging.hpp"
+#include "core/failure_state.hpp"
+#include "core/render/scene_scope.hpp"
 #include "core/render/pipeline.hpp"
 
 #include "core/render/render_framework.hpp"
@@ -15,8 +18,6 @@
 #include "core/render/modules/world/tone_mapping/tone_mapping_module.hpp"
 #include "core/render/modules/world/xess_upscaler/xess_sr_module.hpp"
 
-#include <cstdlib>
-#include <iomanip>
 #include <set>
 
 WorldPipelineBlueprint::WorldPipelineBlueprint(WorldPipelineBuildParams *params) {
@@ -58,49 +59,65 @@ WorldPipelineBlueprint::WorldPipelineBlueprint(WorldPipelineBuildParams *params)
 
 WorldPipeline::WorldPipeline() {}
 
+size_t WorldPipeline::uniqueDispatchImageCount() const {
+    std::set<const vk::DeviceLocalImage *> unique;
+    for (const auto &slot : sharedImages_) for (const auto &image : slot)
+        if (image) unique.insert(image.get());
+    return unique.size();
+}
+
 void WorldPipeline::dumpSharedImages(const char *label) const {
-    std::cerr << label << std::endl;
+    mcvr::log::error("Pipeline") << label << std::endl;
     for (size_t frameIndex = 0; frameIndex < sharedImages_.size(); frameIndex++) {
         for (size_t idx = 0; idx < sharedImages_[frameIndex].size(); idx++) {
             auto &img = sharedImages_[frameIndex][idx];
             if (!img) continue;
-            std::cerr << "  frame=" << frameIndex << " idx=" << idx << " size=" << img->width() << "x" << img->height()
+            mcvr::log::error("Pipeline") << "  frame=" << frameIndex << " idx=" << idx << " size=" << img->width() << "x" << img->height()
                       << " fmt=" << img->vkFormat() << " image=0x" << std::hex << (uint64_t)img->vkImage() << std::dec
                       << std::endl;
         }
     }
 }
 
-void WorldPipeline::init(std::shared_ptr<Framework> framework, std::shared_ptr<Pipeline> pipeline) {
+void WorldPipeline::init(std::shared_ptr<Framework> framework, std::shared_ptr<Pipeline> pipeline,
+                         std::shared_ptr<ShaderPack> reusableShaderPack,
+                         std::vector<std::shared_ptr<WorldModuleRebuildState>> rebuildStates,
+                         VkExtent2D renderExtent) {
     auto blueprint = pipeline->worldPipelineBlueprint();
-    uint32_t frameNum = framework->swapchain()->imageCount();
-    const bool reportNativeProgress = Pipeline::nativeRebuildActive();
+    emissionAtBuild_ = Renderer::options.collectChunkEmission;
+    uint32_t frameNum = framework->recordingContextCount();
+    viewCount_ = SceneRecordingScope::active() ? SceneRecordingScope::active()->viewCount : 1;
 
     worldModules_.resize(blueprint->moduleNames_.size());
     sharedImages_.resize(frameNum,
                          std::vector<std::shared_ptr<vk::DeviceLocalImage>>(blueprint->imageFormats_.size(), nullptr));
     contexts_.resize(frameNum);
-    VkExtent2D extent = framework->swapchain()->vkExtent();
+    VkExtent2D extent = renderExtent.width > 0 && renderExtent.height > 0
+        ? renderExtent : framework->swapchain()->vkExtent();
+    renderExtent_ = extent;
 
     for (int frameIndex = 0; frameIndex < frameNum; frameIndex++) {
+        if (frameIndex >= framesPerView()) {
+            sharedImages_[frameIndex][0] = sharedImages_[frameIndex % framesPerView()][0];
+            continue;
+        }
         sharedImages_[frameIndex][0] = vk::DeviceLocalImage::create(
             framework->device(), framework->vma(), false, extent.width, extent.height, 1, blueprint->imageFormats_[0],
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
-#ifdef USE_AMD
-                | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-#endif
-        );
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     }
-
-    shaderPack_ = nullptr;
-    for (size_t i = 0; i < blueprint->moduleNames_.size(); i++) {
+    shaderPack_ = std::move(reusableShaderPack);
+    if (shaderPack_) {
+        shaderPack_->restartRuntime();
+    }
+    for (size_t i = 0; !shaderPack_ && i < blueprint->moduleNames_.size(); i++) {
         if (blueprint->moduleNames_[i] != RayTracingModule::NAME) { continue; }
 
         auto buildConfig = ShaderPack::buildConfigFromRayTracingAttributes(blueprint->attributeKVs_[i]);
         auto shaderPack = std::make_shared<ShaderPack>(framework);
         std::string error;
         if (!shaderPack->initialize(buildConfig, error)) {
-            std::cerr << "[World Pipeline] Failed to load shared shader pack. Reason: " << error << std::endl;
+            mcvr::log::error("Pipeline") << "[World Pipeline] Failed to load shared shader pack. Reason: " << error << std::endl;
             throw std::runtime_error("failed to load shared shader pack");
         }
         shaderPack_ = shaderPack;
@@ -109,7 +126,7 @@ void WorldPipeline::init(std::shared_ptr<Framework> framework, std::shared_ptr<P
 
     for (int i = blueprint->moduleNames_.size() - 1; i >= 0; i--) {
 #ifdef DEBUG
-        std::cout << "Is " << blueprint->moduleNames_[i] << " exist? "
+        mcvr::log::info("Pipeline") << "Is " << blueprint->moduleNames_[i] << " exist? "
                   << (Pipeline::worldModuleConstructors.find(blueprint->moduleNames_[i]) !=
                       Pipeline::worldModuleConstructors.end())
                   << std::endl;
@@ -120,8 +137,14 @@ void WorldPipeline::init(std::shared_ptr<Framework> framework, std::shared_ptr<P
         auto &moduleOutputIndices = blueprint->modulesOutputIndices_[i];
 
         worldModules_[i]->setAttributes(blueprint->attributeCounts_[i], blueprint->attributeKVs_[i]);
-
+        if (static_cast<size_t>(i) < rebuildStates.size() && rebuildStates[i] != nullptr) {
+            worldModules_[i]->restoreRebuildState(rebuildStates[i]);
+        }
         for (int frameIndex = 0; frameIndex < frameNum; frameIndex++) {
+            // Views execute sequentially on the same command stream. Only dispatch images
+            // alias across views; descriptors, SDK histories and final composites do not.
+            if (frameIndex >= framesPerView())
+                sharedImages_[frameIndex] = sharedImages_[frameIndex % framesPerView()];
             { // output
                 std::vector<std::shared_ptr<vk::DeviceLocalImage>> outputImages;
                 std::vector<VkFormat> outputFormats;
@@ -131,7 +154,7 @@ void WorldPipeline::init(std::shared_ptr<Framework> framework, std::shared_ptr<P
                 }
                 bool result = worldModules_[i]->setOrCreateOutputImages(outputImages, outputFormats, frameIndex);
                 if (!result) {
-                    std::cout << blueprint->moduleNames_[i] << std::endl;
+                    mcvr::log::info("Pipeline") << blueprint->moduleNames_[i] << std::endl;
                     throw std::runtime_error("Output image not set properly");
                 }
                 for (int j = 0; j < moduleOutputIndices.size(); j++) {
@@ -157,10 +180,9 @@ void WorldPipeline::init(std::shared_ptr<Framework> framework, std::shared_ptr<P
         worldModules_[i]->build();
     }
 
-    for (int i = 0; i < framework->swapchain()->imageCount(); i++) {
+    for (uint32_t i = 0; i < frameNum; i++) {
         contexts_[i] = WorldPipelineContext::create(framework->contexts()[i], shared_from_this());
     }
-
 }
 
 std::vector<std::shared_ptr<WorldModule>> &WorldPipeline::worldModules() {
@@ -179,6 +201,12 @@ void WorldPipeline::bindTexture(std::shared_ptr<vk::Sampler> sampler,
                                 std::shared_ptr<vk::DeviceLocalImage> image,
                                 int index) {
     for (int i = 0; i < worldModules_.size(); i++) { worldModules_[i]->bindTexture(sampler, image, index); }
+}
+
+void WorldPipeline::onResourceReload() {
+    for (const auto &module : worldModules_) {
+        if (module != nullptr) { module->onResourceReload(); }
+    }
 }
 
 WorldPipelineContext::WorldPipelineContext(std::shared_ptr<FrameworkContext> frameworkContext,
@@ -204,7 +232,7 @@ void WorldPipelineContext::render() {
 #ifdef USE_AMD
             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 #else
-            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            (SceneRecordingScope::active() ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 #endif
         VkPipelineStageFlags2 dstStage =
 #ifdef USE_AMD
@@ -233,7 +261,9 @@ void WorldPipelineContext::render() {
         outputImage->imageLayout() = targetLayout;
     }
 
-    for (int i = 0; i < worldModuleContexts.size(); i++) { worldModuleContexts[i]->render(); }
+    for (int i = 0; i < worldModuleContexts.size(); i++) {
+        mcvr::failure::runCheckedStage([&] { worldModuleContexts[i]->render(); });
+    }
 
     worldCommandBuffer->barriersBufferImage(
         {}, {{
@@ -246,7 +276,7 @@ void WorldPipelineContext::render() {
 #ifdef USE_AMD
                 .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 #else
-                .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                .newLayout = (SceneRecordingScope::active() ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
 #endif
                 .srcQueueFamilyIndex = mainQueueIndex,
                 .dstQueueFamilyIndex = mainQueueIndex,
@@ -257,7 +287,7 @@ void WorldPipelineContext::render() {
 #ifdef USE_AMD
     outputImage->imageLayout() = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 #else
-    outputImage->imageLayout() = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    outputImage->imageLayout() = (SceneRecordingScope::active() ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 #endif
 }
 
@@ -337,7 +367,7 @@ void Pipeline::collectWorldModules() {
         worldModuleInOutImageNums.insert(std::make_pair(
             XessSrModule::NAME, std::make_pair(XessSrModule::inputImageNum, XessSrModule::outputImageNum)));
     } else {
-        std::cerr << "[Pipeline] xess module skipped: incompatible instance/device extension requirements."
+        mcvr::log::error("Pipeline") << "[Pipeline] xess module skipped: incompatible instance/device extension requirements."
                   << std::endl;
     }
 #endif
@@ -351,9 +381,10 @@ void Pipeline::collectWorldModules() {
         ToneMappingModule::NAME, std::make_pair(ToneMappingModule::inputImageNum, ToneMappingModule::outputImageNum)));
 
     if (framework != nullptr && framework->device() != nullptr &&
-        framework->device()->isDlssDeviceExtensionsCompatible()) {
+        (framework->device()->isDlssDeviceExtensionsCompatible() || framework->device()->isDlssSRDeviceExtensionsCompatible() || framework->device()->isDlssFGDeviceExtensionsCompatible())) {
         bool result = DLSSModule::initNGXContext();
-        if (result) {
+        if (result) worldModuleStaticPreCloser.emplace("dlss.ngx", DLSSModule::deinitNGXContext);
+        if (result && DLSSModule::rrAvailable) {
             worldModuleConstructors.insert(
                 std::make_pair(DLSSModule::NAME,
                                [](std::shared_ptr<Framework> framework, std::shared_ptr<WorldPipeline> worldPipeline) {
@@ -361,12 +392,16 @@ void Pipeline::collectWorldModules() {
                                }));
             worldModuleInOutImageNums.insert(std::make_pair(
                 DLSSModule::NAME, std::make_pair(DLSSModule::inputImageNum, DLSSModule::outputImageNum)));
-            worldModuleStaticPreCloser.insert(std::make_pair(DLSSModule::NAME, DLSSModule::deinitNGXContext));
         } else {
-            std::cerr << "[Pipeline] dlss module skipped: NGX initialization/query failed." << std::endl;
+            mcvr::log::error("Pipeline") << "[Pipeline] dlss module skipped: NGX initialization/query failed." << std::endl;
+        }
+        if (result && DLSSModule::srAvailable) {
+            worldModuleConstructors.emplace(DLSSModule::SR_NAME,
+                [](std::shared_ptr<Framework> f, std::shared_ptr<WorldPipeline> p) { return DLSSModule::create(f, p, false); });
+            worldModuleInOutImageNums.emplace(DLSSModule::SR_NAME, std::make_pair(DLSSModule::inputImageNum, DLSSModule::outputImageNum));
         }
     } else {
-        std::cerr << "[Pipeline] dlss module skipped: incompatible instance/device extension requirements."
+        mcvr::log::error("Pipeline") << "[Pipeline] dlss module skipped: incompatible instance/device extension requirements."
                   << std::endl;
     }
 
@@ -391,13 +426,13 @@ void Pipeline::collectWorldModules() {
 
 Pipeline::Pipeline() {
 #ifdef DEBUG
-    std::cout << "Pipeline init" << std::endl;
+    mcvr::log::info("Pipeline") << "Pipeline init" << std::endl;
 #endif
 }
 
 Pipeline::~Pipeline() {
 #ifdef DEBUG
-    std::cout << "Pipeline deconstruct" << std::endl;
+    mcvr::log::info("Pipeline") << "Pipeline deconstruct" << std::endl;
 #endif
 }
 
@@ -415,36 +450,44 @@ void Pipeline::init(std::shared_ptr<Framework> framework) {
 }
 
 void Pipeline::buildWorldPipelineBlueprint(WorldPipelineBuildParams *params) {
+    auto framework = framework_.lock();
+    std::lock_guard lock(framework->recreateMtx());
     beginNativeRebuild();
     worldPipelineBlueprint_ = WorldPipelineBlueprint::create(params);
     isRecreationNeeded = true;
 }
 
-void Pipeline::recreate(std::shared_ptr<Framework> framework) {
-    const bool reportNativeProgress = Pipeline::nativeRebuildActive();
-    auto &frr = framework->frameResourceRetainer();
-    std::vector<OverlayDynamicDrawShaderInfo> overlayDynamicDrawShaders;
-    if (uiModule_ != nullptr) {
-        overlayDynamicDrawShaders = uiModule_->overlayDynamicDrawShaders();
+void Pipeline::recreate(std::shared_ptr<Framework> framework, bool resizeTargets, bool rebuildWorld) {
+    if (uiModule_) uiModule_->closePonderScenes();
+    // Framework has drained both queues. Drop old frame references before reallocating
+    // large targets instead of retaining several entire worlds across successive resizes.
+    contexts_->clear();
+    if (resizeTargets) {
+        uiModule_->resize(framework);
     }
 
-    frr.retain(uiModule_);
-    uiModule_ = UIModule::create(framework);
-    for (const auto &shaderInfo : overlayDynamicDrawShaders) {
-        uiModule_->registerOverlayDrawShader(shaderInfo.key, shaderInfo.vertexFormatType,
-                                             shaderInfo.drawMode, shaderInfo.uniformSize,
-                                             shaderInfo.vertexShaderPath,
-                                             shaderInfo.fragmentShaderPath,
-                                             shaderInfo.definitions);
+    if (resizeTargets || rebuildWorld) {
+        auto reusableShaderPack = !rebuildWorld && worldPipeline_ &&
+            worldPipeline_->emissionAtBuild_ == Renderer::options.collectChunkEmission ? worldPipeline_->shaderPack() : nullptr;
+        std::vector<std::shared_ptr<WorldModuleRebuildState>> rebuildStates;
+        if (worldPipeline_ != nullptr) {
+            rebuildStates.reserve(worldPipeline_->worldModules().size());
+            for (const auto &module : worldPipeline_->worldModules()) {
+                rebuildStates.push_back(
+                    module == nullptr ? nullptr : module->captureRebuildState());
+            }
+        }
+        if (worldPipeline_ != nullptr) {
+            for (auto &module : worldPipeline_->worldModules()) { module->preClose(); }
+        }
+        worldPipeline_.reset();
+        worldPipeline_ =
+            worldPipelineBlueprint_ == nullptr
+                ? nullptr
+                : WorldPipeline::create(framework, shared_from_this(),
+                                        reusableShaderPack, std::move(rebuildStates));
     }
 
-    if (worldPipeline_ != nullptr)
-        for (auto &module : worldPipeline_->worldModules()) { module->preClose(); }
-    frr.retain(worldPipeline_);
-    worldPipeline_ =
-        worldPipelineBlueprint_ == nullptr ? nullptr : WorldPipeline::create(framework, shared_from_this());
-
-    frr.retain(contexts_);
     contexts_ = std::make_shared<std::vector<std::shared_ptr<PipelineContext>>>();
 
     uint32_t size = framework->swapchain()->imageCount();
@@ -456,9 +499,15 @@ void Pipeline::recreate(std::shared_ptr<Framework> framework) {
 }
 
 void Pipeline::close() {
-    for (auto &module : worldPipeline_->worldModules()) { module->preClose(); }
+    if (uiModule_) uiModule_->closePonderScenes();
+    if (worldPipeline_ != nullptr) {
+        for (auto &module : worldPipeline_->worldModules()) {
+            if (module != nullptr) { module->preClose(); }
+        }
+    }
 
     for (auto &destructor : worldModuleStaticPreCloser) { destructor.second(); }
+    worldModuleStaticPreCloser.clear();
 }
 
 std::shared_ptr<PipelineContext> Pipeline::acquirePipelineContext(std::shared_ptr<FrameworkContext> context) {
@@ -474,6 +523,11 @@ void Pipeline::bindTexture(std::shared_ptr<vk::Sampler> sampler,
                            int index) {
     if (worldPipeline_ != nullptr) worldPipeline_->bindTexture(sampler, image, index);
     uiModule_->bindTexture(sampler, image, index);
+}
+
+void Pipeline::onResourceReload() {
+    if (uiModule_) uiModule_->closePonderScenes();
+    if (worldPipeline_ != nullptr) { worldPipeline_->onResourceReload(); }
 }
 
 std::shared_ptr<UIModule> Pipeline::uiModule() {
@@ -499,6 +553,7 @@ void PipelineContext::fuseWorld() {
     auto context = frameworkContext.lock();
     auto framework = context->framework.lock();
     if (!framework->isRunning()) return;
+    context->worldRenderRequired = true;
 
     uiModuleContext->end();
 
@@ -607,4 +662,7 @@ void PipelineContext::fuseWorld() {
 #else
     worldPipelineContext->outputImage->imageLayout() = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 #endif
+    framework->captureFrameGenerationHudless(*context, uiModuleContext->overlayDrawColorImage);
+    uiModuleContext->writeMainDepth(worldPipelineContext);
+    uiModuleContext->captureMainAliases();
 }

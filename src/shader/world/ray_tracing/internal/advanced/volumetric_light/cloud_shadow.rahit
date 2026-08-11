@@ -39,6 +39,7 @@ layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Ind
 indexBuffer;
 
 #include "util/vertex.glsl"
+#include "util/material_faces.glsl"
 
 layout(location = 1) rayPayloadInEXT ShadowRay shadowRay;
 hitAttributeEXT vec2 attribs;
@@ -52,6 +53,11 @@ void main() {
     uint instanceID = gl_InstanceCustomIndexEXT;
     uint geometryID = gl_GeometryIndexEXT;
     uint geometryBufferIndex = getGeometryBufferIndex(instanceID, geometryID);
+    if (!acceptsMaterialFace(instanceAppearances.values[geometryBufferIndex].materialFlags,
+                             gl_HitKindEXT == gl_HitKindFrontFacingTriangleEXT)) {
+        ignoreIntersectionEXT;
+        return;
+    }
 
     uint i0, i1, i2;
     PositionVertex p0, p1, p2;
@@ -74,7 +80,8 @@ void main() {
         albedo = sampleTexture(textures[nonuniformEXT(textureID)], textureUV, false);
     }
 
-    float alpha = resolveSurfaceAlpha(albedo.a * colorLayer.a, alphaMode);
+    float surfaceAlpha = hasColorLayerMix(packedData) ? albedo.a : albedo.a * colorLayer.a;
+    float alpha = resolveSurfaceAlpha(surfaceAlpha, alphaMode);
     if (alpha < 0.05) {
         ignoreIntersectionEXT;
         return;
@@ -82,7 +89,10 @@ void main() {
 
     float strength = max(ADV_VOLUMETRIC_LIGHT_CLOUD_SHADOW_STRENGTH, 0.0);
     float opticalDepth = alpha * strength;
-    vec3 tint = clamp(albedo.rgb * colorLayer.rgb, vec3(0.35), vec3(1.0));
+    vec3 baseTint = hasColorLayerMix(packedData) ?
+                        mix(albedo.rgb, colorLayer.rgb, clamp(colorLayer.a, 0.0, 1.0)) :
+                        albedo.rgb * colorLayer.rgb;
+    vec3 tint = clamp(baseTint, vec3(0.35), vec3(1.0));
     vec3 transmission = exp(-vec3(opticalDepth)) * mix(vec3(1.0), tint, min(strength, 0.2));
     shadowRay.throughput *= clamp(transmission, vec3(0.0), vec3(1.0));
 

@@ -1,5 +1,7 @@
+#include "core/render/scene_scope.hpp"
 #include "core/render/modules/world/tone_mapping/tone_mapping_module.hpp"
 
+#include "core/render/buffers.hpp"
 #include "core/render/pipeline.hpp"
 #include "core/render/render_framework.hpp"
 #include "core/render/renderer.hpp"
@@ -59,7 +61,7 @@ ToneMappingModule::ToneMappingModule() {}
 void ToneMappingModule::init(std::shared_ptr<Framework> framework, std::shared_ptr<WorldPipeline> worldPipeline) {
     WorldModule::init(framework, worldPipeline);
 
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     hdrImages_.resize(size);
     ldrImages_.resize(size);
@@ -147,7 +149,7 @@ void ToneMappingModule::setAttributes(int attributeCount, std::vector<std::strin
 void ToneMappingModule::build() {
     auto framework = framework_.lock();
     auto worldPipeline = worldPipeline_.lock();
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     initDescriptorTables();
     initImages();
@@ -172,13 +174,40 @@ std::vector<std::shared_ptr<WorldModuleContext>> &ToneMappingModule::contexts() 
 
 void ToneMappingModule::bindTexture(std::shared_ptr<vk::Sampler> sampler,
                                     std::shared_ptr<vk::DeviceLocalImage> image,
-                                    int index) {}
+                                    int index) {
+    auto framework = framework_.lock();
+    const uint32_t size = framework->recordingContextCount();
+    for (uint32_t i = 0; i < size; i++) {
+        if (SceneRecordingScope::active() && i != framework->safeAcquireCurrentContext()->frameIndex) continue;
+        if (descriptorTables_[i] != nullptr) {
+            descriptorTables_[i]->bindSamplerImage(sampler, image,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 3, index);
+        }
+    }
+}
 
 void ToneMappingModule::preClose() {}
 
+std::shared_ptr<WorldModuleRebuildState> ToneMappingModule::captureRebuildState() const {
+    auto state = std::make_shared<ExposureRebuildState>();
+    state->buffer = exposures_[0].data;
+    state->initialized = exposures_[0].initialized;
+    state->device = framework_.lock()->device()->vkDevice();
+    return state;
+}
+
+void ToneMappingModule::restoreRebuildState(const std::shared_ptr<WorldModuleRebuildState> &state) {
+    auto previous = std::dynamic_pointer_cast<ExposureRebuildState>(state);
+    if (previous && previous->buffer && previous->buffer->size() == sizeof(ToneMappingModuleExposureData) &&
+        previous->device == framework_.lock()->device()->vkDevice()) {
+        exposures_[0].data = previous->buffer;
+        exposures_[0].initialized = previous->initialized;
+    }
+}
+
 void ToneMappingModule::initDescriptorTables() {
     auto framework = framework_.lock();
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     descriptorTables_.resize(size);
     samplers_.resize(size);
@@ -205,6 +234,18 @@ void ToneMappingModule::initDescriptorTables() {
                                        .descriptorCount = 1,
                                        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
                                    })
+                                   .defineDescriptorLayoutSetBinding({
+                                       .binding = 3,
+                                       .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                       .descriptorCount = 4096,
+                                       .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   })
+                                   .defineDescriptorLayoutSetBinding({
+                                       .binding = 4,
+                                       .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                       .descriptorCount = 1,
+                                       .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   })
                                    .endDescriptorLayoutSetBinding()
                                    .endDescriptorLayoutSet()
                                    .definePushConstant(VkPushConstantRange{
@@ -221,7 +262,7 @@ void ToneMappingModule::initDescriptorTables() {
 
 void ToneMappingModule::initImages() {
     auto framework = framework_.lock();
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     for (int i = 0; i < size; i++) {
         descriptorTables_[i]->bindSamplerImageForShader(samplers_[i], hdrImages_[i], 0, 0);
@@ -232,13 +273,19 @@ void ToneMappingModule::initBuffers() {
     auto framework = framework_.lock();
     auto vma = framework->vma();
     auto device = framework->device();
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     histBuffers_.resize(size);
 
-    exposureData_ =
-        vk::DeviceLocalBuffer::create(vma, device, sizeof(ToneMappingModuleExposureData),
-                                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    exposures_.resize(worldPipeline_.lock()->viewCount());
+    for (auto &exposure : exposures_) {
+        if (!exposure.data) {
+            exposure.data = vk::DeviceLocalBuffer::create(vma, device, sizeof(ToneMappingModuleExposureData),
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            exposure.initialized = false;
+        }
+        exposure.firstFrame = true;
+    }
 
     for (int i = 0; i < size; i++) {
         histBuffers_[i] =
@@ -246,7 +293,7 @@ void ToneMappingModule::initBuffers() {
                                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         descriptorTables_[i]->bindBuffer(histBuffers_[i], 0, 1);
 
-        descriptorTables_[i]->bindBuffer(exposureData_, 0, 2);
+        descriptorTables_[i]->bindBuffer(exposures_[worldPipeline_.lock()->viewForSlot(i)].data, 0, 2);
     }
 }
 
@@ -265,8 +312,8 @@ void ToneMappingModule::initRenderPass() {
                           .initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                           .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 #else
-                          .initialLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                          .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                          .initialLayout = (SceneRecordingScope::active() ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
+                          .finalLayout = (SceneRecordingScope::active() ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
 #endif
                       })
                       .endAttachmentDescription()
@@ -287,7 +334,7 @@ void ToneMappingModule::initRenderPass() {
 
 void ToneMappingModule::initFrameBuffers() {
     auto framework = framework_.lock();
-    uint32_t size = framework->swapchain()->imageCount();
+    uint32_t size = framework->recordingContextCount();
 
     framebuffers_.resize(size);
 
@@ -302,6 +349,7 @@ void ToneMappingModule::initFrameBuffers() {
 
 void ToneMappingModule::initPipeline() {
     auto framework = framework_.lock();
+    auto worldPipeline = worldPipeline_.lock();
     auto device = framework->device();
     std::filesystem::path shaderPath = Renderer::folderPath / "shaders";
 
@@ -333,15 +381,15 @@ void ToneMappingModule::initPipeline() {
                             {
                                 .x = 0,
                                 .y = 0,
-                                .width = static_cast<float>(framework->swapchain()->vkExtent().width),
-                                .height = static_cast<float>(framework->swapchain()->vkExtent().height),
+                                .width = static_cast<float>(worldPipeline->renderExtent().width),
+                                .height = static_cast<float>(worldPipeline->renderExtent().height),
                                 .minDepth = 0.0,
                                 .maxDepth = 1.0,
                             },
                         .scissor =
                             {
                                 .offset = {.x = 0, .y = 0},
-                                .extent = framework->swapchain()->vkExtent(),
+                                .extent = worldPipeline->renderExtent(),
                             },
                     })
                     .defineDepthStencilState({
@@ -376,6 +424,26 @@ void ToneMappingModuleContext::render() {
     auto mainQueueIndex = framework->physicalDevice()->mainQueueIndex();
 
     auto module = toneMappingModule.lock();
+    auto buffers = Renderer::instance().buffers();
+    descriptorTable->bindBuffer(buffers->worldUniformBuffer(), 0, 4);
+
+    const bool initializeExposure = !module->exposures_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).initialized;
+    if (initializeExposure) {
+        vkCmdFillBuffer(worldCommandBuffer->vkCommandBuffer(), module->exposures_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).data->vkBuffer(),
+                        0, sizeof(ToneMappingModuleExposureData), 0);
+        module->exposures_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).initialized = true;
+    }
+    worldCommandBuffer->barriersBufferImage({{
+        .srcStageMask = initializeExposure ? VK_PIPELINE_STAGE_2_TRANSFER_BIT :
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        .srcAccessMask = initializeExposure ? VK_ACCESS_2_TRANSFER_WRITE_BIT :
+            VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
+        .srcQueueFamilyIndex = mainQueueIndex,
+        .dstQueueFamilyIndex = mainQueueIndex,
+        .buffer = module->exposures_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).data,
+    }}, {});
 
     auto chooseSrc = [](VkImageLayout oldLayout, VkPipelineStageFlags2 fallbackStage, VkAccessFlags2 fallbackAccess,
                         VkPipelineStageFlags2 &outStage, VkAccessFlags2 &outAccess) {
@@ -434,7 +502,7 @@ void ToneMappingModuleContext::render() {
 #ifdef USE_AMD
              .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 #else
-             .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+             .newLayout = (SceneRecordingScope::active() ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
 #endif
              .srcQueueFamilyIndex = mainQueueIndex,
              .dstQueueFamilyIndex = mainQueueIndex,
@@ -445,7 +513,7 @@ void ToneMappingModuleContext::render() {
 #ifdef USE_AMD
     ldrImage->imageLayout() = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 #else
-    ldrImage->imageLayout() = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    ldrImage->imageLayout() = (SceneRecordingScope::active() ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 #endif
 
     vkCmdFillBuffer(worldCommandBuffer->vkCommandBuffer(), histBuffer->vkBuffer(), 0, VK_WHOLE_SIZE, 0);
@@ -471,6 +539,10 @@ void ToneMappingModuleContext::render() {
     float dtSeconds = static_cast<float>(elapsedTime.count());
     if (!std::isfinite(dtSeconds)) dtSeconds = 1.0f / 60.0f;
     dtSeconds = std::clamp(dtSeconds, 0.0f, 1.0f);
+    // Rebuild time is not elapsed scene time. Keep inherited exposure on the first
+    // frame while newly reset denoisers/history images produce their initial result.
+    if (module->exposures_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).firstFrame) dtSeconds = 0.0f;
+    module->exposures_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).firstFrame = false;
 
     float sanitizedLog2Min = std::min(module->log2Min_, module->log2Max_ - 1e-3f);
     float sanitizedLog2Max = std::max(module->log2Max_, sanitizedLog2Min + 1e-3f);
@@ -539,7 +611,7 @@ void ToneMappingModuleContext::render() {
             .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
             .srcQueueFamilyIndex = mainQueueIndex,
             .dstQueueFamilyIndex = mainQueueIndex,
-            .buffer = module->exposureData_,
+            .buffer = module->exposures_.at(module->worldPipeline_.lock()->viewForSlot(frameworkContext.lock()->frameIndex)).data,
         }},
         {});
 
@@ -558,6 +630,6 @@ void ToneMappingModuleContext::render() {
 #ifdef USE_AMD
     ldrImage->imageLayout() = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 #else
-    ldrImage->imageLayout() = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    ldrImage->imageLayout() = (SceneRecordingScope::active() ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 #endif
 }

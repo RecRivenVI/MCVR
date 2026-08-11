@@ -24,6 +24,12 @@ struct MotionUpscalePushConstants {
     uint32_t dstHeight;
 };
 
+// Small, size-independent state that remains meaningful across a GPU-idle rebuild.
+// Temporal image histories must explicitly validate their own dimensions before opting in.
+struct WorldModuleRebuildState {
+    virtual ~WorldModuleRebuildState() = default;
+};
+
 class WorldModule {
   public:
     WorldModule();
@@ -44,6 +50,13 @@ class WorldModule {
 
     virtual void
     bindTexture(std::shared_ptr<vk::Sampler> sampler, std::shared_ptr<vk::DeviceLocalImage> image, int index) = 0;
+
+    // Called at a GPU-idle resource-generation boundary. Modules with temporal state should
+    // discard history before consuming the newly published material set.
+    virtual void onResourceReload() {}
+
+    virtual std::shared_ptr<WorldModuleRebuildState> captureRebuildState() const { return {}; }
+    virtual void restoreRebuildState(const std::shared_ptr<WorldModuleRebuildState> &) {}
 
     // release resources that must be released before deconstruction
     virtual void preClose() = 0;

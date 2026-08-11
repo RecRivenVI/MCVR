@@ -31,6 +31,7 @@
 typedef int (*PFN_glfwInit)(void);
 typedef void (*PFN_glfwTerminate)(void);
 typedef void (*PFN_glfwGetWindowSize)(GLFWwindow *, int *, int *);
+typedef int (*PFN_glfwGetWindowAttrib)(GLFWwindow *, int);
 typedef VkResult (*PFN_glfwCreateWindowSurface)(VkInstance,
                                                 GLFWwindow *,
                                                 const VkAllocationCallbacks *,
@@ -40,36 +41,50 @@ typedef void (*PFN_glfwSetWindowTitle)(GLFWwindow *, const char *);
 typedef void (*PFN_glfwSetFramebufferSizeCallback)(GLFWwindow *, GLFWframebuffersizefun);
 typedef void (*PFN_glfwGetFramebufferSize)(GLFWwindow *, int *, int *);
 typedef void (*PFN_glfwWaitEvents)(void);
+typedef void (*PFN_glfwWaitEventsTimeout)(double);
+typedef int (*PFN_glfwWindowShouldClose)(GLFWwindow *);
 
+#ifdef _WIN32
+extern HWND (*p_glfwGetWin32Window)(GLFWwindow *);
+#endif
 extern PFN_glfwInit p_glfwInit;
 extern PFN_glfwTerminate p_glfwTerminate;
 extern PFN_glfwGetWindowSize p_glfwGetWindowSize;
+extern PFN_glfwGetWindowAttrib p_glfwGetWindowAttrib;
 extern PFN_glfwCreateWindowSurface p_glfwCreateWindowSurface;
 extern PFN_glfwGetRequiredInstanceExtensions p_glfwGetRequiredInstanceExtensions;
 extern PFN_glfwSetWindowTitle p_glfwSetWindowTitle;
 extern PFN_glfwSetFramebufferSizeCallback p_glfwSetFramebufferSizeCallback;
 extern PFN_glfwGetFramebufferSize p_glfwGetFramebufferSize;
 extern PFN_glfwWaitEvents p_glfwWaitEvents;
+extern PFN_glfwWaitEventsTimeout p_glfwWaitEventsTimeout;
+extern PFN_glfwWindowShouldClose p_glfwWindowShouldClose;
 
 #    define GLFW_Init p_glfwInit
 #    define GLFW_Terminate p_glfwTerminate
 #    define GLFW_GetWindowSize p_glfwGetWindowSize
+#    define GLFW_GetWindowAttrib p_glfwGetWindowAttrib
 #    define GLFW_CreateWindowSurface p_glfwCreateWindowSurface
 #    define GLFW_GetRequiredInstanceExtensions p_glfwGetRequiredInstanceExtensions
 #    define GLFW_SetWindowTitle p_glfwSetWindowTitle
 #    define GLFW_SetFramebufferSizeCallback p_glfwSetFramebufferSizeCallback
 #    define GLFW_GetFramebufferSize p_glfwGetFramebufferSize
 #    define GLFW_WaitEvents p_glfwWaitEvents
+#    define GLFW_WaitEventsTimeout p_glfwWaitEventsTimeout
+#    define GLFW_WindowShouldClose p_glfwWindowShouldClose
 #else
 #    define GLFW_Init glfwInit
 #    define GLFW_Terminate glfwTerminate
 #    define GLFW_GetWindowSize glfwGetWindowSize
+#    define GLFW_GetWindowAttrib glfwGetWindowAttrib
 #    define GLFW_CreateWindowSurface glfwCreateWindowSurface
 #    define GLFW_GetRequiredInstanceExtensions glfwGetRequiredInstanceExtensions
 #    define GLFW_SetWindowTitle glfwSetWindowTitle
 #    define GLFW_SetFramebufferSizeCallback glfwSetFramebufferSizeCallback
 #    define GLFW_GetFramebufferSize glfwGetFramebufferSize
 #    define GLFW_WaitEvents glfwWaitEvents
+#    define GLFW_WaitEventsTimeout glfwWaitEventsTimeout
+#    define GLFW_WindowShouldClose glfwWindowShouldClose
 #endif
 
 #include <memory>

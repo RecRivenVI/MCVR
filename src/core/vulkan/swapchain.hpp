@@ -28,6 +28,8 @@ class Swapchain : public SharedObject<Swapchain> {
     VkSurfaceFormatKHR &vkSurfaceFormat();
     std::vector<std::shared_ptr<SwapchainImage>> &swapchainImages();
     uint32_t imageCount();
+    VkPresentModeKHR presentMode() const { return presentMode_; }
+    bool needsReconstruction();
 
   private:
     std::shared_ptr<PhysicalDevice> physicalDevice_;

@@ -2,6 +2,9 @@
 
 #include "core/all_extern.hpp"
 
+#include <cstddef>
+#include <functional>
+#include <unordered_map>
 #include <vector>
 
 namespace vk {
@@ -31,6 +34,12 @@ class DescriptorTable : public SharedObject<DescriptorTable> {
     std::vector<VkDescriptorSet> &descriptorSet();
     std::vector<VkDescriptorSetLayout> &descriptorSetLayout();
     VkPipelineLayout &vkPipelineLayout();
+    // Strong ownership of the pipeline layout and its descriptor set layouts. Pipelines
+    // created with this layout hold this token so the layout outlives the table.
+    std::shared_ptr<void> pipelineLayoutKeepAlive();
+    // Bind an independently owned, layout-compatible immutable set. The caller must retain
+    // each generation used by recorded commands until its submission retires.
+    void useExternalSet(uint32_t set, std::shared_ptr<DescriptorTable> owner, uint32_t sourceSet);
 
     std::shared_ptr<DescriptorTable> bindImage(
         std::shared_ptr<Image> image, VkImageLayout layout, uint32_t set, uint32_t binding, uint32_t viewIndex = 0);
@@ -69,14 +78,46 @@ class DescriptorTable : public SharedObject<DescriptorTable> {
     std::shared_ptr<DescriptorTable> bindAS(std::shared_ptr<TLAS> buffer, uint32_t set, uint32_t binding);
 
   private:
+    struct ResourceBindingKey {
+        uint32_t set;
+        uint32_t binding;
+        uint32_t index;
+
+        bool operator==(const ResourceBindingKey &other) const noexcept {
+            return set == other.set && binding == other.binding && index == other.index;
+        }
+    };
+
+    struct ResourceBindingKeyHash {
+        std::size_t operator()(const ResourceBindingKey &key) const noexcept {
+            std::size_t hash = std::hash<uint32_t>{}(key.set);
+            hash ^= std::hash<uint32_t>{}(key.binding) + static_cast<std::size_t>(0x9e3779b9U) + (hash << 6) +
+                    (hash >> 2);
+            hash ^= std::hash<uint32_t>{}(key.index) + static_cast<std::size_t>(0x9e3779b9U) + (hash << 6) +
+                    (hash >> 2);
+            return hash;
+        }
+    };
+
+    void retainDescriptorResources(uint32_t set,
+                                   uint32_t binding,
+                                   uint32_t index,
+                                   std::vector<std::shared_ptr<void>> resources);
+
     std::shared_ptr<Device> device_;
 
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     std::vector<VkDescriptorSetLayout> tableLayout_;
     std::vector<VkDescriptorSet> table_;
+    std::vector<std::shared_ptr<DescriptorTable>> externalSets_;
     std::vector<std::vector<VkDescriptorType>> tableTypes_;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
+    std::shared_ptr<void> pipelineLayoutKeepAlive_;
     std::vector<VkPushConstantRange> pushConstantRanges_;
+    // Keep every resource generation written to this table until the table retires.
+    // UPDATE_AFTER_BIND permits a bound table to be updated before submission.
+    std::unordered_map<ResourceBindingKey, std::vector<std::shared_ptr<void>>, ResourceBindingKeyHash>
+        resourceKeepAlive_;
 };
 
 class DescriptorTableBuilder {

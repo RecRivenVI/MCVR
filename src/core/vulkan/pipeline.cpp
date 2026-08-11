@@ -1,5 +1,8 @@
 #include "core/vulkan/pipeline.hpp"
 
+#include "core/logging.hpp"
+#include "core/failure_state.hpp"
+
 #include "core/vulkan/descriptor.hpp"
 #include "core/vulkan/device.hpp"
 #include "core/vulkan/render_pass.hpp"
@@ -8,12 +11,12 @@
 #include <iostream>
 #include <vector>
 
-std::ostream &graphicsPipelineCout() {
-    return std::cout << "[GraphicsPipeline] ";
+auto graphicsPipelineCout() {
+    return mcvr::log::info("GraphicsPipeline");
 }
 
-std::ostream &graphicsPipelineCerr() {
-    return std::cerr << "[GraphicsPipeline] ";
+auto graphicsPipelineCerr() {
+    return mcvr::log::error("GraphicsPipeline");
 }
 
 vk::GraphicsPipeline::GraphicsPipeline(std::shared_ptr<Device> device, VkPipeline pipeline)
@@ -213,6 +216,7 @@ vk::GraphicsPipelineBuilder::defineColorBlendState(VkPipelineColorBlendStateCrea
 vk::GraphicsPipelineBuilder &
 vk::GraphicsPipelineBuilder::definePipelineLayout(std::shared_ptr<DescriptorTable> descriptorTable) {
     pipelineLayout_ = descriptorTable->vkPipelineLayout();
+    pipelineLayoutKeepAlive_ = descriptorTable->pipelineLayoutKeepAlive();
     return *this;
 }
 
@@ -260,17 +264,19 @@ std::shared_ptr<vk::GraphicsPipeline> vk::GraphicsPipelineBuilder::build(std::sh
     pipelineCreateInfo.basePipelineIndex = -1;
 
     VkPipeline pipeline;
-    if (vkCreateGraphicsPipelines(device->vkDevice(), VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &pipeline) !=
-        VK_SUCCESS) {
+    if (const auto result = device->createGraphicsPipelines(1, &pipelineCreateInfo, nullptr, &pipeline);
+        result != VK_SUCCESS) {
         graphicsPipelineCerr() << "failed to create graphics pipeline" << std::endl;
-        exit(EXIT_FAILURE);
+        mcvr::failure::raise(mcvr::failure::Kind::runtime, result, "vkCreateGraphicsPipelines");
     } else {
 #ifdef DEBUG
         graphicsPipelineCout() << "created graphics pipeline" << std::endl;
 #endif
     }
 
-    return std::make_shared<GraphicsPipeline>(device, pipeline);
+    auto result = std::make_shared<GraphicsPipeline>(device, pipeline);
+    result->pipelineLayoutKeepAlive_ = pipelineLayoutKeepAlive_;
+    return result;
 }
 
 vk::RayTracingPipelineBuilder::ShaderStageBuilder::ShaderStageBuilder(RayTracingPipelineBuilder &parent)
@@ -331,6 +337,7 @@ vk::RayTracingPipelineBuilder::ShaderGroupBuilder &vk::RayTracingPipelineBuilder
 vk::RayTracingPipelineBuilder &
 vk::RayTracingPipelineBuilder::definePipelineLayout(std::shared_ptr<DescriptorTable> descriptorTable) {
     pipelineLayout_ = descriptorTable->vkPipelineLayout();
+    pipelineLayoutKeepAlive_ = descriptorTable->pipelineLayoutKeepAlive();
     return *this;
 }
 
@@ -345,13 +352,15 @@ std::shared_ptr<vk::RayTracingPipeline> vk::RayTracingPipelineBuilder::build(std
     pipelineInfo.maxPipelineRayRecursionDepth = 3;
 
     VkPipeline rayTracingPipeline;
-    if (vkCreateRayTracingPipelinesKHR(device->vkDevice(), VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
-                                        &rayTracingPipeline) != VK_SUCCESS) {
-        std::cerr << "Cannot build ray tracing pipeline" << std::endl;
-        exit(EXIT_FAILURE);
+    if (const auto result = device->createRayTracingPipelines(VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
+            &rayTracingPipeline); result != VK_SUCCESS) {
+        mcvr::log::error("Pipeline") << "Cannot build ray tracing pipeline" << std::endl;
+        mcvr::failure::raise(mcvr::failure::Kind::runtime, result, "vkCreateRayTracingPipelinesKHR");
     }
 
-    return RayTracingPipeline::create(device, rayTracingPipeline);
+    auto result = RayTracingPipeline::create(device, rayTracingPipeline);
+    result->pipelineLayoutKeepAlive_ = pipelineLayoutKeepAlive_;
+    return result;
 }
 
 vk::ComputePipelineBuilder &vk::ComputePipelineBuilder::defineShader(std::shared_ptr<vk::Shader> shader) {
@@ -362,6 +371,7 @@ vk::ComputePipelineBuilder &vk::ComputePipelineBuilder::defineShader(std::shared
 vk::ComputePipelineBuilder &
 vk::ComputePipelineBuilder::definePipelineLayout(std::shared_ptr<vk::DescriptorTable> descriptorTable) {
     pipelineLayout_ = descriptorTable->vkPipelineLayout();
+    pipelineLayoutKeepAlive_ = descriptorTable->pipelineLayoutKeepAlive();
     return *this;
 }
 
@@ -375,11 +385,13 @@ std::shared_ptr<vk::ComputePipeline> vk::ComputePipelineBuilder::build(std::shar
     computePipelineCreateInfo.layout = pipelineLayout_;
 
     VkPipeline compPipeline;
-    if (vkCreateComputePipelines(device->vkDevice(), VK_NULL_HANDLE, 1, &computePipelineCreateInfo, nullptr,
-                                 &compPipeline) != VK_SUCCESS) {
-        std::cerr << "Cannot build compute pipeline" << std::endl;
-        exit(EXIT_FAILURE);
+    if (const auto result = device->createComputePipelines(1, &computePipelineCreateInfo, nullptr,
+            &compPipeline); result != VK_SUCCESS) {
+        mcvr::log::error("Pipeline") << "Cannot build compute pipeline" << std::endl;
+        mcvr::failure::raise(mcvr::failure::Kind::runtime, result, "vkCreateComputePipelines");
     }
 
-    return ComputePipeline::create(device, compPipeline);
+    auto result = ComputePipeline::create(device, compPipeline);
+    result->pipelineLayoutKeepAlive_ = pipelineLayoutKeepAlive_;
+    return result;
 }

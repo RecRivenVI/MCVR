@@ -7,7 +7,7 @@
 
 namespace vk {
 struct VertexLayoutInfo {
-    VkVertexInputBindingDescription bindingDescription;
+    std::vector<VkVertexInputBindingDescription> bindingDescriptions;
     std::vector<VkVertexInputAttributeDescription> attributeDescriptions;
 };
 
@@ -23,8 +23,13 @@ struct Vertex {
     static constexpr uint32_t useGlintBit = 1u << 3u;
     static constexpr uint32_t useNormBit = 1u << 4u;
     static constexpr uint32_t useLightBit = 1u << 5u;
+    static constexpr uint32_t colorLayerMixBit = 1u << 6u;
+    // Alpha modes use five bits so the text-mode namespace (12..19) cannot
+    // collide with transmission/cutout/coverage modes. Coordinate data starts
+    // after the widened field.
     static constexpr uint32_t alphaModeShift = 8u;
-    static constexpr uint32_t coordinateShift = 12u;
+    static constexpr uint32_t coordinateShift = 13u;
+    static constexpr uint32_t glintModeShift = 18u;
 
     template <typename T>
     static VertexLayoutInfo initVertexLayout(std::vector<VertexAttribute> &attributes);
@@ -38,6 +43,10 @@ struct Vertex {
     static uint32_t packMaterialFlags(const VertexFormat::PBRVertex &vertex);
     static VertexFormat::PositionVertex makePositionVertex(const VertexFormat::PBRVertex &vertex);
     static VertexFormat::MaterialVertex makeMaterialVertex(const VertexFormat::PBRVertex &vertex);
+    static void appendPackedVertices(const std::vector<VertexFormat::PBRVertex> &vertices,
+                                     uint32_t emissiveOverlay,
+                                     std::vector<VertexFormat::PositionVertex> &positions,
+                                     std::vector<VertexFormat::MaterialVertex> &materials);
     static std::vector<VertexFormat::PositionVertex>
     buildPositionVertices(const std::vector<VertexFormat::PBRVertex> &vertices);
     static std::vector<VertexFormat::MaterialVertex>
@@ -53,9 +62,11 @@ vk::VertexLayoutInfo vk::Vertex::initVertexLayout(std::vector<VertexAttribute> &
 
 template <typename T>
 void Vertex::buildVertexLayoutInfo(VertexLayoutInfo &vertexLayoutInfo, std::vector<VertexAttribute> &attributes) {
-    vertexLayoutInfo.bindingDescription.binding = 0;
-    vertexLayoutInfo.bindingDescription.stride = sizeof(T);
-    vertexLayoutInfo.bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    vertexLayoutInfo.bindingDescriptions.push_back({
+        .binding = 0,
+        .stride = sizeof(T),
+        .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+    });
 
     for (uint32_t i = 0; i < attributes.size(); i++) {
         vertexLayoutInfo.attributeDescriptions.push_back({

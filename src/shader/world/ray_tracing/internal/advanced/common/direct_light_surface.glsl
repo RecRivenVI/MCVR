@@ -1,5 +1,7 @@
 #include "common/constants.glsl"
 #include "common/parallax_condition.glsl"
+#include "util/emissive_overlay.glsl"
+#include "util/camera_ray.glsl"
 #ifndef ADV_DIRECT_LIGHT_SURFACE_GLSL
 #define ADV_DIRECT_LIGHT_SURFACE_GLSL
 
@@ -9,6 +11,10 @@
 
 bool hasColorLayer(uint packedData) {
     return (packedData & USE_COLOR_LAYER_BIT) != 0u;
+}
+
+bool hasColorLayerMix(uint packedData) {
+    return (packedData & COLOR_LAYER_MIX_BIT) != 0u;
 }
 
 bool hasTexture(uint packedData) {
@@ -36,7 +42,7 @@ bool hasNoHeightSurface(uint packedData) {
 }
 
 uint getAlphaMode(uint packedData) {
-    return (packedData >> ALPHA_MODE_SHIFT) & 0xFu;
+    return (packedData >> ALPHA_MODE_SHIFT) & 0x1Fu;
 }
 
 uint getCoordinate(uint packedData) {
@@ -60,6 +66,7 @@ struct PrimarySurfaceCache {
     uint packedData;
     vec4 colorLayerValue;
     vec3 glint;
+    uint emissiveOverlayTextureID;
     ivec2 overlayUV;
 };
 
@@ -117,7 +124,8 @@ PrimarySurfaceCache decodeSurfaceCache(vec4 cache0,
     cache.textureID = decodeFirstHitUint(cache4.zw);
     cache.packedData = decodeFirstHitUint(cache7.yz);
     cache.colorLayerValue = cache5;
-    cache.glint = cache6.xyz;
+    cache.glint = unpackUnorm4x8(uint(round(cache6.x))).rgb;
+    cache.emissiveOverlayTextureID = decodeFirstHitUint(cache6.yz);
     cache.overlayUV = ivec2(int(round(cache6.w)), int(round(cache7.x)));
     return cache;
 }
@@ -142,13 +150,8 @@ DirectLightCameraRay buildPrimaryViewDirectLightCameraRay(ivec2 pixel, vec2 reso
     float fovX = fovXFromProj(worldUBO.cameraProjMat);
     cameraRay.coneSpread = coneSpreadFromFov(fovY, fovX, resolution);
 
-    vec2 ndc = pixelCenter / resolution * 2.0 - 1.0;
-    vec4 nearPoint = vec4(ndc, 0.0, 1.0);
-    vec4 viewNear = worldUBO.cameraProjMatInv * nearPoint;
-    viewNear /= viewNear.w;
-
-    cameraRay.origin = vec3(worldUBO.cameraEffectedViewMatInv * vec4(0.0, 0.0, 0.0, 1.0));
-    cameraRay.direction = normalize(vec3(worldUBO.cameraEffectedViewMatInv * vec4(viewNear.xyz, 0.0)));
+    buildWorldCameraRay(worldUBO, pixelCenter, resolution, cameraRay.origin,
+                        cameraRay.direction);
     cameraRay.viewDir = -cameraRay.direction;
     return cameraRay;
 }
@@ -167,6 +170,7 @@ void prepareDirectLightSurface(PrimarySurfaceCache cache,
                                out DirectLightPreparedSurface prepared) {
     uint packedData = cache.packedData;
     bool useColorLayer = hasColorLayer(packedData);
+    bool colorLayerMix = hasColorLayerMix(packedData);
     bool useTexture = hasTexture(packedData);
     bool useGlint = hasGlint(packedData);
     bool useOverlay = hasOverlay(packedData);
@@ -192,11 +196,12 @@ void prepareDirectLightSurface(PrimarySurfaceCache cache,
         lod = lodWithCone(textures[nonuniformEXT(textureID)], textureUV, coneRadiusWorld, cache.dPduWorld,
                           cache.dPdvWorld);
 
-        bool isWaterMaterial = ADV_WATER_SURFACE_MODE == 1u && isFlaggedWaterSurface(textureMap.flag, textureUV, lod);
+        bool isWaterMaterial = ADV_WATER_SURFACE_MODE == 1u && isFlaggedWaterSurface(textureMap, textureUV, lod);
         hasFftWaterSurface = isWaterMaterial && abs(cache.baseGeoNormal.y) > 0.75;
 
         if (ADV_EVALUATE_HEIGHT_MAP != 0 && ADV_ENABLE_PARALLAX != 0 && !hasNoHeightSurface(packedData) &&
             textureMap.normal >= 0 &&
+            !isTextMode(alphaMode) &&
             coordinate != 1u) {
             maxDepthWorld = heightMapMaxDepthWorld(atlasUvMin, atlasUvMax, cache.dPduWorld, cache.dPdvWorld);
             hasHeightMapSurface = maxDepthWorld > heightMapMinWorldDepth &&
@@ -231,9 +236,11 @@ void prepareDirectLightSurface(PrimarySurfaceCache cache,
     vec3 glint = useGlint ? cache.glint : vec3(0.0);
 
     sampleSurfaceState(useTexture, textureID, textureMap, atlasUvMin, atlasUvMax, initialHit.uv, lod, alphaMode,
-                       colorLayerValue, colorLayer, glint, useOverlay, cache.overlayUV, cache.dPduWorld,
+                       colorLayerMix, colorLayerValue, colorLayer, glint, useOverlay, cache.overlayUV, cache.dPduWorld,
                        cache.dPdvWorld, cache.baseGeoNormal, hasHeightMapSurface, maxDepthWorld, initialHit,
                        hitWorldPos, cameraRay.viewDir, hasFftWaterSurface, prepared.surface);
+    prepared.surface.emissiveOverlayRadiance =
+        sampleEmissiveOverlay(cache.emissiveOverlayTextureID, initialHit.uv, lod);
 
     prepared.referenceUv = textureUV;
     prepared.referenceWorldPos = cache.planeHitWorldPos;
