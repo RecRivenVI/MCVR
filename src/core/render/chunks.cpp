@@ -1,3 +1,4 @@
+#include "core/diagnostics/frame_profile.hpp"
 #include "core/render/chunk_trace.hpp"
 #include "core/render/material_faces.hpp"
 #include "core/render/chunk_scheduling.hpp"
@@ -57,6 +58,7 @@ static void buildChunkPackedVertices(const std::vector<std::vector<vk::VertexFor
                                      std::vector<vk::VertexFormat::PositionVertex> &packedPositions,
                                      std::vector<vk::VertexFormat::MaterialVertex> &packedMaterials,
                                      std::vector<uint32_t> &packedIndices) {
+    mcvr::profile::Scope auditProfile("chunk-pack-vertices");
     for (int i = 0; i < static_cast<int>(vertices.size()); i++) {
         const auto &geometryVertices = vertices[i];
         const auto &geometryIndices = indices[i];
@@ -510,6 +512,7 @@ void ChunkBuildData::buildLightInfos(const Emission &emission) {
 }
 
 void ChunkBuildData::build(bool persistStaging) {
+    mcvr::profile::Scope auditProfile("chunk-build-record");
     auto framework = Renderer::instance().framework();
     auto vma = framework->vma();
     auto device = framework->device();
@@ -575,6 +578,7 @@ void ChunkBuildData::build(bool persistStaging) {
 
     blasBuilder = vk::BLASBuilder::create();
     auto blasGeometryBuilder = blasBuilder->beginGeometries();
+    const mcvr::faces::ModelRules faceRules(geometryMaterialFlags);
     for (int i = 0; i < geometryCount; i++) {
         const VkDeviceAddress geometryIndexAddress =
             indexBuffer->bufferAddress() + geometryIndexOffsets[i] * sizeof(uint32_t);
@@ -589,7 +593,7 @@ void ChunkBuildData::build(bool persistStaging) {
 
         blasGeometryBuilder->defineTriangleGeomrtry<vk::VertexFormat::PositionVertex>(
             geometryPositionAddress, vertices[i].size(), geometryIndexAddress, indices[i].size(),
-            geometryTypes[i] == World::WORLD_SOLID && !mcvr::faces::needsAnyHit(geometryMaterialFlags[i], geometryMaterialFlags));
+            geometryTypes[i] == World::WORLD_SOLID && !faceRules.needsAnyHit(geometryMaterialFlags[i]));
     }
 
     positionBuffer->flushStagingBuffer();
@@ -648,6 +652,7 @@ ChunkBuildDataBatch::ChunkBuildDataBatch(uint32_t maxBatchSize,
 }
 
 void ChunkBuildDataBatch::build() {
+    mcvr::profile::Scope auditProfile("chunk-batch-build-record");
     auto framework = Renderer::instance().framework();
     auto vma = framework->vma();
     auto device = framework->device();
@@ -768,6 +773,7 @@ void ChunkBuildDataBatch::build() {
 
         auto blasBuilder = blasBatchBuilder->defineBLASBuilder();
         auto blasGeometryBuilder = blasBuilder->beginGeometries();
+        const mcvr::faces::ModelRules faceRules(data->geometryMaterialFlags);
 
         for (int i = 0; i < data->geometryCount; i++) {
             const VkDeviceAddress geometryIndexAddress =
@@ -785,7 +791,7 @@ void ChunkBuildDataBatch::build() {
 
             blasGeometryBuilder->defineTriangleGeomrtry<vk::VertexFormat::PositionVertex>(
                 geometryPositionAddress, data->vertices[i].size(), geometryIndexAddress, data->indices[i].size(),
-                data->geometryTypes[i] == World::WORLD_SOLID && !mcvr::faces::needsAnyHit(data->geometryMaterialFlags[i], data->geometryMaterialFlags));
+                data->geometryTypes[i] == World::WORLD_SOLID && !faceRules.needsAnyHit(data->geometryMaterialFlags[i]));
         }
 
         blasGeometryBuilder->endGeometries();
@@ -1213,6 +1219,7 @@ bool Chunk1::enqueue(std::shared_ptr<ChunkBuildData> chunkBuildData) {
     lastUpdate = std::chrono::steady_clock::now();
 
     if (chunkBuildData->version == desiredVersion && chunkBuildData->version > blasVersion) {
+        sceneMetadataCache.reset();
         blasVersion = chunkBuildData->version;
         mcvr::chunkTrace::note("publish",chunkBuildData->id,blasVersion,0,chunkBuildData->slotGeneration);
         x = chunkBuildData->x;
@@ -1278,6 +1285,7 @@ void Chunk1::markDirty(int64_t generation) {
 }
 
 void Chunk1::invalidate(int64_t generation) {
+    sceneMetadataCache.reset();
     auto framework = Renderer::instance().framework();
     auto &frr = framework->frameResourceRetainer();
 
@@ -1340,6 +1348,7 @@ void Chunk1::retainResources(FrameResourceRetainer &frr) {
 }
 
 void Chunk1::releaseEmissionResources(FrameResourceRetainer &frr) {
+    sceneMetadataCache.reset();
     frr.retain(lightInfos);
     lightInfos = nullptr;
 
@@ -1369,6 +1378,25 @@ std::shared_ptr<ChunkRenderData> Chunk1::tryGetValid() {
     ret->geometryMaterialFlags = geometryMaterialFlags;
 
     return ret;
+}
+
+const std::shared_ptr<mcvr::ChunkSceneMetadata> &Chunk1::sceneMetadata() {
+    if (!blas) throw std::logic_error("Cannot cache an unpublished chunk");
+    const mcvr::ChunkSceneKey key{blasVersion, geometryCount, {
+        blas.get(), indexBufferAddresses.get(), positionBufferAddresses.get(), materialBufferAddresses.get(),
+        indexBuffer.get(), positionBuffer.get(), materialBuffer.get(), lightInfos.get(), lightBuffer.get(),
+        geometryGroupNames.get(), geometryMaterialFlags.get()}};
+    return sceneMetadataCache.get(key, [&] {
+        auto snapshot = tryGetValid();
+        if (!snapshot->indexBufferAddresses || !snapshot->positionBufferAddresses ||
+            !snapshot->materialBufferAddresses || !snapshot->geometryMaterialFlags)
+            throw std::logic_error("Missing published chunk geometry arrays");
+        const auto names = snapshot->geometryGroupNames
+            ? std::span<const std::string>(*snapshot->geometryGroupNames) : std::span<const std::string>{};
+        return std::make_shared<mcvr::ChunkSceneMetadata>(snapshot, snapshot->geometryCount,
+            *snapshot->indexBufferAddresses, *snapshot->positionBufferAddresses, *snapshot->materialBufferAddresses,
+            names, *snapshot->geometryMaterialFlags);
+    });
 }
 
 Chunks::Chunks(std::shared_ptr<Framework> framework) {
@@ -1587,6 +1615,7 @@ void Chunks::relocateChunk(int64_t handle, int x, int y, int z, int64_t generati
 }
 
 void Chunks::queueChunkBuild(ChunkBuildTask task) {
+    mcvr::profile::Scope auditProfile("chunk-copy-enqueue");
     const auto inputStart = std::chrono::steady_clock::now();
     const auto recordInputTiming = [&]() {
         if (!chunkPerformanceEnabled) return;

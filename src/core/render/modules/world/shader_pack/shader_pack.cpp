@@ -1,4 +1,5 @@
 #include "core/render/modules/world/shader_pack/shader_pack.hpp"
+#include "core/diagnostics/frame_profile.hpp"
 
 #include "core/render/renderer.hpp"
 #include "core/render/scene_scope.hpp"
@@ -2567,6 +2568,7 @@ void ShaderPack::uploadExecutionBuffer(ShaderPackLoader::Stage stage,
                                        uint32_t executionSet,
                                        uint32_t queueIndex,
                                        VkPipelineStageFlags2 dstStageMask) const {
+    mcvr::profile::Scope profile("pt.execution-buffer-pack-upload");
     const auto &execution = this->execution(stage);
     if (executionBuffer == nullptr || execution.variables.empty()) { return; }
 

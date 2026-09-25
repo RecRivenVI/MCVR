@@ -1,3 +1,4 @@
+#include "core/diagnostics/frame_profile.hpp"
 #include "core/render/textures.hpp"
 
 #include "core/logging.hpp"
@@ -11,6 +12,7 @@
 #include "core/render/render_framework.hpp"
 #include "core/render/renderer.hpp"
 #include "core/render/upload_retirement.hpp"
+#include "core/render/sampler_update.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -369,21 +371,20 @@ void Textures::setSamplingMode(uint32_t id, VkFilter samplingMode, VkSamplerMipm
     if (samplerIter == samplers.end() || samplerIter->second == nullptr) {
         throw std::runtime_error("The given texture id " + std::to_string(id) + " has no initialized sampler");
     }
-    if (samplers[id]->vkSamplingMode() != samplingMode) {
-        VkSamplerAddressMode addressMode = samplers[id]->vkAddressMode();
-
-        auto framework = Renderer::instance().framework();
-        if (resourceReloadActive_) {
-            resourceReloadRetainedSamplers_.push_back(samplers[id]);
-        } else {
-            recordTextureState("sampler.replace-filter-old", id, 0, textures_[id], samplers[id]);
-            framework->frameResourceRetainer().retain(samplers[id]);
-        }
-        samplers[id] = vk::Sampler::create(device, samplingMode, mipmapMode, addressMode);
-        recordTextureState("sampler.replace-filter-new", id, 0, textures_[id], samplers[id]);
-    }
-
-    if (!resourceReloadActive_) { bindTextureAndReleasedAliases(id); }
+    mcvr::render::updateSampler(samplerIter->second,
+        [&](auto &sampler) { return mcvr::render::matchesFilter(sampler, samplingMode, mipmapMode); },
+        [&] { return vk::Sampler::create(device, samplingMode, mipmapMode, samplerIter->second->vkAddressMode()); },
+        [&](const auto &old) {
+            if (resourceReloadActive_) resourceReloadRetainedSamplers_.push_back(old);
+            else {
+                recordTextureState("sampler.replace-filter-old", id, 0, textures_[id], old);
+                Renderer::instance().framework()->frameResourceRetainer().retain(old);
+            }
+        },
+        [&] {
+            recordTextureState("sampler.replace-filter-new", id, 0, textures_[id], samplerIter->second);
+            if (!resourceReloadActive_) bindTextureAndReleasedAliases(id);
+        });
 }
 
 void Textures::setAddressMode(uint32_t id, VkSamplerAddressMode addressMode) {
@@ -415,22 +416,21 @@ void Textures::setAddressMode(uint32_t id, VkSamplerAddressMode addressMode) {
     if (samplerIter == samplers.end() || samplerIter->second == nullptr) {
         throw std::runtime_error("The given texture id " + std::to_string(id) + " has no initialized sampler");
     }
-    if (samplers[id]->vkAddressMode() != addressMode) {
-        VkFilter samplingMode = samplers[id]->vkSamplingMode();
-        VkSamplerMipmapMode mipmapMode = samplers[id]->vkMipmapMode();
-
-        auto framework = Renderer::instance().framework();
-        if (resourceReloadActive_) {
-            resourceReloadRetainedSamplers_.push_back(samplers[id]);
-        } else {
-            recordTextureState("sampler.replace-address-old", id, 0, textures_[id], samplers[id]);
-            framework->frameResourceRetainer().retain(samplers[id]);
-        }
-        samplers[id] = vk::Sampler::create(device, samplingMode, mipmapMode, addressMode);
-        recordTextureState("sampler.replace-address-new", id, 0, textures_[id], samplers[id]);
-    }
-
-    if (!resourceReloadActive_) { bindTextureAndReleasedAliases(id); }
+    mcvr::render::updateSampler(samplerIter->second,
+        [&](auto &sampler) { return sampler.vkAddressMode() == addressMode; },
+        [&] { return vk::Sampler::create(device, samplerIter->second->vkSamplingMode(),
+                                        samplerIter->second->vkMipmapMode(), addressMode); },
+        [&](const auto &old) {
+            if (resourceReloadActive_) resourceReloadRetainedSamplers_.push_back(old);
+            else {
+                recordTextureState("sampler.replace-address-old", id, 0, textures_[id], old);
+                Renderer::instance().framework()->frameResourceRetainer().retain(old);
+            }
+        },
+        [&] {
+            recordTextureState("sampler.replace-address-new", id, 0, textures_[id], samplerIter->second);
+            if (!resourceReloadActive_) bindTextureAndReleasedAliases(id);
+        });
 }
 
 VkResult Textures::beginResourceReload() {
@@ -546,6 +546,7 @@ void Textures::queueUpload(uint8_t *srcPointer,
 }
 
 void Textures::performQueuedUpload() {
+    mcvr::profile::Scope auditProfile("texture-upload-record");
     std::scoped_lock lck(mtx_, Renderer::instance().framework()->recreateMtx());
     collectCompletedUploadsImpl();
     flushQueuedUploadImpl();
@@ -718,6 +719,7 @@ void Textures::collectCompletedUploadsImpl() {
 }
 
 void Textures::flushQueuedUploadImpl() {
+    mcvr::profile::Scope auditProfile("texture-flush");
     // Poll retirement even after the last upload. Returning first held the final batch forever.
     collectCompletedUploadsImpl();
     if (uploadQueue_ == nullptr || uploadQueue_->empty()) {

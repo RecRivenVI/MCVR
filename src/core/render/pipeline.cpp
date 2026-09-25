@@ -84,6 +84,7 @@ void WorldPipeline::init(std::shared_ptr<Framework> framework, std::shared_ptr<P
                          std::vector<std::shared_ptr<WorldModuleRebuildState>> rebuildStates,
                          VkExtent2D renderExtent) {
     auto blueprint = pipeline->worldPipelineBlueprint();
+    auditModuleNames_=blueprint->moduleNames_;
     emissionAtBuild_ = Renderer::options.collectChunkEmission;
     uint32_t frameNum = framework->recordingContextCount();
     viewCount_ = SceneRecordingScope::active() ? SceneRecordingScope::active()->viewCount : 1;
@@ -262,7 +263,11 @@ void WorldPipelineContext::render() {
     }
 
     for (int i = 0; i < worldModuleContexts.size(); i++) {
+        auto name=worldPipeline.lock()->auditModuleNames_[i].c_str();
+        mcvr::profile::Scope auditRecord(name);
+        const int stamp=SceneRecordingScope::active() ? -1 : context->auditGpu.begin(worldCommandBuffer->vkCommandBuffer(),name,3);
         mcvr::failure::runCheckedStage([&] { worldModuleContexts[i]->render(); });
+        context->auditGpu.end(worldCommandBuffer->vkCommandBuffer(),stamp);
     }
 
     worldCommandBuffer->barriersBufferImage(

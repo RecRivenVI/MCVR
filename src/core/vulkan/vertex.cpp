@@ -1,6 +1,8 @@
 #include "core/vulkan/vertex.hpp"
 
 #include "common/shared.hpp"
+#include <cstring>
+#include <stdexcept>
 
 uint32_t vk::Vertex::packMaterialFlags(const VertexFormat::PBRVertex &vertex) {
     uint32_t packed = 0;
@@ -38,6 +40,22 @@ vk::VertexFormat::MaterialVertex vk::Vertex::makeMaterialVertex(const VertexForm
         .packedData = packMaterialFlags(vertex),
         .emissiveOverlayTextureID = 0,
     };
+}
+
+void vk::Vertex::writePackedVertices(std::span<const VertexFormat::PBRVertex> vertices,
+                                     uint32_t emissiveOverlay,
+                                     std::span<VertexFormat::PositionVertex> positions,
+                                     std::span<VertexFormat::MaterialVertex> materials) {
+    if (positions.size() != vertices.size() || materials.size() != vertices.size())
+        throw std::invalid_argument("Packed vertex destination size mismatch");
+    for (size_t i = 0; i < vertices.size(); ++i) {
+        const auto position = makePositionVertex(vertices[i]);
+        auto material = makeMaterialVertex(vertices[i]);
+        material.emissiveOverlayTextureID = emissiveOverlay;
+        // memcpy also establishes the trivial object's lifetime in raw mapped storage.
+        std::memcpy(positions.data() + i, &position, sizeof(position));
+        std::memcpy(materials.data() + i, &material, sizeof(material));
+    }
 }
 
 std::vector<vk::VertexFormat::PositionVertex>

@@ -77,7 +77,8 @@ void main() {
         loadTrianglePositions(geometryBufferIndex, i0, i1, i2, p0, p1, p2);
         vec3 dposdu, dposdv;
         computedposduDv(p0.pos, p1.pos, p2.pos, m0.textureUV, m1.textureUV, m2.textureUV, dposdu, dposdv);
-        float lod = lodWithCone(textures[nonuniformEXT(m0.textureID)], uv, coneRadiusWorld, dposdu, dposdv);
+        float lod = lodWithObjectCone(textures[nonuniformEXT(m0.textureID)], coneRadiusWorld, mat3(gl_ObjectToWorldEXT),
+            p0.pos, p1.pos, p2.pos, m0.textureUV, m1.textureUV, m2.textureUV);
 
         textureColor = sampleTexture(textures[nonuniformEXT(m0.textureID)], uv, lod, false);
     }

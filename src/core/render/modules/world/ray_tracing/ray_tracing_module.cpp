@@ -1,4 +1,5 @@
 #include "core/logging.hpp"
+#include "core/diagnostics/frame_profile.hpp"
 #include "core/failure_state.hpp"
 #include "core/diagnostics/device_loss_trace.hpp"
 #include "core/render/scene_scope.hpp"
@@ -663,6 +664,7 @@ void RayTracingModule::initRuntimeBuffers() {
 }
 
 void RayTracingModule::refreshRuntimeBuffers(uint32_t frameIndex) {
+    mcvr::profile::Scope profile("pt.runtime-buffers");
     if (shaderPack_ == nullptr) { return; }
     shaderPack_->setRuntimeResourceExpressionVariables(executionExpressionVariables());
     shaderPack_->refreshRuntimeBuffers();
@@ -1339,6 +1341,7 @@ void RayTracingModule::uploadStaticRayTracingPassSbts(std::shared_ptr<vk::Device
 void RayTracingModule::renderFullScreenPass(
     const FullScreenPass &pass,
     RayTracingModuleContext &context) {
+    mcvr::profile::Scope profile("pt.pass-fullscreen");
     auto frameworkContext = context.frameworkContext.lock();
     auto worldCommandBuffer = frameworkContext->worldCommandBuffer;
     uint32_t frameIndex = frameworkContext->frameIndex;
@@ -1386,6 +1389,7 @@ void RayTracingModule::renderRayTracingPass(
     RayTracingPass &pass,
     RayTracingModuleContext &context,
     const std::unordered_map<std::string, ExecutionVariable> &variables) {
+    mcvr::profile::Scope profile("pt.pass-raytrace");
     auto frameworkContext = context.frameworkContext.lock();
     auto framework = frameworkContext->framework.lock();
     auto worldCommandBuffer = frameworkContext->worldCommandBuffer;
@@ -1438,6 +1442,7 @@ void RayTracingModule::renderSharcUpdateAndResolve(
     RayTracingPass &pass,
     RayTracingModuleContext &context,
     const ExecutionVariables &variables) {
+    mcvr::profile::Scope profile("pt.pass-sharc");
     auto frameworkContext = context.frameworkContext.lock();
     auto framework = frameworkContext->framework.lock();
     auto worldCommandBuffer = frameworkContext->worldCommandBuffer;
@@ -1503,6 +1508,7 @@ void RayTracingModule::renderComputePass(
     const ComputePass &pass,
     RayTracingModuleContext &context,
     const std::unordered_map<std::string, ExecutionVariable> &variables) {
+    mcvr::profile::Scope profile("pt.pass-compute");
     auto frameworkContext = context.frameworkContext.lock();
     auto framework = frameworkContext->framework.lock();
     auto worldCommandBuffer = frameworkContext->worldCommandBuffer;
@@ -1896,6 +1902,7 @@ RayTracingModuleContext::RayTracingModuleContext(std::shared_ptr<FrameworkContex
       worldPrepareContext(rayTracingModule->worldPrepare_->contexts_[frameworkContext->frameIndex]) {}
 
 void RayTracingModuleContext::render() {
+    mcvr::profile::Phases profile("pt.bind-frame-inputs");
     auto module = rayTracingModule.lock();
     if (module == nullptr) { return; }
 
@@ -1915,7 +1922,9 @@ void RayTracingModuleContext::render() {
     rayTracingDescriptorTable->bindBuffer(buffers->lastWorldUniformBuffer(), 2, 1);
     rayTracingDescriptorTable->bindBuffer(buffers->skyUniformBuffer(), 2, 2);
 
+    profile.next("pt.prepare-dispatch");
     mcvr::failure::runCheckedStage([&] { worldPrepareContext->render(); });
+    profile.next("pt.bind-scene-inputs");
     if (Renderer::options.collectChunkEmission && chunks != nullptr && chunks->chunkPackedData() != nullptr) {
         rayTracingDescriptorTable->bindBuffer(chunks->chunkPackedData(), 1, 9);
     }
@@ -1932,6 +1941,7 @@ void RayTracingModuleContext::render() {
         rayTracingDescriptorTable->bindBuffer(worldPrepareContext->instanceAppearanceBuffer, 1, 10);
     }
 
+    profile.next("pt.execution-variables");
     RayTracingModule::ExecutionVariables variables;
     variables.reserve(module->globalVariables_.size());
     for (const auto &[name, value] : module->globalVariables_) {
@@ -1944,6 +1954,7 @@ void RayTracingModuleContext::render() {
                           });
     }
 
+    profile.next("pt.sharc-dispatch");
     if (module->hasSharcRuntime_ && module->isSharcEnabled_ && module->sharcUpdatePass_ != nullptr) {
         auto &updateVariables = variables;
         if (module->sharcUpdatePass_->executionBuffer != nullptr) {
@@ -1957,7 +1968,9 @@ void RayTracingModuleContext::render() {
         module->renderSharcUpdateAndResolve(*module->sharcUpdatePass_, *this, updateVariables);
     }
 
+    profile.next("pt.execution-program");
     auto executePass = [&](const std::string &passName, ShaderPack::ExecutionVariables &passVariables) {
+        mcvr::profile::Scope passProfile("pt.pass-execute");
         mcvr::failure::throwIfFatal();
         auto passIter = module->passNameToPass_.find(passName);
         if (passIter == module->passNameToPass_.end()) { throw std::runtime_error("unknown pass: " + passName); }
@@ -1993,6 +2006,7 @@ void RayTracingModuleContext::render() {
         module->shaderPack_->execution(ShaderPackLoader::Stage::RayTracing).commands, variables,
         module->executionExpressionVariables(), true, RayTracingModule::executionLoopLimit, executePass);
 
+    profile.next("pt.execution-finish");
     for (auto &[name, value] : module->globalVariables_) {
         auto iter = variables.find(name);
         if (iter != variables.end()) { value = iter->second.value; }

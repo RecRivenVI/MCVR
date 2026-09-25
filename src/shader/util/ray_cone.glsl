@@ -40,14 +40,13 @@ void computedposduDv(vec3 pos0, vec3 pos1, vec3 pos2, vec2 uv0, vec2 uv1, vec2 u
     dposdv = (-dpos1 * duv2.x + dpos2 * duv1.x) * invDet;
 }
 
-float lodWithCone(sampler2D tex, vec2 uv, float coneRadiusWorld, vec3 dposdu, vec3 dposdv) {
+float rayConeLod(vec2 texDim, float coneRadiusWorld, vec3 dposdu, vec3 dposdv) {
     float su = max(length(dposdu), 1e-6);
     float sv = max(length(dposdv), 1e-6);
 
     float du = coneRadiusWorld / su;
     float dv = coneRadiusWorld / sv;
 
-    ivec2 texDim = textureSize(tex, 0);
     float footprintTexels = max(du * float(texDim.x), dv * float(texDim.y));
 
     float lod = max(log2(max(footprintTexels, 1e-6)), 0.0);
@@ -55,4 +54,21 @@ float lodWithCone(sampler2D tex, vec2 uv, float coneRadiusWorld, vec3 dposdu, ve
     return lod;
 }
 
+float lodWithCone(sampler2D tex, vec2 uv, float coneRadiusWorld, vec3 dposdu, vec3 dposdv) {
+    return rayConeLod(vec2(textureSize(tex, 0)), coneRadiusWorld, dposdu, dposdv);
+}
+
+float objectRayConeLod(vec2 texDim, float radius, mat3 objectToWorld,
+    vec3 p0, vec3 p1, vec3 p2, vec2 uv0, vec2 uv1, vec2 uv2) {
+    vec3 du, dv;
+    // World-space cone widths require world-space derivatives, including degenerate UVs.
+    computedposduDv(objectToWorld * p0, objectToWorld * p1, objectToWorld * p2,
+        uv0, uv1, uv2, du, dv);
+    return rayConeLod(texDim, radius, du, dv);
+}
+float lodWithObjectCone(sampler2D tex, float radius, mat3 objectToWorld,
+    vec3 p0, vec3 p1, vec3 p2, vec2 uv0, vec2 uv1, vec2 uv2) {
+    return objectRayConeLod(vec2(textureSize(tex, 0)), radius, objectToWorld,
+        p0, p1, p2, uv0, uv1, uv2);
+}
 #endif

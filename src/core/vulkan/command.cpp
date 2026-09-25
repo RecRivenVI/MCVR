@@ -1,4 +1,5 @@
 #include "core/vulkan/command.hpp"
+#include "core/diagnostics/frame_profile.hpp"
 
 #include "core/logging.hpp"
 #include "core/failure_state.hpp"
@@ -210,6 +211,7 @@ std::shared_ptr<vk::CommandBuffer> vk::CommandBuffer::endRenderPass() {
 std::shared_ptr<vk::CommandBuffer>
 vk::CommandBuffer::bindDescriptorTable(std::shared_ptr<DescriptorTable> descriptorTable,
                                        VkPipelineBindPoint bindPoint) {
+    mcvr::profile::Scope profile("vk.descriptor-materialize-bind");
     uint32_t dynamicCount = descriptorTable->dynamicDescriptorCount();
     std::vector<uint32_t> dynamicOffsets(dynamicCount, 0); // fallback, still need to update later!
     vkCmdBindDescriptorSets(commandBuffer_, bindPoint, descriptorTable->vkPipelineLayout(), 0,

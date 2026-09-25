@@ -11,6 +11,17 @@ target_compile_definitions(mcvr_contract_test PRIVATE
 
 add_test(NAME mcvr.contract COMMAND mcvr_contract_test)
 
+add_executable(mcvr_frame_profile_test frame_profile_test.cpp)
+target_compile_features(mcvr_frame_profile_test PRIVATE cxx_std_23)
+target_include_directories(mcvr_frame_profile_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+add_test(NAME mcvr.frame-profile COMMAND mcvr_frame_profile_test)
+add_executable(mcvr_gpu_profile_test gpu_profile_test.cpp)
+target_compile_features(mcvr_gpu_profile_test PRIVATE cxx_std_23)
+target_compile_definitions(mcvr_gpu_profile_test PRIVATE VK_NO_PROTOTYPES)
+target_include_directories(mcvr_gpu_profile_test PRIVATE "${PROJECT_SOURCE_DIR}/src"
+    "${PROJECT_SOURCE_DIR}/extern/vulkan_headers/include" "${VOLK_INCLUDE_DIR}")
+add_test(NAME mcvr.gpu-profile COMMAND mcvr_gpu_profile_test)
+
 add_executable(mcvr_texture_upload_region_test texture_upload_region_test.cpp)
 target_compile_features(mcvr_texture_upload_region_test PRIVATE cxx_std_23)
 target_include_directories(mcvr_texture_upload_region_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
@@ -29,6 +40,18 @@ target_include_directories(mcvr_entity_vertex_packing_test PRIVATE "${PROJECT_SO
     "${PROJECT_SOURCE_DIR}/extern/vulkan_headers/include" "${VOLK_INCLUDE_DIR}"
     "${VMA_INCLUDE_DIR}" "${GLFW_INCLUDE_DIR}" "${GLM_INCLUDE_DIR}" "${STB_INCLUDE_DIR}")
 add_test(NAME mcvr.entity-vertex-packing COMMAND mcvr_entity_vertex_packing_test)
+
+add_executable(mcvr_entity_conversion_gpu_test entity_conversion_gpu_test.cpp
+    "${PROJECT_SOURCE_DIR}/src/core/vulkan/vertex.cpp")
+target_compile_features(mcvr_entity_conversion_gpu_test PRIVATE cxx_std_23)
+target_compile_definitions(mcvr_entity_conversion_gpu_test PRIVATE VK_NO_PROTOTYPES)
+target_include_directories(mcvr_entity_conversion_gpu_test PRIVATE "${PROJECT_SOURCE_DIR}/src"
+    "${VMA_INCLUDE_DIR}" "${GLFW_INCLUDE_DIR}" "${GLM_INCLUDE_DIR}" "${STB_INCLUDE_DIR}")
+target_link_libraries(mcvr_entity_conversion_gpu_test PRIVATE volk::volk)
+add_dependencies(mcvr_entity_conversion_gpu_test shaders)
+add_test(NAME mcvr.entity-conversion-gpu COMMAND mcvr_entity_conversion_gpu_test
+    "${PROJECT_BINARY_DIR}/src/shader/shaders/world/entity_convert_comp.spv")
+set_tests_properties(mcvr.entity-conversion-gpu PROPERTIES SKIP_RETURN_CODE 77)
 
 add_executable(mcvr_instancing_contract_test instancing_contract_test.cpp)
 target_compile_features(mcvr_instancing_contract_test PRIVATE cxx_std_23)
@@ -262,6 +285,11 @@ target_compile_features(mcvr_texture_binding_snapshots_test PRIVATE cxx_std_23)
 target_include_directories(mcvr_texture_binding_snapshots_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
 add_test(NAME mcvr.texture-binding-snapshots COMMAND mcvr_texture_binding_snapshots_test)
 
+add_executable(mcvr_sampler_update_test sampler_update_test.cpp)
+target_compile_features(mcvr_sampler_update_test PRIVATE cxx_std_23)
+target_include_directories(mcvr_sampler_update_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+add_test(NAME mcvr.sampler-update COMMAND mcvr_sampler_update_test)
+
 add_executable(mcvr_upload_staging_budget_test upload_staging_budget_test.cpp)
 target_compile_features(mcvr_upload_staging_budget_test PRIVATE cxx_std_23)
 target_include_directories(mcvr_upload_staging_budget_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
@@ -437,3 +465,28 @@ add_executable(mcvr_audit_sink_test audit_sink_test.cpp)
 target_compile_features(mcvr_audit_sink_test PRIVATE cxx_std_23)
 target_include_directories(mcvr_audit_sink_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
 add_test(NAME mcvr.audit-sink COMMAND mcvr_audit_sink_test)
+
+add_executable(mcvr_chunk_scene_metadata_test chunk_scene_metadata_test.cpp)
+target_compile_features(mcvr_chunk_scene_metadata_test PRIVATE cxx_std_23)
+target_include_directories(mcvr_chunk_scene_metadata_test PRIVATE "${PROJECT_SOURCE_DIR}/src"
+    "${PROJECT_SOURCE_DIR}/extern/vulkan_headers/include" "${GLM_INCLUDE_DIR}")
+add_test(NAME mcvr.chunk-scene-metadata COMMAND mcvr_chunk_scene_metadata_test)
+
+set(RIGID_MODEL_SPIRV "${CMAKE_CURRENT_BINARY_DIR}/shaders/rigid_model.spv")
+add_custom_command(OUTPUT "${RIGID_MODEL_SPIRV}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
+    COMMAND "${MCVR_TEST_GLSLANG}" -V "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rigid_model.comp"
+        "-I${PROJECT_SOURCE_DIR}/src/shader" --target-env vulkan1.2 -o "${RIGID_MODEL_SPIRV}"
+    DEPENDS shaders/rigid_model.comp "${PROJECT_SOURCE_DIR}/src/shader/util/ray_cone.glsl" VERBATIM)
+add_custom_target(mcvr_rigid_model_shader DEPENDS "${RIGID_MODEL_SPIRV}")
+add_dependencies(mcvr_framebuffer_gpu_test mcvr_rigid_model_shader)
+add_test(NAME mcvr.rigid-model-gpu COMMAND mcvr_framebuffer_gpu_test
+    "${PROJECT_BINARY_DIR}/src/shader/shaders/overlay/clear_vert.spv"
+    "${PROJECT_BINARY_DIR}/src/shader/shaders/overlay/clear_frag.spv"
+    "${PROJECT_BINARY_DIR}/src/shader/shaders/overlay/clear_2_frag.spv"
+    --rigid-model "${RIGID_MODEL_SPIRV}")
+set_tests_properties(mcvr.rigid-model-gpu PROPERTIES SKIP_RETURN_CODE 77)
+add_executable(mcvr_rigid_build_lifecycle_test rigid_build_lifecycle_test.cpp)
+target_compile_features(mcvr_rigid_build_lifecycle_test PRIVATE cxx_std_23)
+target_include_directories(mcvr_rigid_build_lifecycle_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+add_test(NAME mcvr.rigid-build-lifecycle COMMAND mcvr_rigid_build_lifecycle_test)

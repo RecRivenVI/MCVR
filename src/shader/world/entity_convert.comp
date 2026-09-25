@@ -1,0 +1,62 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "../../common/shared.hpp"
+#include "../../common/entity_convert.hpp"
+
+layout(local_size_x=64) in;
+layout(set=0,binding=0,std430) readonly buffer Input { uint words[]; } src;
+layout(set=0,binding=1,std430) readonly buffer Jobs { EntityConvertJob jobs[]; } work;
+layout(set=0,binding=2,std430) writeonly buffer Positions { PositionVertex vertices[]; } positions;
+layout(set=0,binding=3,std430) writeonly buffer Materials { MaterialVertex vertices[]; } materials;
+layout(set=0,binding=4,std430) writeonly buffer Indices { uint indices[]; } indices;
+layout(push_constant) uniform Push { uint firstJob; } pushData;
+
+float f(uint at) { return uintBitsToFloat(src.words[at]); }
+vec2 f2(uint at) { return vec2(f(at), f(at+1)); }
+vec3 f3(uint at) { return vec3(f(at), f(at+1), f(at+2)); }
+vec4 f4(uint at) { return vec4(f(at), f(at+1), f(at+2), f(at+3)); }
+
+void main() {
+    EntityConvertJob j = work.jobs[pushData.firstJob + gl_WorkGroupID.x];
+    uint v = j.first + gl_LocalInvocationID.x;
+    if (v < j.vertexCount) {
+        uint at = j.source + v * 32u;
+        PositionVertex p;
+        p.pos = f3(at); p.pad0 = 0u;
+        MaterialVertex m;
+        m.norm=f3(at+4); m.textureID=src.words[at+19]; m.colorLayer=f4(at+8);
+        m.textureUV=f2(at+14); m.overlayUV=ivec2(src.words[at+16],src.words[at+17]);
+        m.glintUV=f2(at+20); m.glintTexture=src.words[at+22]; m.albedoEmission=f(at+27);
+        m.lightUV=ivec2(src.words[at+24],src.words[at+25]);
+        uint color=src.words[at+7], glint=src.words[at+18];
+        m.packedData=(color>0u?1u:0u) | (src.words[at+12]>0u?2u:0u) |
+            (src.words[at+13]>0u?4u:0u) | (glint>0u?8u:0u) |
+            (src.words[at+3]>0u?16u:0u) | (src.words[at+23]>0u?32u:0u) |
+            (color>1u?64u:0u) | ((src.words[at+31]&31u)<<8) |
+            ((src.words[at+26]&15u)<<13) | ((glint&3u)<<18);
+        if (j.deferred == 1u) {
+            // Deferred PBR topology/material processing; alpha remains the encoded PBR mode.
+            if (j.normalOffset != 0u && src.words[at+3] != 0u)
+                p.pos += 0.00001 * normalize(m.norm);
+            m.packedData = (m.packedData & ~(15u<<13)) | ((j.coordinate & 15u)<<13);
+            if ((j.emissionPolicy & 1u) != 0u) {
+                float value = uintBitsToFloat(j.emissionBits);
+                // Same comparison as std::max, including a NaN original value.
+                if (m.albedoEmission < value) m.albedoEmission = value;
+            }
+            if ((j.emissionPolicy & 2u) != 0u) m.albedoEmission = 1.0;
+        }
+        m.emissiveOverlayTextureID=j.emissiveOverlay;
+        positions.vertices[j.vertexOffset+v]=p;
+        materials.vertices[j.vertexOffset+v]=m;
+    }
+    if (v < j.indexCount) {
+        uint index;
+        if (j.deferred != 1u) index=src.words[j.indexSource+v];
+        else if (j.quadIndices != 0u) {
+            const uint pattern[6]=uint[6](0u,1u,2u,2u,3u,0u);
+            index=(v/6u)*4u+pattern[v%6u];
+        } else index=v;
+        indices.indices[j.indexOffset+v]=index;
+    }
+}

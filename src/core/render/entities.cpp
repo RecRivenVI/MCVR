@@ -1,3 +1,8 @@
+#include "core/render/entity_gpu_conversion.hpp"
+#include "core/render/scene_scope.hpp"
+#include <cstdlib>
+#include <glm/gtc/type_ptr.hpp>
+#include "core/diagnostics/frame_profile.hpp"
 #include "core/render/material_faces.hpp"
 #include "core/render/entities.hpp"
 
@@ -25,6 +30,13 @@ using VertexIdentifier = std::array<uint32_t, 2>;
 using TriangleIdentifier = std::array<VertexIdentifier, 3>;
 
 namespace {
+// CPU reference remains available for controlled comparisons (restart required).
+bool gpuEntityConversionEnabled() {
+    static const bool enabled = [] { const auto *v = std::getenv("MCVR_ENTITY_GPU_CONVERSION");
+        return !v || std::string_view(v) != "0"; }();
+    return enabled && !SceneRecordingScope::active();
+}
+
 
 const char *postRenderFlagName(int postRenderFlag) {
     switch (postRenderFlag) {
@@ -244,23 +256,6 @@ struct TriangleHash {
     }
 };
 
-static void buildEntityPackedVertices(const std::vector<std::vector<vk::VertexFormat::PBRVertex>> &vertices,
-                                      const std::vector<std::vector<uint32_t>> &indices,
-                                      const std::vector<uint32_t> &emissiveOverlayTextureIDs,
-                                      std::vector<vk::VertexFormat::PositionVertex> &packedPositions,
-                                      std::vector<vk::VertexFormat::MaterialVertex> &packedMaterials,
-                                      std::vector<uint32_t> &packedIndices) {
-    for (int i = 0; i < static_cast<int>(vertices.size()); i++) {
-        const auto &geometryVertices = vertices[i];
-        const auto &geometryIndices = indices[i];
-
-        packedIndices.insert(packedIndices.end(), geometryIndices.begin(), geometryIndices.end());
-
-        vk::Vertex::appendPackedVertices(geometryVertices, emissiveOverlayTextureIDs[i],
-                                         packedPositions, packedMaterials);
-    }
-}
-
 
 EntityBuildData::EntityBuildData(int hashCode,
                                  double x,
@@ -314,13 +309,15 @@ void EntityBuildDataBatch::addData(std::shared_ptr<EntityBuildData> data) {
     datas.push_back(data);
 }
 
-void EntityBuildDataBatch::build() {
+void EntityBuildDataBatch::build(std::shared_ptr<vk::ComputePipeline> *conversionPipeline) {
+    mcvr::profile::Scope auditProfile("entity-batch-build-record");
     auto clearBatch = [this]() {
         datas.clear();
         indexBuffer = nullptr;
         positionBuffer = nullptr;
         materialBuffer = nullptr;
         blasBatchBuilder = nullptr;
+        gpuConversion = nullptr;
     };
 
     if (datas.empty()) {
@@ -333,6 +330,7 @@ void EntityBuildDataBatch::build() {
     auto device = framework->device();
     auto physicalDevice = framework->physicalDevice();
 
+    mcvr::profile::Phases preparation("entity.layout");
     std::vector<uint32_t> instanceOffsets;
     std::vector<uint32_t> geometryVertexOffsets;
     std::vector<uint32_t> geometryIndexOffsets;
@@ -346,8 +344,8 @@ void EntityBuildDataBatch::build() {
             geometryVertexOffsets.push_back(totalVertexCount);
             geometryIndexOffsets.push_back(totalIndexCount);
 
-            totalVertexCount += data->vertices[i].size();
-            totalIndexCount += data->indices[i].size();
+            totalVertexCount += data->vertexCount(i);
+            totalIndexCount += data->indexCount(i);
         }
 
         totalGeometryCount += data->geometryCount;
@@ -358,6 +356,7 @@ void EntityBuildDataBatch::build() {
         return;
     }
 
+    preparation.next("entity.device-buffer-allocate");
     positionBuffer = vk::DeviceLocalBuffer::create(
         vma, device, false, totalVertexCount * sizeof(vk::VertexFormat::PositionVertex),
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
@@ -370,34 +369,54 @@ void EntityBuildDataBatch::build() {
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
-    std::vector<vk::VertexFormat::PositionVertex> packedPositions;
-    std::vector<vk::VertexFormat::MaterialVertex> packedMaterials;
-    std::vector<uint32_t> packedIndices;
-    packedPositions.reserve(totalVertexCount);
-    packedMaterials.reserve(totalVertexCount);
-    packedIndices.reserve(totalIndexCount);
-    for (auto data : datas) {
-        buildEntityPackedVertices(data->vertices, data->indices, data->emissiveOverlayTextureIDs,
-                                  packedPositions, packedMaterials, packedIndices);
+    if (conversionPipeline) {
+        gpuConversion = EntityGpuConversion::create(*framework, datas, positionBuffer, materialBuffer, indexBuffer,
+                                                   *conversionPipeline);
+    } else {
+    // Keep the source PBR data for overlay composition and other existing consumers, but
+    // write the final streams directly to their owned staging allocations. No intermediate
+    // packed vectors, extra copy, global idle, or change to upload/BLAS retirement.
+    preparation.next("entity.staging-write");
+    positionBuffer->writeToStagingBuffer([&](void *positionData, size_t positionBytes) {
+        materialBuffer->writeToStagingBuffer([&](void *materialData, size_t materialBytes) {
+            indexBuffer->writeToStagingBuffer([&](void *indexData, size_t indexBytes) {
+                auto positions = std::span(static_cast<vk::VertexFormat::PositionVertex *>(positionData),
+                    positionBytes / sizeof(vk::VertexFormat::PositionVertex));
+                auto materials = std::span(static_cast<vk::VertexFormat::MaterialVertex *>(materialData),
+                    materialBytes / sizeof(vk::VertexFormat::MaterialVertex));
+                auto packedIndices = std::span(static_cast<uint32_t *>(indexData), indexBytes / sizeof(uint32_t));
+                size_t vertexOffset = 0, indexOffset = 0;
+                preparation.next("entity.host-pack");
+                for (const auto &data : datas) {
+                    mcvr::profile::Scope packing("entity-pack-vertices");
+                    for (size_t i = 0; i < data->vertices.size(); ++i) {
+                        const auto &vertices = data->vertices[i];
+                        const auto &indices = data->indices[i];
+                        if (vertices.size() > positions.size() - vertexOffset ||
+                            vertices.size() > materials.size() - vertexOffset ||
+                            indices.size() > packedIndices.size() - indexOffset)
+                            throw std::out_of_range("Entity packed stream exceeds its allocated buffer");
+                        vk::Vertex::writePackedVertices(vertices, data->emissiveOverlayTextureIDs[i],
+                            positions.subspan(vertexOffset, vertices.size()),
+                            materials.subspan(vertexOffset, vertices.size()));
+                        std::memcpy(packedIndices.data() + indexOffset, indices.data(), indices.size() * sizeof(uint32_t));
+                        vertexOffset += vertices.size();
+                        indexOffset += indices.size();
+                    }
+                }
+                preparation.next("entity.staging-flush");
+            });
+        });
+    });
+
     }
 
-    if (!packedPositions.empty()) {
-        positionBuffer->uploadToStagingBuffer(packedPositions.data(),
-                                              packedPositions.size() * sizeof(vk::VertexFormat::PositionVertex), 0);
-        materialBuffer->uploadToStagingBuffer(packedMaterials.data(),
-                                              packedMaterials.size() * sizeof(vk::VertexFormat::MaterialVertex), 0);
-    }
-    if (!packedIndices.empty()) {
-        indexBuffer->uploadToStagingBuffer(packedIndices.data(), packedIndices.size() * sizeof(uint32_t), 0);
-    }
-    positionBuffer->flushStagingBuffer();
-    materialBuffer->flushStagingBuffer();
-    indexBuffer->flushStagingBuffer();
-
+    preparation.next("entity.blas-prepare");
     blasBatchBuilder = vk::BLASBatchBuilder::create();
     std::vector<uint32_t> nonPrebuildInstances;
     for (int instanceIndex = 0; auto data : datas) {
         auto instanceOffset = instanceOffsets[instanceIndex];
+        const mcvr::faces::ModelRules faceRules(data->geometryMaterialFlags);
         std::shared_ptr<vk::BLASBuilder> blasBuilder = nullptr;
         std::shared_ptr<vk::BLASBuilder::BLASGeometryBuilder> blasGeometryBuilder = nullptr;
         if (data->prebuiltBLAS < 0) {
@@ -419,9 +438,9 @@ void EntityBuildDataBatch::build() {
             data->materialBufferAddresses.push_back(materialBufferAddress);
             if (data->prebuiltBLAS < 0) {
                 blasGeometryBuilder->defineTriangleGeomrtry<vk::VertexFormat::PositionVertex>(
-                    positionBufferAddress, data->vertices[i].size(), indexBufferAddress, data->indices[i].size(),
+                    positionBufferAddress, data->vertexCount(i), indexBufferAddress, data->indexCount(i),
                     data->geometryTypes[i] == World::WORLD_SOLID &&
-                    !mcvr::faces::needsAnyHit(data->geometryMaterialFlags[i], data->geometryMaterialFlags));
+                    !faceRules.needsAnyHit(data->geometryMaterialFlags[i]));
             }
         }
         if (data->prebuiltBLAS < 0) {
@@ -433,6 +452,7 @@ void EntityBuildDataBatch::build() {
         instanceIndex++;
     }
 
+    preparation.next("entity.blas-allocate");
     auto blass = blasBatchBuilder->allocateBuffers(physicalDevice, device, vma)->build(device);
     for (int i = 0; i < nonPrebuildInstances.size(); i++) { datas[nonPrebuildInstances[i]]->blas = blass[i]; }
 }
@@ -475,8 +495,8 @@ Entity::Entity(std::shared_ptr<EntityBuildData> chunkBuildData) {
     vertexCounts->reserve(geometryCount);
     indexCounts->reserve(geometryCount);
     for (uint32_t i = 0; i < geometryCount; i++) {
-        vertexCounts->push_back(static_cast<uint32_t>(chunkBuildData->vertices[i].size()));
-        indexCounts->push_back(static_cast<uint32_t>(chunkBuildData->indices[i].size()));
+        vertexCounts->push_back(chunkBuildData->vertexCount(i));
+        indexCounts->push_back(chunkBuildData->indexCount(i));
     }
 }
 
@@ -531,6 +551,104 @@ EntityPostBatch::EntityPostBatch(std::shared_ptr<EntityPostBuildDataBatch> entit
 
 Entities::Entities(std::shared_ptr<Framework> framework) {}
 
+void Entities::queueRigidModel(uint64_t model, uint64_t instance, int geometryType, int texture,
+    const void *vertices, int vertexCount, double x, double y, double z, int mask,
+    const float *matrix, const char *group) {
+    mcvr::profile::Scope timing("entity-rigid-queue");
+    if (!worldMeshFrameOpen_ || !activeWorldToken_ || !model || !(instance >> 63u)
+        || !matrix || !group || !vertices || vertexCount <= 0 || vertexCount % 4)
+        throw std::invalid_argument("Invalid rigid model submission");
+    for (size_t i=0; i<16; ++i)
+        if (!std::isfinite(matrix[i])) throw std::invalid_argument("Non-finite rigid model transform");
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+        throw std::invalid_argument("Non-finite rigid model origin");
+    auto framework = Renderer::instance().framework();
+    auto &frr = framework->frameResourceRetainer();
+    auto found = rigidModels_.find(model);
+    std::shared_ptr<RigidModel> resource;
+    if (found != rigidModels_.end() && found->second->world == activeWorldToken_
+        && found->second->generation == activeResourceGeneration_) resource = found->second;
+    if (!resource) {
+        mcvr::profile::Scope creation("entity-rigid-model-create");
+        if (mcvr::profile::enabled()) mcvr::profile::emit(mcvr::profile::frame, 5,
+            "entity.rigid.new-input", vertexCount, static_cast<uint64_t>(vertexCount)*128);
+        auto build = EntityBuildDataBatch::create();
+        const auto start = entityBuildDataBatch_->datas.size();
+        int hash=0, post=0, prebuilt=-1, geometryCount=1;
+        int format=World::PBR_TRIANGLE, mode=static_cast<int>(World::DrawMode::QUADS);
+        double origin=0;
+        const char *content="";
+        void *input=const_cast<void *>(vertices);
+        try {
+            // Use the existing material/conversion contract; a nonzero world token disables
+            // the deferred dynamic-vertex path. This local mesh is expanded only on a miss.
+            queueBuild(EntitiesBuildTask{.lineWidth=.0125f, .coordinate=World::WORLD,
+                .normalOffset=false, .entityCount=1, .entityHashCodes=&hash,
+                .entityXs=&origin, .entityYs=&origin, .entityZs=&origin,
+                .entityRayTracingFlags=&mask, .entityPostRenderFlags=&post,
+                .entityPrebuiltBLASs=&prebuilt, .entityPosts=&post, .entityGeometryCounts=&geometryCount,
+                .geometryTypes=&geometryType, .geometryGroupNames=&group, .geometryContentNames=&content,
+                .geometryTextures=&texture, .vertexFormats=&format, .indexFormats=&mode,
+                .vertexCounts=&vertexCount, .vertices=&input, .worldToken=activeWorldToken_,
+                .frameToken=activeFrameToken_, .resourceGeneration=activeResourceGeneration_});
+            if (entityBuildDataBatch_->datas.size()!=start+1)
+                throw std::logic_error("Rigid model conversion did not produce one model");
+            build->datas.push_back(entityBuildDataBatch_->datas.back());
+            entityBuildDataBatch_->datas.resize(start);
+        } catch (...) { entityBuildDataBatch_->datas.resize(start); throw; }
+        build->build();
+        auto buffers=Renderer::instance().buffers();
+        buffers->queueImportantWorldUpload(build->indexBuffer);
+        buffers->queueImportantWorldUpload(build->positionBuffer);
+        buffers->queueImportantWorldUpload(build->materialBuffer);
+        resource=std::make_shared<RigidModel>();
+        resource->build=build;
+        resource->batch=EntityBatch::create(build);
+        resource->world=activeWorldToken_;
+        resource->generation=activeResourceGeneration_;
+        if (found != rigidModels_.end()) frr.retain(found->second);
+        // The CPU owner bounds recipes at 512. Face-state variants are additionally bounded
+        // here; evicting an entry does not destroy queued instances or in-flight ownership.
+        if (rigidModels_.size() >= 1024 && found == rigidModels_.end()) {
+            auto oldest=std::min_element(rigidModels_.begin(),rigidModels_.end(),
+                [](const auto &a,const auto &b){ return a.second->used < b.second->used; });
+            frr.retain(oldest->second); rigidModels_.erase(oldest);
+        }
+        rigidModels_[model]=resource;
+    }
+    if (resource->used != activeFrameToken_) {
+        rigidUsed_.push_back(resource);
+        resource->used=activeFrameToken_;
+    }
+    auto next=std::make_shared<Entity>(*resource->batch->entities.front());
+    next->rigidModel=model; next->rigidInstance=instance;
+    next->x=x; next->y=y; next->z=z; next->rayTracingFlag=mask;
+    next->instanceTransform=glm::make_mat4(matrix);
+    next->worldToken=activeWorldToken_; next->frameToken=activeFrameToken_;
+    next->resourceGeneration=activeResourceGeneration_;
+    rigidInstances_.push_back(std::move(next));
+}
+
+void Entities::recordRigidModels(const std::shared_ptr<vk::CommandBuffer> &commands) {
+    for (auto &model : rigidUsed_) {
+        model->lifecycle.record([&] {
+            model->build->blasBatchBuilder->submit(commands);
+            if (mcvr::profile::enabled()) mcvr::profile::emit(mcvr::profile::frame, 5,
+                "entity.rigid.blas-build", model->batch->entities.size(), 0);
+        });
+    }
+}
+
+void Entities::commitRigidModels() {
+    auto &frr=Renderer::instance().framework()->frameResourceRetainer();
+    for (auto &model : rigidUsed_) {
+        if (model->lifecycle.submitted()) {
+            frr.retain(model->build);
+            model->build.reset();
+        }
+    }
+}
+
 bool Entities::beginCachedCloud(uint64_t revision, double x, double y, double z) {
     if (revision == 0 || cloudCapturing_ || !entityBuildDataBatch_)
         throw std::logic_error("Invalid cloud geometry capture boundary");
@@ -558,6 +676,16 @@ void Entities::endCachedCloud(bool success) {
         cloudBuildData_->datas.assign(datas.begin() + cloudCaptureStart_, datas.end());
     }
     datas.erase(datas.begin() + cloudCaptureStart_, datas.end());
+}
+
+void Entities::recordGpuConversion(const std::shared_ptr<vk::CommandBuffer> &commands) {
+    if (mcvr::profile::enabled() && entityBuildDataBatch_) {
+        size_t builds=0;
+        for (const auto &data : entityBuildDataBatch_->datas) if (data->blas) ++builds;
+        mcvr::profile::emit(mcvr::profile::frame,5,"entity.dynamic.blas-inputs",builds,0);
+    }
+    if (entityBuildDataBatch_ && entityBuildDataBatch_->gpuConversion)
+        entityBuildDataBatch_->gpuConversion->record(*Renderer::instance().framework(), commands);
 }
 
 void Entities::recordCachedCloudBuild(const std::shared_ptr<vk::CommandBuffer> &commands) {
@@ -613,6 +741,13 @@ void Entities::resetFrame() {
     auto framework = Renderer::instance().framework();
     framework->safeAcquireCurrentContext();
     auto &frr = framework->frameResourceRetainer();
+    for (auto &model : rigidUsed_) { frr.retain(model); model->lifecycle.beginFrame(); }
+    rigidUsed_.clear();
+    rigidInstances_.clear();
+    std::erase_if(rigidModels_, [&](const auto &entry) {
+        if (activeFrameToken_ <= entry.second->used + 120) return false;
+        frr.retain(entry.second); return true;
+    });
     frr.retain(cloudBuildData_);
     frr.retain(cloudBlasBuilder_);
     cloudBuildData_.reset();
@@ -796,6 +931,7 @@ void Entities::endWorldMeshFrame(uint64_t worldToken, uint64_t frameToken,
     }
     if (!worldMeshStages_.empty()) throw std::runtime_error("World mesh frame has active stages");
     if (!commit) {
+        rigidInstances_.clear();
         for (size_t i = frameEntityCheckpoint_; i < entityBuildDataBatch_->datas.size(); ++i) {
             const auto &data = entityBuildDataBatch_->datas[i];
             if (data != nullptr && data->auditId != 0) {
@@ -816,6 +952,9 @@ void Entities::endWorldMeshFrame(uint64_t worldToken, uint64_t frameToken,
 }
 
 void Entities::invalidateWorldMeshGeneration(uint64_t resourceGeneration) {
+    auto &retainer=Renderer::instance().framework()->frameResourceRetainer();
+    for (const auto &[key, model] : rigidModels_) retainer.retain(model);
+    rigidModels_.clear(); rigidInstances_.clear();
     activeResourceGeneration_ = resourceGeneration;
     worldMeshFrameOpen_ = false;
     worldMeshStages_.clear();
@@ -841,6 +980,29 @@ bool Entities::acceptsWorldMeshGeneration(uint64_t worldToken, uint64_t frameTok
 }
 
 void Entities::queueBuild(EntitiesBuildTask task) {
+    mcvr::profile::Scope auditProfile("entity-convert-copy-enqueue");
+    if (mcvr::profile::enabled()) {
+        static constexpr const char *labels[] = {
+            "entity.format.block", "entity.format.entity", "entity.format.particle", "entity.format.position",
+            "entity.format.color", "entity.format.lines", "entity.format.color-light", "entity.format.tex",
+            "entity.format.tex-color", "entity.format.color-tex-light", "entity.format.tex-light-color",
+            "entity.format.tex-color-normal", "entity.format.pbr"};
+        static_assert(std::size(labels) == World::NUM_VERTEX_FORMATS);
+        std::array<uint64_t, World::NUM_VERTEX_FORMATS> counts{};
+        size_t geometry = 0;
+        for (int e = 0; e < task.entityCount; ++e) {
+            for (int i = 0; i < task.entityGeometryCounts[e]; ++i, ++geometry) {
+                const int format = task.vertexFormats[geometry];
+                if (format >= 0 && format < World::NUM_VERTEX_FORMATS && task.vertexCounts[geometry] > 0)
+                    counts[format] += task.vertexCounts[geometry];
+            }
+        }
+        for (int i = 0; i < World::NUM_VERTEX_FORMATS; ++i)
+            if (counts[i]) mcvr::profile::emit(mcvr::profile::frame, 5, labels[i], counts[i],
+                                              counts[i] * worldVertexStride(i));
+    }
+    mcvr::profile::Accumulated formatPhase("entity.convert.format"),
+        topologyPhase("entity.convert.topology"), materialPhase("entity.convert.material");
     Renderer::instance().framework()->safeAcquireCurrentContext();
     auto framework = Renderer::instance().framework();
     auto vma = framework->vma();
@@ -862,9 +1024,21 @@ void Entities::queueBuild(EntitiesBuildTask task) {
         std::vector<std::string> geometryContentNames;
         std::vector<std::vector<vk::VertexFormat::PBRVertex>> vertices;
         std::vector<std::vector<uint32_t>> indices;
+        std::vector<mcvr::EntityRawGeometry> rawGeometry;
         std::vector<uint32_t> emissiveOverlayTextureIDs;
         std::vector<std::string> shaderKeys;
         std::vector<std::string> materialKeys;
+        // JNI already supplies these sizes. Reserve without changing filtering or element order.
+        geometryMaterialFlags.reserve(geometryCountIncludeGlint);
+        geometryTypes.reserve(geometryCountIncludeGlint);
+        geometryGroupNames.reserve(geometryCountIncludeGlint);
+        geometryContentNames.reserve(geometryCountIncludeGlint);
+        vertices.reserve(geometryCountIncludeGlint);
+        indices.reserve(geometryCountIncludeGlint);
+        rawGeometry.reserve(geometryCountIncludeGlint);
+        emissiveOverlayTextureIDs.reserve(geometryCountIncludeGlint);
+        shaderKeys.reserve(geometryCountIncludeGlint);
+        materialKeys.reserve(geometryCountIncludeGlint);
         int hashCode = task.entityHashCodes[e];
         double x = task.entityXs[e];
         double y = task.entityYs[e];
@@ -886,6 +1060,11 @@ void Entities::queueBuild(EntitiesBuildTask task) {
             lineFrameY = glm::dvec3(frame[3], frame[4], frame[5]);
             lineFrameZ = glm::dvec3(frame[6], frame[7], frame[8]);
         }
+
+        bool eyeLayer = false;
+        for (uint32_t i = 0; i < geometryCountIncludeGlint; ++i)
+            if (task.geometryGroupNames && task.geometryGroupNames[geometryIndex+i] &&
+                std::string_view(task.geometryGroupNames[geometryIndex+i]) == "eyes") eyeLayer = true;
 
         uint32_t geometryCountWithoutGlint = 0;
         for (int i = 0; i < task.entityGeometryCounts[e]; i++) {
@@ -944,11 +1123,38 @@ void Entities::queueBuild(EntitiesBuildTask task) {
             auto &geometryVertices = vertices.emplace_back();
             auto &geometryIndices = indices.emplace_back();
 
+            auto &raw = rawGeometry.emplace_back();
+            if (gpuEntityConversionEnabled() && mcvr::rawEntityConversionEligible({
+                    task.vertexFormats[geometryIndex+i], task.indexFormats[geometryIndex+i], task.vertexCounts[geometryIndex+i],
+                    post, task.worldToken != 0, task.geometryIndexCounts != nullptr, eyeLayer, cloudCapturing_, prebuiltBLAS >= 0})) {
+                mcvr::profile::Scope capture(formatPhase);
+                const uint32_t count = task.vertexCounts[geometryIndex+i];
+                raw.wordCount = mcvr::entityWordCount(static_cast<size_t>(count) * sizeof(vk::VertexFormat::PBRVertex));
+                raw.words = std::make_unique_for_overwrite<uint32_t[]>(raw.wordCount);
+                std::memcpy(raw.words.get(), task.vertices[geometryIndex+i], static_cast<size_t>(raw.wordCount) * 4);
+                auto &job = raw.parameters;
+                job.deferred = 1; job.vertexCount = count;
+                job.quadIndices = task.indexFormats[geometryIndex+i] == static_cast<int>(World::DrawMode::QUADS);
+                const uint64_t indexCount = job.quadIndices ? static_cast<uint64_t>(count)/4*6 : count;
+                if (indexCount > UINT32_MAX) throw std::length_error("Entity index count overflow");
+                job.indexCount = static_cast<uint32_t>(indexCount);
+                job.normalOffset = task.normalOffset;
+                job.coordinate = static_cast<uint32_t>(coordinate) & 15u;
+                job.emissionPolicy = (task.geometryEmissions ? 1u : 0u) | ((emissiveDebug || semanticEmission) ? 2u : 0u);
+                job.emissionBits = task.geometryEmissions ? std::bit_cast<uint32_t>(task.geometryEmissions[geometryIndex+i]) : 0u;
+                // PBR alpha is already encoded. The original contract ignores the RenderType alpha override.
+                allVertexCount += count; allIndexCount += job.indexCount;
+                geometryCountWithoutGlint++;
+                continue;
+            }
+
+            mcvr::profile::Phases conversion(formatPhase);
             if (task.vertexFormats[geometryIndex + i] == World::PBR_TRIANGLE) {
                 geometryVertices.resize(task.vertexCounts[geometryIndex + i]);
                 std::memcpy(geometryVertices.data(), task.vertices[geometryIndex + i],
                             task.vertexCounts[geometryIndex + i] * sizeof(vk::VertexFormat::PBRVertex));
             } else {
+                geometryVertices.reserve(task.vertexCounts[geometryIndex + i]);
                 for (int j = 0; j < task.vertexCounts[geometryIndex + i]; j++) {
                     vk::VertexFormat::PBRVertex vertex{};
 
@@ -1244,6 +1450,7 @@ void Entities::queueBuild(EntitiesBuildTask task) {
                 }
             }
 
+            conversion.next(topologyPhase);
             // Square-section roll reference: prefer the owner's local Y, then local X, then local
             // Z. Every candidate comes from the same (possibly rotated) frame, so a rotated owner
             // such as a Sable sub-level never falls back onto the world axes mid-line.
@@ -1582,6 +1789,7 @@ void Entities::queueBuild(EntitiesBuildTask task) {
                 }
             }
 
+            conversion.next(materialPhase);
             const bool pbrSource = task.vertexFormats[geometryIndex + i] == World::PBR_TRIANGLE;
             for (auto &vertex : geometryVertices) {
                 if (task.geometryAlphaModes != nullptr) {
@@ -1601,6 +1809,7 @@ void Entities::queueBuild(EntitiesBuildTask task) {
             if (geometryVertices.empty() || geometryIndices.empty()) {
                 vertices.pop_back();
                 indices.pop_back();
+                rawGeometry.pop_back();
                 geometryMaterialFlags.pop_back();
                 geometryTypes.pop_back();
                 geometryGroupNames.pop_back();
@@ -1614,6 +1823,7 @@ void Entities::queueBuild(EntitiesBuildTask task) {
             }
         }
 
+        if (eyeLayer) rawGeometry.clear();
         if (!post && task.worldToken == 0) {
             composeEmissiveEyeOverlays(geometryMaterialFlags, geometryTypes, geometryGroupNames, geometryContentNames,
                                        vertices, indices, emissiveOverlayTextureIDs);
@@ -1636,6 +1846,7 @@ void Entities::queueBuild(EntitiesBuildTask task) {
                                     std::move(shaderKeys), std::move(materialKeys));
 
         chunkBuildData->geometryMaterialFlags = std::move(geometryMaterialFlags);
+        chunkBuildData->rawGeometry = std::move(rawGeometry);
         if (post) {
             entityPostBuildDataBatch_->addData(chunkBuildData);
         } else {
@@ -1649,13 +1860,14 @@ void Entities::queueBuild(EntitiesBuildTask task) {
 }
 
 void Entities::build() {
+    mcvr::profile::Scope auditProfile("entity-build-dispatch");
     Renderer::instance().framework()->safeAcquireCurrentContext();
     auto framework = Renderer::instance().framework();
     auto vma = framework->vma();
     auto device = framework->device();
     auto physicalDevice = framework->physicalDevice();
 
-    entityBuildDataBatch_->build();
+    entityBuildDataBatch_->build(gpuEntityConversionEnabled() ? &conversionPipeline_ : nullptr);
 
     for (const auto &data : entityBuildDataBatch_->datas) {
         if (data != nullptr && data->auditId != 0) {
@@ -1663,9 +1875,14 @@ void Entities::build() {
         }
     }
 
+    if (auto conversion = entityBuildDataBatch_->gpuConversion) {
+        Renderer::instance().buffers()->queueImportantWorldUpload(conversion->input);
+        Renderer::instance().buffers()->queueImportantWorldUpload(conversion->jobs);
+    } else {
     Renderer::instance().buffers()->queueImportantWorldUpload(entityBuildDataBatch_->indexBuffer);
     Renderer::instance().buffers()->queueImportantWorldUpload(entityBuildDataBatch_->positionBuffer);
     Renderer::instance().buffers()->queueImportantWorldUpload(entityBuildDataBatch_->materialBuffer);
+    }
     blasBatchBuilder_ = entityBuildDataBatch_->blasBatchBuilder;
 
     entityBatch_ = EntityBatch::create(entityBuildDataBatch_);
@@ -1681,6 +1898,15 @@ void Entities::build() {
         queuedClouds_.insert(queuedClouds_.end(), batch->entities.begin(), batch->entities.end());
     }
     entityBatch_->entities.insert(entityBatch_->entities.end(), queuedClouds_.begin(), queuedClouds_.end());
+    entityBatch_->entities.insert(entityBatch_->entities.end(), rigidInstances_.begin(), rigidInstances_.end());
+    if (mcvr::profile::enabled()) {
+        uint64_t vertices=0;
+        for (const auto &entity : rigidInstances_)
+            for (auto count : *entity->vertexCounts) vertices+=count;
+        mcvr::profile::emit(mcvr::profile::frame,5,"entity.rigid.instances",rigidInstances_.size(),0);
+        mcvr::profile::emit(mcvr::profile::frame,5,"entity.rigid.referenced-vertices",vertices,0);
+        mcvr::profile::emit(mcvr::profile::frame,5,"entity.rigid.resident-models",rigidModels_.size(),0);
+    }
     entityPostBatch_ = EntityPostBatch::create(entityPostBuildDataBatch_);
 
     for (auto entity : entityPostBatch_->entities) {
@@ -1692,6 +1918,8 @@ void Entities::build() {
 }
 
 void Entities::close() {
+    rigidModels_.clear(); rigidInstances_.clear(); rigidUsed_.clear();
+    conversionPipeline_.reset();
     cloudCache_.clear();
     cloudBuildData_.reset();
     cloudBlasBuilder_.reset();

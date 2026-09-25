@@ -32,7 +32,7 @@ class WorldPrepare : public SharedObject<WorldPrepare> {
     void build();
 
   private:
-    using EntityRenderDataBatch = std::map<int, std::pair<std::shared_ptr<Entity>, VkTransformMatrixKHR>>;
+    using EntityRenderDataBatch = std::map<uint64_t, std::pair<std::shared_ptr<Entity>, VkTransformMatrixKHR>>;
     using ChunkTransformBatch =
         std::map<std::shared_ptr<Chunk1>, glm::dmat4, std::owner_less<std::shared_ptr<Chunk1>>>;
 

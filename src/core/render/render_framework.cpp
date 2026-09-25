@@ -1,3 +1,4 @@
+#include "core/diagnostics/frame_profile.hpp"
 #include "core/render/chunk_trace.hpp"
 #include "core/render/streamline_runtime.hpp"
 #include "core/render/frame_acquire_policy.hpp"
@@ -79,6 +80,7 @@ std::shared_ptr<vk::CommandBuffer> FrameworkContext::beginUiPtCommands() {
 }
 
 FrameworkContext::~FrameworkContext() {
+    if(device) auditGpu.close(device->vkDevice());
     if (frameTimestampQueryPool != VK_NULL_HANDLE && device != nullptr) {
         vkDestroyQueryPool(device->vkDevice(), frameTimestampQueryPool, nullptr);
         frameTimestampQueryPool = VK_NULL_HANDLE;
@@ -233,6 +235,7 @@ Framework::~Framework() {
 }
 
 VkResult Framework::acquireContext() {
+    mcvr::profile::Scope auditProfile("acquire-other");
     mcvr::diagnostics::device_loss::note("frame-acquire-begin");
     if (!running_.load(std::memory_order_acquire)) { return inactiveResult(); }
     if (device_ == nullptr || device_->hasFailure()) {
@@ -250,11 +253,13 @@ VkResult Framework::acquireContext() {
     mcvr::FrameAcquireAttempt acquireAttempt;
     for (uint32_t attempt = 0; attempt < 2; ++attempt) {
         imageAcquiredSemaphore = acquireSemaphore();
+        { mcvr::profile::Scope auditWait("swapchain-acquire");
         const auto acquireStart = mcvr::fgdiag::start();
         result = vkAcquireNextImageKHR(device_->vkDevice(), swapchain_->vkSwapchain(), UINT64_MAX,
                                        imageAcquiredSemaphore->vkSemaphore(), VK_NULL_HANDLE, &imageIndex);
         acquireAttempt.observe(result);
         mcvr::fgdiag::elapsed(mcvr::fgdiag::MainAcquire, acquireStart);
+        }
         if (!acquireAttempt.requiresRecreate()) { break; }
 
         recycleSemaphore(imageAcquiredSemaphore);
@@ -272,10 +277,12 @@ VkResult Framework::acquireContext() {
     if (acquireAttempt.suboptimal()) { suboptimalSwapchain_ = true; }
 
     std::shared_ptr<vk::Fence> fence = contexts_[imageIndex]->commandFinishedFence;
+    { mcvr::profile::Scope auditWait("frame-fence-wait");
     const auto fenceStart = mcvr::fgdiag::start();
     result = vkWaitForFences(device_->vkDevice(), 1, &fence->vkFence(), true, UINT64_MAX);
     mcvr::diagnostics::device_loss::note("frame-fence-wait", result, imageIndex);
     mcvr::fgdiag::elapsed(mcvr::fgdiag::MainFence, fenceStart);
+    }
     if (result != VK_SUCCESS) {
         mcvr::log::info("RenderFramework") << "vkWaitForFences failed with error: " << std::dec << result << std::endl;
         currentContext_ = nullptr;
@@ -315,6 +322,13 @@ VkResult Framework::acquireContext() {
     currentContext_->worldCommandBuffer->begin();
     currentContext_->overlayCommandBuffer->begin();
     currentContext_->fuseCommandBuffer->begin();
+    currentContext_->auditGpu.reset(device_->vkDevice(), currentContext_->uploadCommandBuffer->vkCommandBuffer(), timestampValidBits_!=0);
+    if (currentContext_->auditGpu.lastResult == VK_ERROR_DEVICE_LOST)
+        return recordFailure(VK_ERROR_DEVICE_LOST, "vkCreateQueryPool(audit timestamps)");
+    currentContext_->auditUpload=currentContext_->auditGpu.begin(currentContext_->uploadCommandBuffer->vkCommandBuffer(), "upload-buffer");
+    currentContext_->auditWorld=currentContext_->auditGpu.begin(currentContext_->worldCommandBuffer->vkCommandBuffer(), "world-buffer");
+    currentContext_->auditOverlay=currentContext_->auditGpu.begin(currentContext_->overlayCommandBuffer->vkCommandBuffer(), "ui-buffer");
+    currentContext_->auditFuse=currentContext_->auditGpu.begin(currentContext_->fuseCommandBuffer->vkCommandBuffer(), "fuse-buffer");
     if (currentContext_->frameTimestampQueryPool != VK_NULL_HANDLE) {
         vkCmdResetQueryPool(currentContext_->uploadCommandBuffer->vkCommandBuffer(),
                             currentContext_->frameTimestampQueryPool, 0, 2);
@@ -352,6 +366,7 @@ VkResult Framework::acquireContext() {
 }
 
 VkResult Framework::submitCommand() {
+    mcvr::profile::Scope auditProfile("submit-record-other");
     mcvr::diagnostics::device_loss::note("frame-submit-begin");
     if (!running_.load(std::memory_order_acquire)) { return inactiveResult(); }
 
@@ -376,6 +391,11 @@ VkResult Framework::submitCommand() {
                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, currentContext_->frameTimestampQueryPool, 1);
     }
 
+    currentContext_->auditGpu.owner=mcvr::profile::frame;
+    currentContext_->auditGpu.end(currentContext_->uploadCommandBuffer->vkCommandBuffer(),currentContext_->auditUpload);
+    currentContext_->auditGpu.end(currentContext_->worldCommandBuffer->vkCommandBuffer(),currentContext_->auditWorld);
+    currentContext_->auditGpu.end(currentContext_->overlayCommandBuffer->vkCommandBuffer(),currentContext_->auditOverlay);
+    currentContext_->auditGpu.end(currentContext_->fuseCommandBuffer->vkCommandBuffer(),currentContext_->auditFuse);
     currentContext_->uploadCommandBuffer->end();
     currentContext_->worldCommandBuffer->end();
     currentContext_->uiPtCommands.end();
@@ -409,15 +429,20 @@ VkResult Framework::submitCommand() {
     mcvr::failure::throwIfFatal();
     VkResult result = vkResetFences(device_->vkDevice(), 1, &fence->vkFence());
     if (result != VK_SUCCESS) { return recordFailure(result, "vkResetFences(frame)"); }
+    { mcvr::profile::Scope auditWait("queue-submit");
     const auto submitStart = mcvr::fgdiag::start();
     result = vkQueueSubmit(device_->mainVkQueue(), 1, &vkSubmitInfo, fence->vkFence());
     mcvr::diagnostics::device_loss::note("frame-queue-submit", result,
         currentContext_ == nullptr ? 0 : currentContext_->frameIndex);
     mcvr::fgdiag::elapsed(mcvr::fgdiag::MainSubmit, submitStart);
+    }
     if (result != VK_SUCCESS) { return recordFailure(result, "vkQueueSubmit(frame)"); }
     currentContext_->frameSubmitted = true;
-    if (auto world = Renderer::instance().world(); world && currentContext_->worldRendered)
+    currentContext_->auditGpu.submitted=currentContext_->auditGpu.recording;
+    if (auto world = Renderer::instance().world(); world && currentContext_->worldRendered) {
         world->entities()->commitCachedCloudBuild();
+        world->entities()->commitRigidModels();
+    }
     mcvr::chunkTrace::note("frame-submit",-1,-1,currentContext_->chunkTraceSerial);
     currentContext_->timestampQuerySubmitted = currentContext_->frameTimestampQueryPool != VK_NULL_HANDLE;
     mcvr::diagnostics::recordFrame(
@@ -428,10 +453,12 @@ VkResult Framework::submitCommand() {
 }
 
 VkResult Framework::flushForReadback() {
+    mcvr::profile::Scope auditProfile("readback-flush");
     std::lock_guard lock(recreateMtx_);
     if (!isRunning()) return inactiveResult();
     auto context = safeAcquireCurrentContext();
     if (!context) return VK_ERROR_INITIALIZATION_FAILED;
+    context->auditGpu.invalidate();
     if (context->frameSubmitted) {
         const auto fence = context->commandFinishedFence->vkFence();
         const auto result = vkWaitForFences(device_->vkDevice(), 1, &fence, VK_TRUE, UINT64_MAX);
@@ -468,8 +495,10 @@ VkResult Framework::flushForReadback() {
     mcvr::failure::throwIfFatal();
     auto result = vkQueueSubmit(device_->mainVkQueue(), 1, &submit, fence->vkFence());
     if (result != VK_SUCCESS) return recordFailure(result, "vkQueueSubmit(readback flush)");
-    if (auto world = Renderer::instance().world(); world && context->worldRendered)
+    if (auto world = Renderer::instance().world(); world && context->worldRendered) {
         world->entities()->commitCachedCloudBuild();
+        world->entities()->commitRigidModels();
+    }
     result = vkWaitForFences(device_->vkDevice(), 1, &fence->vkFence(), VK_TRUE, UINT64_MAX);
     if (result != VK_SUCCESS) return recordFailure(result, "vkWaitForFences(readback flush)");
     for (auto command : commands) {
@@ -523,6 +552,7 @@ void Framework::captureFrameGenerationHudless(FrameworkContext &frame, const std
 }
 
 VkResult Framework::present() {
+    mcvr::profile::Scope auditProfile("present-other");
     mcvr::diagnostics::device_loss::note("frame-present-begin");
     if (!running_.load(std::memory_order_acquire)) { return inactiveResult(); }
     if (currentContext_ == nullptr) { return recordFailure(VK_ERROR_INITIALIZATION_FAILED, "present(no context)"); }
@@ -536,11 +566,14 @@ VkResult Framework::present() {
     presentInfo.pSwapchains = &swapchain_->vkSwapchain();
     presentInfo.pImageIndices = &currentContext_->frameIndex;
 
+    VkResult result;
+    { mcvr::profile::Scope auditWait("queue-present");
     const auto presentStart = mcvr::fgdiag::start();
     mcvr::StreamlineRuntime::get().marker(sl::PCLMarker::ePresentStart);
-    VkResult result = vkQueuePresentKHR(device_->mainVkQueue(), &presentInfo);
+    result = vkQueuePresentKHR(device_->mainVkQueue(), &presentInfo);
     mcvr::diagnostics::device_loss::note("frame-queue-present", result, currentContext_->frameIndex);
     mcvr::fgdiag::elapsed(mcvr::fgdiag::FirstPresent, presentStart);
+    }
     const bool firstAccepted = result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR;
     auto &sl=mcvr::StreamlineRuntime::get();
     sl.marker(sl::PCLMarker::ePresentEnd);
@@ -585,6 +618,7 @@ uint32_t Framework::effectiveFrameRateLimit() const {
 }
 
 void Framework::limitFrameRate() {
+    mcvr::profile::Scope auditProfile("frame-limiter");
     if (mcvr::StreamlineRuntime::get().pacesFrames()) { frameLimitAnchor_ = {}; return; }
     mcvr::fgdiag::Scope timing(mcvr::fgdiag::Limiter);
     const uint32_t fpsLimit = effectiveFrameRateLimit();
@@ -903,6 +937,13 @@ VkResult Framework::completeGpuProfile(const std::shared_ptr<FrameworkContext> &
                                                    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
     if (result != VK_SUCCESS) { return recordFailure(result, "vkGetQueryPoolResults(frame timestamps)"); }
 
+    if(context->auditGpu.submitted) {
+        context->auditGpu.collect(device_->vkDevice(),timestampValidBits_,timestampPeriodNs_);
+        if (context->auditGpu.lastResult == VK_ERROR_DEVICE_LOST)
+            return recordFailure(VK_ERROR_DEVICE_LOST, "vkGetQueryPoolResults(audit timestamps)");
+        const uint64_t mask=timestampValidBits_>=64 ? UINT64_MAX : (uint64_t{1}<<timestampValidBits_)-1;
+        mcvr::profile::emit(context->auditGpu.owner,4,"main-queue-frame",static_cast<uint64_t>(((timestamps[1]-timestamps[0])&mask)*timestampPeriodNs_),0);
+    }
     context->timestampQuerySubmitted = false;
     const uint32_t sequence = context->gpuProfileSequence;
     context->gpuProfileSequence = 0;

@@ -58,7 +58,7 @@ set(NO_REFLECT_HIT_SHADERS
 foreach(shader IN LISTS NO_REFLECT_HIT_SHADERS)
     require_source_marker("${MCVR_SOURCE_DIR}/${shader}" "float lod = 0.0;"
                           "function-scope emissive-overlay LOD fallback")
-    require_source_marker("${MCVR_SOURCE_DIR}/${shader}" "lod = lodWithCone("
+    require_source_marker("${MCVR_SOURCE_DIR}/${shader}" "lod = lodWithObjectCone("
                           "textured emissive-overlay LOD assignment")
 endforeach()
 

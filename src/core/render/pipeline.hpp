@@ -78,6 +78,7 @@ class WorldPipeline : public SharedObject<WorldPipeline> {
   private:
     void dumpSharedImages(const char *label) const;
 
+    std::vector<std::string> auditModuleNames_;
     std::vector<std::shared_ptr<WorldModule>> worldModules_;
     std::vector<std::vector<std::shared_ptr<vk::DeviceLocalImage>>> sharedImages_;
     std::shared_ptr<ShaderPack> shaderPack_;

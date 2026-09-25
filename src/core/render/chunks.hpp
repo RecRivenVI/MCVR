@@ -6,6 +6,7 @@
 #include "core/vulkan/all_core_vulkan.hpp"
 
 #include "core/render/emission.hpp"
+#include "core/render/chunk_scene_metadata.hpp"
 #include "core/render/external_chunk_handle.hpp"
 #include "core/render/world.hpp"
 
@@ -211,6 +212,9 @@ struct Chunk1 : public SharedObject<Chunk1> {
     bool hasCustomTransform = false;
     glm::dmat4 customTransform = glm::dmat4(1.0);
 
+    mcvr::ChunkSceneCache sceneMetadataCache;
+    const std::shared_ptr<mcvr::ChunkSceneMetadata> &sceneMetadata();
+
     float buildFactor(std::chrono::steady_clock::time_point currentTime, glm::vec3 cameraPos, glm::vec3 chunkPos);
 
     bool enqueue(std::shared_ptr<ChunkBuildData> chunkBuildData);
@@ -253,6 +257,7 @@ class Chunks : public SharedObject<Chunks> {
     glm::ivec4 chunkGridInfo();
     void setChunkStorageSectionPos(glm::ivec3 sectionPos);
     glm::ivec4 chunkStorageSectionPos();
+    uint32_t primaryChunkCount() const { return primaryChunkCount_; }
 
   private:
     void allocateChunkPackedDataBuffers();

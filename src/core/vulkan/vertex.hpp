@@ -4,6 +4,7 @@
 #include "core/all_extern.hpp"
 
 #include <vector>
+#include <span>
 
 namespace vk {
 struct VertexLayoutInfo {
@@ -43,6 +44,11 @@ struct Vertex {
     static uint32_t packMaterialFlags(const VertexFormat::PBRVertex &vertex);
     static VertexFormat::PositionVertex makePositionVertex(const VertexFormat::PBRVertex &vertex);
     static VertexFormat::MaterialVertex makeMaterialVertex(const VertexFormat::PBRVertex &vertex);
+    // Exact-sized, disjoint output spans, including mapped upload storage. No allocation.
+    static void writePackedVertices(std::span<const VertexFormat::PBRVertex> vertices,
+                                    uint32_t emissiveOverlay,
+                                    std::span<VertexFormat::PositionVertex> positions,
+                                    std::span<VertexFormat::MaterialVertex> materials);
     static void appendPackedVertices(const std::vector<VertexFormat::PBRVertex> &vertices,
                                      uint32_t emissiveOverlay,
                                      std::vector<VertexFormat::PositionVertex> &positions,

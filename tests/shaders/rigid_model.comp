@@ -1,0 +1,22 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "util/ray_cone.glsl"
+layout(local_size_x=64) in;
+layout(set=0,binding=0,std430) buffer Output { vec4 values[]; } result;
+void main() {
+    uint i=gl_GlobalInvocationID.x;
+    if(i>=257u*32u*32u)return;
+    float angle=float(i%257u)*.023;
+    float sx=exp2(float((i/257u)%9u)-4.0), sy=exp2(float((i/2313u)%9u)-4.0);
+    if((i&1u)!=0u)sx=-sx;
+    mat3 transform=mat3(vec3(cos(angle)*sx,sin(angle)*sx,0),
+        vec3(-sin(angle)*sy,cos(angle)*sy,0),vec3(0,0,1));
+    bool degenerate=(i%7u)==0u;
+    vec2 uv1=degenerate?vec2(0):vec2(1,0), uv2=degenerate?vec2(0):vec2(0,1);
+    float actual=objectRayConeLod(vec2(1024,512),.04,transform,
+        vec3(0),vec3(2,0,0),vec3(0,3,0),vec2(0),uv1,uv2);
+    float expected=max(log2(max(1024*.04/(degenerate?1.0:2*abs(sx)),
+        512*.04/(degenerate?1.0:3*abs(sy)))),0.0);
+    vec3 worldNormal=normalize(cross(transform*vec3(2,0,0),transform*vec3(0,3,0)));
+    result.values[i]=vec4(actual,expected,length(worldNormal-vec3(0,0,sign(sx*sy))),0);
+}

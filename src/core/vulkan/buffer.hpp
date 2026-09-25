@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 
 #include "core/all_extern.hpp"
 
@@ -80,6 +81,9 @@ class DeviceLocalBuffer : public Buffer, public SharedObject<DeviceLocalBuffer> 
 
     void uploadToStagingBuffer(void *src);
     void uploadToStagingBuffer(void *src, size_t size, size_t offset);
+    // The callback must fill the whole buffer and must not retain the pointer or submit GPU work.
+    // Allocation, flush and existing transient retirement are identical to ordinary uploads.
+    void writeToStagingBuffer(const std::function<void(void *, size_t)> &write);
     void flushStagingBuffer();
     void releaseStaging();
 
@@ -103,6 +107,7 @@ class DeviceLocalBuffer : public Buffer, public SharedObject<DeviceLocalBuffer> 
     std::shared_ptr<Device> device_;
 
     bool persistStaging_;
+    void prepareStagingBuffer();
     std::shared_ptr<TemporaryStagingBuffer> transientStagingRetainer_ = nullptr;
     size_t size_;
     const char *allocTraceTag_ = nullptr;

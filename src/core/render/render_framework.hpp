@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/util/close_gate.hpp"
+#include "core/diagnostics/gpu_profile.hpp"
 #include "core/util/deferred_frame_commands.hpp"
 
 #include "core/logging.hpp"
@@ -64,6 +65,8 @@ struct FrameworkContext : public SharedObject<FrameworkContext> {
     mcvr::DeferredFrameCommands<vk::CommandBuffer> uiPtCommands;
     std::shared_ptr<vk::CommandBuffer> fuseCommandBuffer;
 
+    mcvr::profile::GpuFrame auditGpu;
+    int auditUpload=-1, auditWorld=-1, auditOverlay=-1, auditFuse=-1;
     VkQueryPool frameTimestampQueryPool = VK_NULL_HANDLE;
     uint32_t gpuProfileSequence = 0;
     bool timestampQuerySubmitted = false;

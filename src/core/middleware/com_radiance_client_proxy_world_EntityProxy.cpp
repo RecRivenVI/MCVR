@@ -4,6 +4,17 @@
 #include "core/render/entities.hpp"
 #include "core/render/renderer.hpp"
 
+extern "C" JNIEXPORT void JNICALL Java_com_radiance_client_proxy_world_EntityProxy_queueRigidModel(
+    JNIEnv *env, jclass, jlong model, jlong instance, jint type, jint texture,
+    jlong vertices, jint count, jdouble x, jdouble y, jdouble z, jint mask, jlong matrix, jlong group) {
+    jni::invokeVoid(env, "Queue rigid model", [&] {
+        auto world=Renderer::instance().world();
+        if (!world) throw std::logic_error("Rigid model submitted without a world");
+        world->entities()->queueRigidModel(model,instance,type,texture,reinterpret_cast<const void *>(vertices),
+            count,x,y,z,mask,reinterpret_cast<const float *>(matrix),reinterpret_cast<const char *>(group));
+    });
+}
+
 JNIEXPORT jboolean JNICALL Java_com_radiance_client_proxy_world_EntityProxy_beginCachedCloud(
     JNIEnv *env, jclass, jlong revision, jdouble x, jdouble y, jdouble z) {
     return jni::invoke<jboolean>(env, "Queue cached cloud geometry", JNI_FALSE, [&]() -> jboolean {

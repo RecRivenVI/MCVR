@@ -85,7 +85,7 @@ foreach(text_any_hit IN ITEMS
         "${VANILLA_ROOT}/world/text.rahit"
         "${ADVANCED_ROOT}/common/text.rahit")
     file(READ "${text_any_hit}" text_any_hit_source)
-    foreach(required_marker IN ITEMS lodWithCone resolveTextCoverage "alpha <= 0.0" "rand(mainRay.seed)" ignoreIntersectionEXT)
+    foreach(required_marker IN ITEMS lodWithObjectCone resolveTextCoverage "alpha <= 0.0" "rand(mainRay.seed)" ignoreIntersectionEXT)
         string(FIND "${text_any_hit_source}" "${required_marker}" marker_index)
         if(marker_index EQUAL -1)
             message(FATAL_ERROR "${text_any_hit} is missing upstream marker: ${required_marker}")

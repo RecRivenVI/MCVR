@@ -971,7 +971,7 @@ class FramebufferHarness {
     }
 
   public:
-    void diagramSurfaceCase(const std::filesystem::path &shaderPath) {
+    void diagramSurfaceCase(const std::filesystem::path &shaderPath, bool rigid = false) {
         constexpr uint32_t samples = 257 * 32 * 32;
         auto output = createBuffer(samples * 4 * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -1016,6 +1016,12 @@ class FramebufferHarness {
         });
         auto values = static_cast<const float *>(output.mapped);
         for (uint32_t i = 0; i < samples; ++i) {
+            if (rigid) {
+                require(std::isfinite(values[i*4]) && std::abs(values[i*4]-values[i*4+1]) < 2e-5f,
+                    "Rigid model mip differs from analytical world-space footprint");
+                require(values[i*4+2] < 1e-5f, "Rigid transformed geometric normal differs");
+                continue;
+            }
             float coverage = float(i / 1024) / 256.0f;
             float luminosity = std::floor(std::clamp((coverage - .5f + .18f) * 1.8f + .5f, 0.0f, 1.0f) * 32) / 32;
             float scaled = std::max(luminosity - .00001f, 0.0f) * 7;
@@ -1030,7 +1036,7 @@ class FramebufferHarness {
                 "Spring stress and hurt surface recoloring disagree");
             require(std::abs(values[i * 4 + 3] - 229.75f) < 1e-5f, "Diagram GL/UI origin mismatch");
         }
-        std::cout << "[PASS] 263168 diagram/stress/hurt samples, monotone fade and GUI origin\n";
+        std::cout << (rigid ? "[PASS] 263168 transformed model mip/normal samples\n" : "[PASS] 263168 diagram/stress/hurt samples, monotone fade and GUI origin\n");
     }
 
     void inlineUpdateCase() {
@@ -1411,6 +1417,10 @@ int main(int argc, char **argv) {
                                    std::filesystem::absolute(argv[3]), std::string_view(argv[4]) == "--post-sync");
         if (std::string_view(argv[4]) == "--post-sync") {
             harness.postColorSyncCase();
+            return 0;
+        }
+        if (std::string_view(argv[4]) == "--rigid-model") {
+            harness.diagramSurfaceCase(std::filesystem::absolute(argv[5]), true);
             return 0;
         }
         if (std::string_view(argv[4]) == "--diagram-surface") {

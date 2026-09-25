@@ -895,7 +895,8 @@ void main() {
 
         float coneRadiusWorld = mainRay.coneWidth + gl_HitTEXT * mainRay.coneSpread;
         computedposduDv(p0.pos, p1.pos, p2.pos, m0.textureUV, m1.textureUV, m2.textureUV, dposdu, dposdv);
-        lod = lodWithCone(textures[nonuniformEXT(textureID)], textureUV, coneRadiusWorld, dposdu, dposdv);
+        lod = lodWithObjectCone(textures[nonuniformEXT(textureID)], coneRadiusWorld, mat3(gl_ObjectToWorldEXT),
+            p0.pos, p1.pos, p2.pos, m0.textureUV, m1.textureUV, m2.textureUV);
         dPduWorld = objectToWorld * dposdu;
         dPdvWorld = objectToWorld * dposdv;
         planeGeoNormal = normalizeF(cross(dPduWorld, dPdvWorld), baseGeoNormal);

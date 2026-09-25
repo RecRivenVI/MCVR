@@ -11,6 +11,7 @@
 #include "core/render/world.hpp"
 
 #include <fstream>
+#include <cstdlib>
 #include <algorithm>
 #include <regex>
 #include <stdexcept>
@@ -1358,6 +1359,17 @@ void UIModuleContext::copyPersistentStateFrom(const UIModuleContext &other) {
     overlayClearStencil = other.overlayClearStencil;
 }
 
+// Outside a raster pass, the state is still observable through the shadow fields,
+// but no draw can consume its transient values. Every draw/pass entry replays the
+// full state through syncToCommandBuffer. Keep eager recording as a local reference.
+bool UIModuleContext::deferIdleStateWrite() const {
+    static const bool enabled = [] {
+        const char *value = std::getenv("MCVR_IDLE_UI_STATE");
+        return !value || std::string_view(value) != "0";
+    }();
+    return enabled && overlayMode == NONE;
+}
+
 void UIModuleContext::setOverlayScissorEnabled(bool enabled) {
     auto context = frameworkContext.lock();
     auto framework = context->framework.lock();
@@ -1365,6 +1377,7 @@ void UIModuleContext::setOverlayScissorEnabled(bool enabled) {
     if (!framework->isRunning()) return;
 
     overlayScissorEnabled = enabled;
+    if (deferIdleStateWrite()) return;
     if (overlayScissorEnabled) {
         vkCmdSetScissor(context->overlayCommandBuffer->vkCommandBuffer(), 0, 1, &overlayScissor);
     } else {
@@ -1406,6 +1419,7 @@ void UIModuleContext::setOverlayViewport(int x, int y, int width, int height) {
     overlayViewport.y = static_cast<float>(drawExtent().height) - y - height;
     overlayViewport.width = width;
     overlayViewport.height = height;
+    if (deferIdleStateWrite()) return;
     vkCmdSetViewport(context->overlayCommandBuffer->vkCommandBuffer(), 0, 1, &overlayViewport);
 }
 
@@ -1416,6 +1430,7 @@ void UIModuleContext::setOverlayBlendEnable(bool enable) {
     if (!framework->isRunning()) return;
 
     overlayBlendEnabled = enable;
+    if (deferIdleStateWrite()) return;
     syncColorAttachments();
 }
 
@@ -1429,6 +1444,7 @@ void UIModuleContext::setOverlayColorBlendConstants(float const1, float const2, 
     overlayBlendConstants[1] = const2;
     overlayBlendConstants[2] = const3;
     overlayBlendConstants[3] = const4;
+    if (deferIdleStateWrite()) return;
     vkCmdSetBlendConstants(context->overlayCommandBuffer->vkCommandBuffer(), overlayBlendConstants.data());
 }
 
@@ -1439,6 +1455,7 @@ void UIModuleContext::setOverlayColorLogicOpEnable(bool enable) {
     if (!framework->isRunning()) return;
 
     overlayColorLogicOpEnable = enable;
+    if (deferIdleStateWrite()) return;
     if (context->device->hasExtendedDynamicState2LogicOp()) {
         vkCmdSetLogicOpEnableEXT(context->overlayCommandBuffer->vkCommandBuffer(), overlayColorLogicOpEnable);
     }
@@ -1457,6 +1474,7 @@ void UIModuleContext::setOverlayBlendFuncSeparate(int srcColorBlendFactor,
     overlayColorBlendEquation.srcAlphaBlendFactor = static_cast<VkBlendFactor>(srcAlphaBlendFactor);
     overlayColorBlendEquation.dstColorBlendFactor = static_cast<VkBlendFactor>(dstColorBlendFactor);
     overlayColorBlendEquation.dstAlphaBlendFactor = static_cast<VkBlendFactor>(dstAlphaBlendFactor);
+    if (deferIdleStateWrite()) return;
     syncColorAttachments();
 }
 
@@ -1468,6 +1486,7 @@ void UIModuleContext::setOverlayBlendOpSeparate(int colorBlendOp, int alphaBlend
 
     overlayColorBlendEquation.colorBlendOp = static_cast<VkBlendOp>(colorBlendOp);
     overlayColorBlendEquation.alphaBlendOp = static_cast<VkBlendOp>(alphaBlendOp);
+    if (deferIdleStateWrite()) return;
     syncColorAttachments();
 }
 
@@ -1478,6 +1497,7 @@ void UIModuleContext::setOverlayColorWriteMask(int colorWriteMask) {
     if (!framework->isRunning()) return;
 
     overlayColorWriteMask = colorWriteMask;
+    if (deferIdleStateWrite()) return;
     syncColorAttachments();
 }
 
@@ -1488,6 +1508,7 @@ void UIModuleContext::setOverlayColorLogicOp(int colorLogicOp) {
     if (!framework->isRunning()) return;
 
     overlayColorLogicOp = static_cast<VkLogicOp>(colorLogicOp);
+    if (deferIdleStateWrite()) return;
     if (context->device->hasExtendedDynamicState2LogicOp()) {
         vkCmdSetLogicOpEXT(context->overlayCommandBuffer->vkCommandBuffer(), overlayColorLogicOp);
     }
@@ -1500,6 +1521,7 @@ void UIModuleContext::setOverlayDepthTestEnable(bool enable) {
     if (!framework->isRunning()) return;
 
     overlayDepthTestEnable = enable;
+    if (deferIdleStateWrite()) return;
     vkCmdSetDepthTestEnable(context->overlayCommandBuffer->vkCommandBuffer(), overlayDepthTestEnable);
 }
 
@@ -1510,6 +1532,7 @@ void UIModuleContext::setOverlayDepthWriteEnable(bool enable) {
     if (!framework->isRunning()) return;
 
     overlayDepthWriteEnable = enable;
+    if (deferIdleStateWrite()) return;
     vkCmdSetDepthWriteEnable(context->overlayCommandBuffer->vkCommandBuffer(), overlayDepthWriteEnable);
 }
 
@@ -1520,6 +1543,7 @@ void UIModuleContext::setOverlayStencilTestEnable(bool enable) {
     if (!framework->isRunning()) return;
 
     overlayStencilTestEnable = enable;
+    if (deferIdleStateWrite()) return;
     vkCmdSetStencilTestEnable(context->overlayCommandBuffer->vkCommandBuffer(), overlayStencilTestEnable);
 }
 
@@ -1530,6 +1554,7 @@ void UIModuleContext::setOverlayDepthCompareOp(int depthCompareOp) {
     if (!framework->isRunning()) return;
 
     overlayDepthCompareOp = static_cast<VkCompareOp>(depthCompareOp);
+    if (deferIdleStateWrite()) return;
     vkCmdSetDepthCompareOp(context->overlayCommandBuffer->vkCommandBuffer(), overlayDepthCompareOp);
 }
 
@@ -1542,6 +1567,7 @@ void UIModuleContext::setOverlayStencilFrontFunc(int compareOp, int reference, i
     overlayCompareOp[0] = static_cast<VkCompareOp>(compareOp);
     overlayReference[0] = reference;
     overlayCompareMask[0] = compareMask;
+    if (deferIdleStateWrite()) return;
     vkCmdSetStencilOp(context->overlayCommandBuffer->vkCommandBuffer(), VK_STENCIL_FACE_FRONT_BIT, overlayFailOp[0],
                       overlayPassOp[0], overlayDepthFailOp[0], overlayCompareOp[0]);
     vkCmdSetStencilReference(context->overlayCommandBuffer->vkCommandBuffer(), VK_STENCIL_FACE_FRONT_BIT,
@@ -1559,6 +1585,7 @@ void UIModuleContext::setOverlayStencilBackFunc(int compareOp, int reference, in
     overlayCompareOp[1] = static_cast<VkCompareOp>(compareOp);
     overlayReference[1] = reference;
     overlayCompareMask[1] = compareMask;
+    if (deferIdleStateWrite()) return;
     vkCmdSetStencilOp(context->overlayCommandBuffer->vkCommandBuffer(), VK_STENCIL_FACE_BACK_BIT, overlayFailOp[1],
                       overlayPassOp[1], overlayDepthFailOp[1], overlayCompareOp[1]);
     vkCmdSetStencilReference(context->overlayCommandBuffer->vkCommandBuffer(), VK_STENCIL_FACE_BACK_BIT,
@@ -1576,6 +1603,7 @@ void UIModuleContext::setOverlayStencilFrontOp(int failOp, int depthFailOp, int 
     overlayFailOp[0] = static_cast<VkStencilOp>(failOp);
     overlayDepthFailOp[0] = static_cast<VkStencilOp>(depthFailOp);
     overlayPassOp[0] = static_cast<VkStencilOp>(passOp);
+    if (deferIdleStateWrite()) return;
     vkCmdSetStencilOp(context->overlayCommandBuffer->vkCommandBuffer(), VK_STENCIL_FACE_FRONT_BIT, overlayFailOp[0],
                       overlayPassOp[0], overlayDepthFailOp[0], overlayCompareOp[0]);
 }
@@ -1589,6 +1617,7 @@ void UIModuleContext::setOverlayStencilBackOp(int failOp, int depthFailOp, int p
     overlayFailOp[1] = static_cast<VkStencilOp>(failOp);
     overlayDepthFailOp[1] = static_cast<VkStencilOp>(depthFailOp);
     overlayPassOp[1] = static_cast<VkStencilOp>(passOp);
+    if (deferIdleStateWrite()) return;
     vkCmdSetStencilOp(context->overlayCommandBuffer->vkCommandBuffer(), VK_STENCIL_FACE_BACK_BIT, overlayFailOp[1],
                       overlayPassOp[1], overlayDepthFailOp[1], overlayCompareOp[1]);
 }
@@ -1600,6 +1629,7 @@ void UIModuleContext::setOverlayStencilFrontWriteMask(int writeMask) {
     if (!framework->isRunning()) return;
 
     overlayWriteMask[0] = writeMask;
+    if (deferIdleStateWrite()) return;
     vkCmdSetStencilWriteMask(context->overlayCommandBuffer->vkCommandBuffer(), VK_STENCIL_FACE_FRONT_BIT,
                              overlayWriteMask[0]);
 }
@@ -1611,6 +1641,7 @@ void UIModuleContext::setOverlayStencilBackWriteMask(int writeMask) {
     if (!framework->isRunning()) return;
 
     overlayWriteMask[1] = writeMask;
+    if (deferIdleStateWrite()) return;
     vkCmdSetStencilWriteMask(context->overlayCommandBuffer->vkCommandBuffer(), VK_STENCIL_FACE_BACK_BIT,
                              overlayWriteMask[1]);
 }
@@ -1622,6 +1653,7 @@ void UIModuleContext::setOverlayLineWidth(float lineWidth) {
     if (!framework->isRunning()) return;
 
     overlayLineWidth = lineWidth;
+    if (deferIdleStateWrite()) return;
     vkCmdSetLineWidth(context->overlayCommandBuffer->vkCommandBuffer(), overlayLineWidth);
 }
 
@@ -1632,6 +1664,7 @@ void UIModuleContext::setOverlayPolygonMode(int polygonMode) {
     if (!framework->isRunning()) return;
 
     overlayPolygonMode = static_cast<VkPolygonMode>(polygonMode);
+    if (deferIdleStateWrite()) return;
     vkCmdSetPolygonModeEXT(context->overlayCommandBuffer->vkCommandBuffer(), overlayPolygonMode);
     setOverlayDepthBiasEnable(overlayPolygonMode, overlayDepthBiasEnable);
 }
@@ -1643,6 +1676,7 @@ void UIModuleContext::setOverlayCullMode(int cullMode) {
     if (!framework->isRunning()) return;
 
     overlayCullMode = cullMode;
+    if (deferIdleStateWrite()) return;
     vkCmdSetCullMode(context->overlayCommandBuffer->vkCommandBuffer(), overlayCullMode);
 }
 
@@ -1653,6 +1687,7 @@ void UIModuleContext::setOverlayFrontFace(int frontFace) {
     if (!framework->isRunning()) return;
 
     overlayFrontFace = static_cast<VkFrontFace>(frontFace);
+    if (deferIdleStateWrite()) return;
     vkCmdSetFrontFace(context->overlayCommandBuffer->vkCommandBuffer(), overlayFrontFace);
 }
 
@@ -1663,6 +1698,7 @@ void UIModuleContext::setOverlayDepthBiasEnable(int polygonMode, bool enable) {
     if (!framework->isRunning()) return;
 
     overlayDepthBiasEnable = enable;
+    if (deferIdleStateWrite()) return;
     if (overlayDepthBiasEnable)
         vkCmdSetDepthBias(context->overlayCommandBuffer->vkCommandBuffer(),
                           overlayDepthBiasConstantFactor[overlayPolygonMode], overlayDepthBiasClamp[overlayPolygonMode],
@@ -1966,6 +2002,7 @@ void UIModuleContext::switchOverlayPost() {
         overlayPostColorImage->imageLayout() = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     }
 
+    if (overlayMode == NONE) syncToCommandBuffer();
     overlayMode = POST;
 }
 

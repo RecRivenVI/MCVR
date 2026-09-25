@@ -396,6 +396,22 @@ void vk::DeviceLocalBuffer::uploadToStagingBuffer(void *src) {
 }
 
 void vk::DeviceLocalBuffer::uploadToStagingBuffer(void *src, size_t size, size_t offset) {
+    prepareStagingBuffer();
+    std::memcpy(static_cast<uint8_t *>(mappedPtr_) + offset, src, size);
+    vmaFlushAllocation(vma_->allocator(), stagingAllocation_, offset, size);
+}
+
+void vk::DeviceLocalBuffer::writeToStagingBuffer(const std::function<void(void *, size_t)> &write) {
+    prepareStagingBuffer();
+    write(mappedPtr_, size_);
+    const auto result = vmaFlushAllocation(vma_->allocator(), stagingAllocation_, 0, size_);
+    if (result != VK_SUCCESS) {
+        device_->recordFailure(result, "flush directly written upload staging");
+        mcvr::failure::raise(mcvr::failure::Kind::runtime, result, "flush directly written upload staging");
+    }
+}
+
+void vk::DeviceLocalBuffer::prepareStagingBuffer() {
     if (!persistStaging_) {
         if (stagingBuffer_ != VK_NULL_HANDLE || stagingAllocation_ != VK_NULL_HANDLE || mappedPtr_ != nullptr) {
             bufferCerr() << "if not persist staging, the staging buffer should not exist!" << std::endl;
@@ -426,8 +442,6 @@ void vk::DeviceLocalBuffer::uploadToStagingBuffer(void *src, size_t size, size_t
         transientStagingRetainer_ = TemporaryStagingBuffer::create(vma_, stagingBuffer_, stagingAllocation_, size_);
     }
 
-    std::memcpy(static_cast<uint8_t *>(mappedPtr_) + offset, src, size);
-    vmaFlushAllocation(vma_->allocator(), stagingAllocation_, offset, size);
 }
 
 void vk::DeviceLocalBuffer::flushStagingBuffer() {

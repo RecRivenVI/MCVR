@@ -300,6 +300,7 @@ struct UIModuleContext : public SharedObject<UIModuleContext> {
 
     UIModuleContext(std::shared_ptr<FrameworkContext> context, std::shared_ptr<UIModule> uiModule);
 
+    bool deferIdleStateWrite() const;
     void syncToCommandBuffer();
     void writeMainDepth(std::shared_ptr<WorldPipelineContext> worldContext);
     void captureMainAliases();
